@@ -120,6 +120,14 @@ fn regen_keys(
 
 fn parse_args() -> (u64, u64, String, String) {
     let mut seed: u64 = SEED;
+    // 600, not a smaller number: at 300 the honest/malicious incoming-trust
+    // separation is briefly inverted (checked manually), because it's a
+    // slow, deliberately-damped multiplicative update (see alpha_edge
+    // below) that just hasn't had enough iterations yet at 300. 600 is
+    // the point it reliably resolves in the right direction, so it's the
+    // default, not merely a starting point to raise if you want to see
+    // that separation - lowering --steps below this risks reading a
+    // still-converging trend as a conclusion.
     let mut steps: u64 = 600;
     let mut out = "../telemetry/telemetry.jsonl".to_string();
     let mut chain_log = "../telemetry/tri_sync_chain_crypto.blocks.jsonl".to_string();

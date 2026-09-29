@@ -90,13 +90,16 @@ Concretely, as of this commit:
   - `tri_sync_chain`, `tri_sync_chain_weighted`: same incoming-trust-weight
     separation, measured against `head_block.state` rather than `truth`
     (see the ground-truth item below for why).
-  - `tri_sync_chain_crypto`: separation is present but sample-size
-    sensitive - at 300 steps it was actually inverted
-    (`malicious=2.58` vs `honest=2.55`), which looked like a real gap
-    until a 600-step run showed the expected direction clearly
-    (`honest=2.27` vs `malicious=1.99`). This binary's step rate is
-    bounded by ed25519 signing cost, so 300 steps is just not enough
-    samples for the separation to show - not an architectural gap.
+  - `tri_sync_chain_crypto`: separation is real but slow to resolve - at
+    300 steps it's actually inverted (`malicious=2.58` vs `honest=2.55`),
+    only becoming the expected direction by 600
+    (`honest=2.27` vs `malicious=1.99`), since it's a deliberately-damped
+    multiplicative update that just needs enough iterations. This is why
+    the CLI default is `--steps 600`, not merely a starting point to
+    raise if you want to see the separation - it was never shipped at
+    300, that number only ever came from an ad hoc verification probe
+    during development. Overriding `--steps` down below the default
+    risks reading a still-converging trend as a conclusion.
 - **Fixed: no decision anywhere reads ground truth anymore.**
   `trust_graph::update_reliability` (used by `tri_sync_scalar`) now scores
   a node against the fused reference (`RStar::value`). All three chain
