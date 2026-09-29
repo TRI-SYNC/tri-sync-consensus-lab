@@ -68,14 +68,12 @@ Concretely, as of this commit:
   binary) report a deliberate, consistent deviation (`truth +
   DEVIATION_BIAS`, no noise) instead of a baseline reading, and are given
   the network's lowest noise bucket so `invariants::clarity_gate` never
-  flags them - only the trust/fusion mechanism itself responds to them,
-  not a noise-based heuristic. The RNG is always drawn (even when the
-  sample is unused) so the RNG stream doesn't depend on which nodes are
-  adversarial, keeping runs reproducible either way. This is what lets
-  the network self-correct: no component ever singles out which nodes
-  deviate, so the same fusion and trust-weighting logic that handles
-  ordinary noise handles this too. Verified per binary with a real run
-  and an end-of-run adversarial summary:
+  flags them - the only thing that catches them is the trust/fusion
+  mechanism itself, not a noise-based heuristic. The RNG is always drawn
+  (even when the sample is unused) so the RNG stream doesn't depend on
+  which nodes are adversarial, keeping runs reproducible either way.
+  Verified per binary with a real run and an end-of-run adversarial
+  summary:
   - `tri_sync_scalar` (`SEED=42`, 250 steps): fused reference stays
     close to truth despite the deviating nodes (`|truth - r_star| =
     0.095` against a `DEVIATION_BIAS` of `3.0`), and their reliability
