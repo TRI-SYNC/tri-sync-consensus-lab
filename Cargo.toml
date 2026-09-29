@@ -1,5 +1,5 @@
 [workspace]
-members = ["tri_sync_core"]
+members = ["tri_sync_core", "tri_sync_node"]
 
 [package]
 name = "tri_sync"

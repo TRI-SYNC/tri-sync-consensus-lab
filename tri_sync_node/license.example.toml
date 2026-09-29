@@ -1,0 +1,18 @@
+# Example license file, real end-to-end test fixture (not a placeholder).
+#
+# Signed with the development private key whose public half is embedded
+# in `src/license.rs` as `LICENSE_PUBLIC_KEY_HEX`. The private key was
+# generated for this repository and discarded from this machine after
+# signing - it is not, and will not be, committed anywhere. Before any
+# license is issued to a real customer, `LICENSE_PUBLIC_KEY_HEX` must be
+# replaced with a real production public key, and licenses signed with
+# its matching private key, held by whoever issues licenses.
+#
+# The signature covers "org|max_nodes|sorted,features|expiry" - see
+# `canonical_string` in src/license.rs.
+
+org = "TriSync Example Org"
+max_nodes = 5
+features = ["chain_crypto", "chain_weighted", "http_api"]
+expiry = "2030-01-01"
+signature = "82dee2e95a97d442202441494dee0c8b03efa92751cc63ae4e24e56c9e3f5d3054b93b2daf4a6cb4c5cdb6d638f1306e112f741e5926a353a84b8a4bdbd46f06"
