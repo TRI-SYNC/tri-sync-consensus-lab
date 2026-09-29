@@ -188,12 +188,24 @@ Concretely, as of this commit:
   (including a fork+reconcile event spanning the restart boundary in
   `tri_sync_chain_weighted`); confirmed a corrupted log line fails loudly
   with a clear message and a non-zero exit code instead of skipping it.
-  **Scope caveat:** only the ledger (`blocks`/`head`) persists across a
-  restart. The simulation's own state - `x_vec`, `truth`, per-node
-  reliability, the `w_out` trust graph - does not, so a resumed run's
-  new blocks extend the old chain's history on top of a
-  freshly-initialized simulation trajectory, not a continuation of the
-  old one.
+  **Persistence scope is a deliberate decision, not an open gap:** only
+  the ledger (`blocks`/`head`) persists across a restart. The
+  simulation's own live state - `x_vec`, `truth`, per-node reliability,
+  the `w_out` trust graph - does not, and isn't meant to. That mirrors
+  how a real node works: the chain is the durable source of truth it
+  must agree on with everyone else, while its in-memory beliefs about
+  its neighbors are working state it rebuilds by observing and
+  re-earning trust, not something it needs to have persisted to rejoin
+  correctly. Snapshotting the full simulation state was considered and
+  rejected for that reason - it would make a restarted node's local
+  memory durable, which is backwards for what this is modeling, and
+  would need its own versioned format, write cadence, and consistency
+  story with the ledger for questionable benefit. The visible
+  consequence: a resumed run's new blocks extend the old chain's real
+  history, but on top of a freshly-initialized simulation trajectory, so
+  `x_vec`/`truth`/reliability show a jump at the restart boundary in the
+  telemetry - expected, the same way a rebooted node shows a trust dip
+  right after rejoining, not a bug to fix.
 
 ## Running
 
