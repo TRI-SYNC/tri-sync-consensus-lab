@@ -1,11 +1,29 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tiny_http::{Header, Method, Response, Server};
+
+/// Caps concurrent `/events` streams. Each one holds its own thread open
+/// for as long as the client stays connected, so with no cap a burst of
+/// clients (or a handful that never disconnect) could spawn unbounded
+/// threads. Generous on purpose - this serves local telemetry, not the
+/// public internet - the point is a bound, not a low one.
+const MAX_EVENTS_CONNECTIONS: usize = 100;
+
+/// Decrements the shared open-connections counter when an `/events`
+/// stream ends, on every exit path (normal disconnect, write error, or a
+/// panic) rather than just the one at the bottom of `stream_events`.
+struct ConnectionGuard(Arc<AtomicUsize>);
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn parse_args() -> (PathBuf, u16) {
     let mut file = PathBuf::from("../telemetry/telemetry.jsonl");
@@ -108,13 +126,14 @@ fn stream_events(mut w: Box<dyn Write + Send>, cache: Arc<Mutex<Vec<String>>>) {
     }
 }
 
-fn run_server(file_path: PathBuf, port: u16) {
+fn run_server(file_path: PathBuf, port: u16, max_events_connections: usize) {
     let addr = format!("0.0.0.0:{port}");
     eprintln!("SSE server reading {:?} on http://{addr}", file_path);
 
     let cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cache_bg = cache.clone();
     let file_bg = file_path.clone();
+    let events_connections: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // refresh file cache
     thread::spawn(move || {
@@ -136,6 +155,7 @@ fn run_server(file_path: PathBuf, port: u16) {
     // disconnected.
     for request in server.incoming_requests() {
         let cache = cache.clone();
+        let events_connections = events_connections.clone();
         thread::spawn(move || {
             let url = request.url().to_string();
             let method = request.method().clone();
@@ -164,6 +184,15 @@ fn run_server(file_path: PathBuf, port: u16) {
             }
 
             if url.starts_with("/events") {
+                let prev_open = events_connections.fetch_add(1, Ordering::SeqCst);
+                if prev_open >= max_events_connections {
+                    events_connections.fetch_sub(1, Ordering::SeqCst);
+                    let resp = Response::from_string("too many open /events connections")
+                        .with_status_code(503);
+                    let _ = request.respond(resp);
+                    return;
+                }
+                let _guard = ConnectionGuard(events_connections.clone());
                 let writer = request.into_writer();
                 stream_events(writer, cache);
                 return;
@@ -177,7 +206,7 @@ fn run_server(file_path: PathBuf, port: u16) {
 
 fn main() {
     let (file_path, port) = parse_args();
-    run_server(file_path, port);
+    run_server(file_path, port, MAX_EVENTS_CONNECTIONS);
 }
 
 #[cfg(test)]
@@ -202,7 +231,7 @@ mod streaming_tests {
 
         let port = free_port();
         let server_file = file_path.clone();
-        thread::spawn(move || run_server(server_file, port));
+        thread::spawn(move || run_server(server_file, port, MAX_EVENTS_CONNECTIONS));
         // give the server time to bind and the cache-refresh thread time to start
         thread::sleep(Duration::from_millis(500));
 
@@ -259,7 +288,7 @@ mod streaming_tests {
 
         let port = free_port();
         let server_file = file_path.clone();
-        thread::spawn(move || run_server(server_file, port));
+        thread::spawn(move || run_server(server_file, port, MAX_EVENTS_CONNECTIONS));
         thread::sleep(Duration::from_millis(500));
 
         // Open /events and leave it hanging (never read its response) -
@@ -277,5 +306,51 @@ mod streaming_tests {
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 200"), "expected /health to answer promptly; got: {text}");
         assert!(text.ends_with("ok") || text.contains("\r\n\r\nok"), "expected body \"ok\"; got: {text}");
+    }
+
+    #[test]
+    fn events_connections_beyond_the_cap_get_503_without_disturbing_existing_streams() {
+        let dir = std::env::temp_dir().join(format!("tri_sync_http_test3_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("telemetry.jsonl");
+        std::fs::write(&file_path, "").unwrap();
+
+        let port = free_port();
+        let server_file = file_path.clone();
+        let cap = 2usize;
+        thread::spawn(move || run_server(server_file, port, cap));
+        thread::sleep(Duration::from_millis(500));
+
+        // Open `cap` connections and leave them hanging, same as the
+        // responsiveness test above - each one holds a thread and a slot
+        // in the counter for the rest of this test.
+        let mut open_streams = Vec::new();
+        for _ in 0..cap {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            open_streams.push(s);
+            // give the server's spawned thread time to register the
+            // connection (fetch_add) before the next one connects, so the
+            // count this test relies on isn't racy.
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // The (cap + 1)th connection should be turned away with 503.
+        let mut over_cap = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        over_cap.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        over_cap.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut resp = Vec::new();
+        over_cap.read_to_end(&mut resp).unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 503"), "expected the over-cap connection to get 503; got: {text}");
+
+        // One of the connections that was already open and under the cap
+        // should still be a live, working stream, not something the
+        // rejection above disturbed.
+        let mut still_open = open_streams.remove(0);
+        still_open.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut head = [0u8; 15];
+        still_open.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200 OK", "expected the already-open stream to still be serving normally");
     }
 }
