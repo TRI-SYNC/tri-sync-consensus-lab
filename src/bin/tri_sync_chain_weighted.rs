@@ -1,3 +1,9 @@
+// This sim correlates several same-length Vecs (nodes, x_vec, w_out, ...)
+// by a shared `i`/`k` index throughout; the same explicit-index style is
+// used even in loops that happen to touch only one Vec, for consistency
+// with neighboring loops in the same function that touch several.
+#![allow(clippy::needless_range_loop)]
+
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
@@ -86,8 +92,8 @@ fn parse_args() -> (u64, String, String) {
 /// block was originally created, in the same order, so the resulting
 /// head is exactly what it would have been had the process never
 /// stopped. Starts from `genesis` and returns the resulting head. A line
-/// that fails to parse is treated as a corrupt log, not silently skipped
-/// - the same posture as the rest of this crate takes toward tampered or
+/// that fails to parse is treated as a corrupt log, not silently skipped,
+/// the same posture as the rest of this crate takes toward tampered or
 /// truncated state.
 fn load_chain_log(
     path: &str,
@@ -339,7 +345,7 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
 
         // phase
         if fast_sync_remaining == 0 && dval < delta_explode { fast_sync_remaining = fast_cycles; }
-        if fast_sync_remaining > 0 { fast_sync_remaining -= 1; }
+        fast_sync_remaining = fast_sync_remaining.saturating_sub(1);
 
         // completion
         let all_ok = (0..n).all(|i| !clarified[i] && l2(&v_sub(&x_vec[i], &refs[i])) <= epsilon_align);
@@ -411,7 +417,7 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
             }
             head = best.hash.clone();
 
-            let entry = height_candidates.entry(candidate_height).or_insert_with(Vec::new);
+            let entry = height_candidates.entry(candidate_height).or_default();
             for b in &created {
                 if !entry.contains(&b.hash) { entry.push(b.hash.clone()); }
             }

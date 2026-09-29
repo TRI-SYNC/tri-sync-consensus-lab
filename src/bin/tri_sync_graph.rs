@@ -1,3 +1,9 @@
+// This sim correlates several same-length Vecs (nodes, x_vec, w_out, ...)
+// by a shared `i`/`k` index throughout; the same explicit-index style is
+// used even in loops that happen to touch only one Vec, for consistency
+// with neighboring loops in the same function that touch several.
+#![allow(clippy::needless_range_loop)]
+
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
@@ -241,7 +247,7 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         if fast_sync_remaining == 0 && dval < delta_explode {
             fast_sync_remaining = fast_cycles;
         }
-        if fast_sync_remaining > 0 { fast_sync_remaining -= 1; }
+        fast_sync_remaining = fast_sync_remaining.saturating_sub(1);
 
         // completion
         let all_ok = (0..n).all(|i| !clarified[i] && l2(&v_sub(&x_vec[i], &refs[i])) <= epsilon_align);
@@ -268,7 +274,7 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
             done,
         };
 
-        if verbose && (t % 5 == 0 || done) {
+        if verbose && (t.is_multiple_of(5) || done) {
             telemetry::print_row(&row);
         }
 

@@ -1,5 +1,7 @@
 # tri-sync-consensus-lab
 
+[![CI](https://github.com/TRI-SYNC/tri-sync-consensus-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/TRI-SYNC/tri-sync-consensus-lab/actions/workflows/ci.yml)
+
 Simulation testbed for trust-weighted sensor fusion and block-based
 agreement across noisy, adversarial-free nodes; telemetry-instrumented,
 not yet cryptographically secured. Cargo package: `tri_sync`.
