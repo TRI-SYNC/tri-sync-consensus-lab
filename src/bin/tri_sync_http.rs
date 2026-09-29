@@ -108,8 +108,7 @@ fn stream_events(mut w: Box<dyn Write + Send>, cache: Arc<Mutex<Vec<String>>>) {
     }
 }
 
-fn main() {
-    let (file_path, port) = parse_args();
+fn run_server(file_path: PathBuf, port: u16) {
     let addr = format!("0.0.0.0:{port}");
     eprintln!("SSE server reading {:?} on http://{addr}", file_path);
 
@@ -173,5 +172,110 @@ fn main() {
             let resp = Response::from_string("not found").with_status_code(404);
             let _ = request.respond(resp);
         });
+    }
+}
+
+fn main() {
+    let (file_path, port) = parse_args();
+    run_server(file_path, port);
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    /// Binds to port 0 to get an OS-assigned free port, then releases it
+    /// immediately - good enough for a test server started moments later,
+    /// and avoids hardcoding a port that might already be in use.
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn events_stream_new_lines_incrementally_not_as_a_batch_at_connect_time() {
+        let dir = std::env::temp_dir().join(format!("tri_sync_http_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("telemetry.jsonl");
+        std::fs::write(&file_path, "").unwrap();
+
+        let port = free_port();
+        let server_file = file_path.clone();
+        thread::spawn(move || run_server(server_file, port));
+        // give the server time to bind and the cache-refresh thread time to start
+        thread::sleep(Duration::from_millis(500));
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        stream.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n").unwrap();
+
+        // Append a uniquely marked line only *after* the connection is
+        // already open. A batch-at-connect-time implementation sends its
+        // one complete response immediately using whatever backlog
+        // existed at connect time, then the response ends - it could
+        // never see a line appended afterward. Real streaming should
+        // deliver it on this same connection well within the tailer's
+        // ~300ms poll interval.
+        thread::sleep(Duration::from_millis(200));
+        let marker = "STREAM_TEST_MARKER_12345";
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&file_path).unwrap();
+            writeln!(f, "{{\"marker\":\"{marker}\"}}").unwrap();
+        }
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while Instant::now() < deadline {
+            match stream.read(&mut chunk) {
+                Ok(0) => break, // connection closed - a batch response would do this
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if String::from_utf8_lossy(&buf).contains(marker) {
+                        found = true;
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => continue,
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        assert!(
+            found,
+            "expected the line appended after connecting to arrive on the still-open /events \
+             connection within 5s; got {} bytes: {}",
+            buf.len(), String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn health_stays_responsive_while_an_events_connection_is_open() {
+        let dir = std::env::temp_dir().join(format!("tri_sync_http_test2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("telemetry.jsonl");
+        std::fs::write(&file_path, "").unwrap();
+
+        let port = free_port();
+        let server_file = file_path.clone();
+        thread::spawn(move || run_server(server_file, port));
+        thread::sleep(Duration::from_millis(500));
+
+        // Open /events and leave it hanging (never read its response) -
+        // if the server handled requests inline on one loop instead of a
+        // thread per request, this would starve every request behind it.
+        let mut events_stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        events_stream.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+
+        let mut health_stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        health_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        health_stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+
+        let mut resp = Vec::new();
+        health_stream.read_to_end(&mut resp).unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200"), "expected /health to answer promptly; got: {text}");
+        assert!(text.ends_with("ok") || text.contains("\r\n\r\nok"), "expected body \"ok\"; got: {text}");
     }
 }

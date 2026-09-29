@@ -112,22 +112,32 @@ fn load_chain_log(
     Ok(head)
 }
 
-fn main() -> io::Result<()> {
-    // Dependencies used in this bin:
-    // sha2 + hex are required; see Cargo.toml update.
-    let (steps, out_path, chain_log_path) = parse_args();
+/// Final state of a run, returned by `simulate` so both `main` (for the
+/// printed adversarial summary) and tests can inspect it directly instead
+/// of scraping stdout or the output files.
+struct Outcome {
+    truth: Vec<f64>,
+    head_state: Vec<f64>,
+    head_height: u64,
+    // Only read by the persistence-resume test; a real run already prints
+    // this (if nonzero) via the eprintln at load time.
+    #[allow(dead_code)]
+    loaded_blocks: usize,
+    w_out: Vec<BTreeMap<usize, f64>>,
+}
 
+fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose: bool) -> io::Result<Outcome> {
     // Ensure output dir exists
-    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+    if let Some(parent) = std::path::Path::new(out_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Some(parent) = std::path::Path::new(&chain_log_path).parent() {
+    if let Some(parent) = std::path::Path::new(chain_log_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut file = File::create(&out_path)?;
+    let mut file = File::create(out_path)?;
 
-    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut rng = StdRng::seed_from_u64(seed);
     let n: usize = 30;
     let d: usize = 4;
 
@@ -193,15 +203,15 @@ fn main() -> io::Result<()> {
         sig_weight: 999.0,
         hash: "GENESIS".to_string(),
     };
-    let mut head = load_chain_log(&chain_log_path, &genesis, &mut blocks)?;
+    let mut head = load_chain_log(chain_log_path, &genesis, &mut blocks)?;
     let loaded_blocks = blocks.len() - 1; // exclude genesis
-    if loaded_blocks > 0 {
+    if loaded_blocks > 0 && verbose {
         eprintln!(
             "resumed from {chain_log_path}: {loaded_blocks} blocks, head height {}",
             blocks.get(&head).unwrap().height
         );
     }
-    let mut chain_log = std::fs::OpenOptions::new().create(true).append(true).open(&chain_log_path)?;
+    let mut chain_log = std::fs::OpenOptions::new().create(true).append(true).open(chain_log_path)?;
     let quorum: f64 = 10.0;
     let fork_prob: f64 = 0.08;
     let mut forks: u64 = 0;
@@ -417,25 +427,121 @@ fn main() -> io::Result<()> {
         });
 
         let line = serde_json::to_string(&out_obj).unwrap();
-        println!("{line}");
+        if verbose { println!("{line}"); }
         writeln!(file, "{line}")?;
 
         if done { break; }
     }
 
-    println!("\n--- adversarial summary ---");
-    let final_state = &blocks.get(&head).unwrap().state;
-    println!("|head.state - truth| = {:.4}", l2(&v_sub(final_state, &truth)));
+    let head_block = blocks.get(&head).unwrap().clone();
+    Ok(Outcome {
+        truth,
+        head_state: head_block.state,
+        head_height: head_block.height,
+        loaded_blocks,
+        w_out,
+    })
+}
 
-    let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
-    let incoming = |m: usize| -> Vec<f64> { w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect() };
-    let honest_incoming: Vec<f64> = (0..n).filter(|i| !MALICIOUS_NODES.contains(i)).flat_map(incoming).collect();
-    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter().copied().flat_map(incoming).collect();
+fn mean(v: &[f64]) -> f64 { if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 } }
+
+fn incoming(w_out: &[BTreeMap<usize, f64>], m: usize) -> Vec<f64> {
+    w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect()
+}
+
+fn print_adversarial_summary(outcome: &Outcome) {
+    println!("\n--- adversarial summary ---");
+    println!("final head height: {}", outcome.head_height);
+    println!("|head.state - truth| = {:.4}", l2(&v_sub(&outcome.head_state, &outcome.truth)));
+
+    let n = outcome.w_out.len();
+    let honest_incoming: Vec<f64> = (0..n).filter(|i| !MALICIOUS_NODES.contains(i))
+        .flat_map(|i| incoming(&outcome.w_out, i)).collect();
+    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter()
+        .flat_map(|&i| incoming(&outcome.w_out, i)).collect();
     println!(
         "mean incoming trust weight: honest={:.4} (n={})  malicious={:.4} (n={})",
         mean(&honest_incoming), honest_incoming.len(),
         mean(&malicious_incoming), malicious_incoming.len()
     );
+}
 
+fn main() -> io::Result<()> {
+    // Dependencies used in this bin:
+    // sha2 + hex are required; see Cargo.toml update.
+    let (steps, out_path, chain_log_path) = parse_args();
+    let outcome = simulate(SEED, steps, &out_path, &chain_log_path, true)?;
+    print_adversarial_summary(&outcome);
     Ok(())
+}
+
+#[cfg(test)]
+mod sim_tests {
+    use super::*;
+
+    fn tmp_path(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("tri_sync_chain_test_{}_{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn reproducible_given_the_same_seed() {
+        let out = tmp_path("telemetry_a.jsonl");
+        let log_a = tmp_path("chain_a.jsonl");
+        let log_b = tmp_path("chain_b.jsonl");
+        let a = simulate(SEED, 60, &out, &log_a, false).unwrap();
+        let b = simulate(SEED, 60, &out, &log_b, false).unwrap();
+        assert_eq!(a.truth, b.truth);
+        assert_eq!(a.head_state, b.head_state);
+        assert_eq!(a.head_height, b.head_height);
+    }
+
+    #[test]
+    fn liars_end_up_with_lower_incoming_trust_than_honest_nodes() {
+        // 200 steps isn't enough for the separation to show reliably (it's
+        // briefly inverted); this binary's own CLI default of 400 is.
+        let out = tmp_path("telemetry_b.jsonl");
+        let log = tmp_path("chain_c.jsonl");
+        let outcome = simulate(SEED, 400, &out, &log, false).unwrap();
+        let n = outcome.w_out.len();
+        let honest: Vec<f64> = (0..n).filter(|i| !MALICIOUS_NODES.contains(i))
+            .flat_map(|i| incoming(&outcome.w_out, i)).collect();
+        let malicious: Vec<f64> = MALICIOUS_NODES.iter()
+            .flat_map(|&i| incoming(&outcome.w_out, i)).collect();
+        assert!(
+            mean(&malicious) < mean(&honest) - 0.1,
+            "malicious={} honest={}", mean(&malicious), mean(&honest)
+        );
+    }
+
+    #[test]
+    fn resuming_from_a_chain_log_continues_instead_of_restarting() {
+        let out = tmp_path("telemetry_c.jsonl");
+        let log = tmp_path("chain_resume.jsonl");
+        let first = simulate(SEED, 40, &out, &log, false).unwrap();
+        assert_eq!(first.loaded_blocks, 0, "first run should start from genesis");
+        assert!(first.head_height > 0, "expected at least one block in 40 steps");
+
+        let second = simulate(SEED, 40, &out, &log, false).unwrap();
+        assert_eq!(second.loaded_blocks, first.head_height as usize);
+        assert!(
+            second.head_height > first.head_height,
+            "resumed run should extend the chain, not restart it: first={} second={}",
+            first.head_height, second.head_height
+        );
+    }
+
+    #[test]
+    fn a_corrupt_chain_log_line_is_a_hard_error_not_silently_skipped() {
+        let log = tmp_path("chain_corrupt.jsonl");
+        std::fs::write(&log, "not valid json at all\n").unwrap();
+        let genesis = Block {
+            height: 0, parent: String::new(), state: vec![0.0; 4],
+            confidence: 1.0, sig_weight: 999.0, hash: "GENESIS".to_string(),
+        };
+        let mut blocks = HashMap::new();
+        let err = load_chain_log(&log, &genesis, &mut blocks).unwrap_err();
+        assert!(err.to_string().contains("corrupt chain log line"), "{err}");
+    }
 }

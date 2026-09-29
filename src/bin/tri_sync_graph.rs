@@ -45,8 +45,16 @@ fn fuse_vec(values: &[Vec<f64>], weights: &[f64], trim_frac: f64) -> Vec<f64> {
     out
 }
 
-fn main() {
-    let mut rng = StdRng::seed_from_u64(SEED);
+/// Final state of a run, returned by `simulate` so both `main` (for the
+/// printed adversarial summary) and tests can inspect it directly.
+struct Outcome {
+    truth: Vec<f64>,
+    x_vec: Vec<Vec<f64>>,
+    w_out: Vec<std::collections::BTreeMap<usize, f64>>,
+}
+
+fn simulate(seed: u64, verbose: bool) -> Outcome {
+    let mut rng = StdRng::seed_from_u64(seed);
 
     let n: usize = 30;
     let d: usize = 4;
@@ -111,7 +119,7 @@ fn main() {
     let mut fast_sync_remaining: u64 = 0;
     let mut complete_streak: u64 = 0;
 
-    telemetry::print_header();
+    if verbose { telemetry::print_header(); }
 
     loop {
         t += 1;
@@ -260,43 +268,90 @@ fn main() {
             done,
         };
 
-        if t % 5 == 0 || done {
+        if verbose && (t % 5 == 0 || done) {
             telemetry::print_row(&row);
         }
 
         if done {
-            println!("\n✅ COMPLETE: directed trust alignment achieved (sustained).");
+            if verbose { println!("\n✅ COMPLETE: directed trust alignment achieved (sustained)."); }
             break;
         }
         if t >= 400 {
-            println!("\nℹ️  Not completed within step budget (normal under shocks/noise).");
+            if verbose { println!("\nℹ️  Not completed within step budget (normal under shocks/noise)."); }
             break;
         }
     }
 
+    Outcome { truth, x_vec, w_out }
+}
+
+fn mean(v: &[f64]) -> f64 { if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 } }
+
+/// Every OTHER node's edge weight toward node `m`, across the whole
+/// directed graph. If the network learned to distrust a liar, its
+/// incoming weight should be measurably lower than an honest node's.
+fn incoming(w_out: &[std::collections::BTreeMap<usize, f64>], m: usize) -> Vec<f64> {
+    w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect()
+}
+
+fn print_adversarial_summary(outcome: &Outcome) {
+    let n = outcome.x_vec.len();
     println!("\n--- adversarial summary ---");
     let honest_err: Vec<f64> = (0..n)
         .filter(|i| !MALICIOUS_NODES.contains(i))
-        .map(|i| l2(&v_sub(&x_vec[i], &truth)))
+        .map(|i| l2(&v_sub(&outcome.x_vec[i], &outcome.truth)))
         .collect();
-    let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
     println!("mean |x - truth| for honest nodes: {:.4}", mean(&honest_err));
 
-    // Incoming trust: for each node m, every OTHER node's edge weight
-    // toward m, across the whole directed graph. If the network learned
-    // to distrust a liar, its incoming weight should be measurably lower
-    // than an honest node's.
-    let incoming = |m: usize| -> Vec<f64> {
-        w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect()
-    };
     let honest_incoming: Vec<f64> = (0..n)
         .filter(|i| !MALICIOUS_NODES.contains(i))
-        .flat_map(incoming)
+        .flat_map(|i| incoming(&outcome.w_out, i))
         .collect();
-    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter().copied().flat_map(incoming).collect();
+    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter()
+        .flat_map(|&i| incoming(&outcome.w_out, i))
+        .collect();
     println!(
         "mean incoming trust weight: honest={:.4} (n={})  malicious={:.4} (n={})",
         mean(&honest_incoming), honest_incoming.len(),
         mean(&malicious_incoming), malicious_incoming.len()
     );
+}
+
+fn main() {
+    let outcome = simulate(SEED, true);
+    print_adversarial_summary(&outcome);
+}
+
+#[cfg(test)]
+mod sim_tests {
+    use super::*;
+
+    #[test]
+    fn reproducible_given_the_same_seed() {
+        let a = simulate(SEED, false);
+        let b = simulate(SEED, false);
+        assert_eq!(a.truth, b.truth);
+        assert_eq!(a.x_vec, b.x_vec);
+        for (wa, wb) in a.w_out.iter().zip(b.w_out.iter()) {
+            assert_eq!(wa, wb);
+        }
+    }
+
+    #[test]
+    fn liars_end_up_with_lower_incoming_trust_than_honest_nodes() {
+        let outcome = simulate(SEED, false);
+        let n = outcome.x_vec.len();
+        let honest_incoming: Vec<f64> = (0..n)
+            .filter(|i| !MALICIOUS_NODES.contains(i))
+            .flat_map(|i| incoming(&outcome.w_out, i))
+            .collect();
+        let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter()
+            .flat_map(|&i| incoming(&outcome.w_out, i))
+            .collect();
+        assert!(
+            mean(&malicious_incoming) < mean(&honest_incoming) - 0.1,
+            "malicious={} honest={}",
+            mean(&malicious_incoming), mean(&honest_incoming)
+        );
+    }
 }

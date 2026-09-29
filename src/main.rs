@@ -27,8 +27,18 @@ const MALICIOUS_SIGMA: f64 = 0.15;
 use tri_sync::types::{NodeState, Observation, TelemetryRow};
 use tri_sync::{consensus, invariants, node, phase, telemetry, trust_graph};
 
-fn main() {
-    let mut rng = StdRng::seed_from_u64(SEED);
+/// Final state of a run, returned by `simulate` so both `main` (for the
+/// printed adversarial summary) and tests (for invariant/reproducibility/
+/// adversarial-separation assertions) can inspect it without re-running
+/// the loop or scraping stdout.
+struct Outcome {
+    truth: f64,
+    r_star_final: f64,
+    nodes: Vec<NodeState>,
+}
+
+fn simulate(seed: u64, verbose: bool) -> Outcome {
+    let mut rng = StdRng::seed_from_u64(seed);
 
     let n = 25usize;
     let mut nodes: Vec<NodeState> = (0..n).map(|_| NodeState{
@@ -68,7 +78,7 @@ fn main() {
     #[allow(unused_assignments)]
     let mut r_star_final: f64 = 0.0;
 
-    telemetry::print_header();
+    if verbose { telemetry::print_header(); }
 
     loop {
         t += 1;
@@ -162,12 +172,12 @@ fn main() {
             done,
         };
 
-        if t % 5 == 0 || done {
+        if verbose && (t % 5 == 0 || done) {
             telemetry::print_row(&row);
         }
 
         if done {
-            println!("\n✅ COMPLETE: sustained alignment achieved.");
+            if verbose { println!("\n✅ COMPLETE: sustained alignment achieved."); }
             break;
         }
         if t >= 250 {
@@ -176,14 +186,21 @@ fn main() {
             // LIE_BIAS every step, so they never actually converge and
             // `done` structurally can't fire while they're present. That
             // is the expected outcome here, not a failure of the run.
-            println!(
-                "\nℹ️  Not completed within step budget (expected: malicious nodes \
-                 never converge, so global completion can't fire while they're present)."
-            );
+            if verbose {
+                println!(
+                    "\nℹ️  Not completed within step budget (expected: malicious nodes \
+                     never converge, so global completion can't fire while they're present)."
+                );
+            }
             break;
         }
     }
 
+    Outcome { truth, r_star_final, nodes }
+}
+
+fn print_adversarial_summary(outcome: &Outcome) {
+    let Outcome { truth, r_star_final, nodes } = outcome;
     println!("\n--- adversarial summary ---");
     println!("truth={truth:.4}  r_star={r_star_final:.4}  |truth - r_star|={:.4}",
         (truth - r_star_final).abs());
@@ -203,6 +220,56 @@ fn main() {
         println!(
             "  malicious node {i}: reliability={:.4}  |x - r_star|={:.4}",
             nodes[i].reliability, (nodes[i].x - r_star_final).abs()
+        );
+    }
+}
+
+fn main() {
+    let outcome = simulate(SEED, true);
+    print_adversarial_summary(&outcome);
+}
+
+#[cfg(test)]
+mod sim_tests {
+    use super::*;
+
+    #[test]
+    fn reproducible_given_the_same_seed() {
+        let a = simulate(SEED, false);
+        let b = simulate(SEED, false);
+        assert_eq!(a.truth, b.truth);
+        assert_eq!(a.r_star_final, b.r_star_final);
+        for (na, nb) in a.nodes.iter().zip(b.nodes.iter()) {
+            assert_eq!(na.reliability, nb.reliability);
+            assert_eq!(na.x, nb.x);
+        }
+    }
+
+    #[test]
+    fn fused_reference_tracks_truth_despite_liars() {
+        let outcome = simulate(SEED, false);
+        // LIE_BIAS is 3.0; the fused reference should stay far closer to
+        // truth than that despite 5 of 25 nodes lying every step.
+        assert!(
+            (outcome.truth - outcome.r_star_final).abs() < 0.5,
+            "|truth - r_star| = {}",
+            (outcome.truth - outcome.r_star_final).abs()
+        );
+    }
+
+    #[test]
+    fn liars_end_up_measurably_less_reliable_than_honest_nodes() {
+        let outcome = simulate(SEED, false);
+        let honest_mean: f64 = outcome.nodes.iter().enumerate()
+            .filter(|(i, _)| !MALICIOUS_NODES.contains(i))
+            .map(|(_, nd)| nd.reliability)
+            .sum::<f64>() / (outcome.nodes.len() - MALICIOUS_NODES.len()) as f64;
+        let malicious_mean: f64 = MALICIOUS_NODES.iter()
+            .map(|&i| outcome.nodes[i].reliability)
+            .sum::<f64>() / MALICIOUS_NODES.len() as f64;
+        assert!(
+            malicious_mean < honest_mean - 0.2,
+            "malicious_mean={malicious_mean} honest_mean={honest_mean}"
         );
     }
 }
