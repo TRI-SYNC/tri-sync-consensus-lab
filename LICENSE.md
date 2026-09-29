@@ -77,8 +77,8 @@ permit using the code in production or in derivative works.
 
 ## Requesting a license
 
-To request any of the licenses above, contact the copyright holder.
-*(Add contact details here before relying on this document.)*
+To request any of the licenses above, contact the copyright holder at
+tri@trisync.dev.
 
 ## Not legal advice
 
