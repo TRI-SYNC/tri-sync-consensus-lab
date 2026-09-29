@@ -4,6 +4,18 @@ use rand::rngs::StdRng;
 /// Fixed by default so a run can be reproduced exactly; not yet exposed
 /// as a CLI flag.
 const SEED: u64 = 42;
+
+/// Nodes that report a deliberate, consistent lie instead of an honest
+/// noisy reading - conflicting data, not a Sybil cluster or an
+/// equivocating signer. 6 of 30 = 20% of the network, avoiding the
+/// indices that already get the small honest observation bias below.
+const MALICIOUS_NODES: [usize; 6] = [3, 8, 13, 18, 23, 28];
+/// The fixed offset a malicious node reports instead of the truth.
+const LIE_BIAS: f64 = 3.0;
+/// Malicious nodes get the network's lowest noise bucket, so
+/// `invariants::clarity_gate` never treats them as suspiciously noisy -
+/// only the trust-weighting mechanism can catch them.
+const MALICIOUS_SIGMA: f64 = 0.12;
 use rand_distr::StandardNormal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -51,26 +63,61 @@ fn prefer(a: &Block, b: &Block) -> bool {
     false
 }
 
-fn parse_args() -> (u64, String) {
+fn parse_args() -> (u64, String, String) {
     let mut steps: u64 = 600;
     let mut out = "../telemetry/telemetry.jsonl".to_string();
+    let mut chain_log = "../telemetry/tri_sync_chain_weighted.blocks.jsonl".to_string();
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--steps" => { i += 1; steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(steps); }
             "--out" => { i += 1; out = args.get(i).cloned().unwrap_or(out); }
+            "--chain-log" => { i += 1; chain_log = args.get(i).cloned().unwrap_or(chain_log); }
             _ => {}
         }
         i += 1;
     }
-    (steps, out)
+    (steps, out, chain_log)
+}
+
+/// Loads a persisted chain log (one JSON `Block` per line) into `blocks`,
+/// replaying the same `prefer` comparisons that were applied when each
+/// block was originally created, in the same order, so the resulting
+/// head is exactly what it would have been had the process never
+/// stopped. Starts from `genesis` and returns the resulting head. A line
+/// that fails to parse is treated as a corrupt log, not silently skipped
+/// - the same posture as the rest of this crate takes toward tampered or
+/// truncated state.
+fn load_chain_log(
+    path: &str,
+    genesis: &Block,
+    blocks: &mut HashMap<String, Block>,
+) -> io::Result<String> {
+    blocks.insert(genesis.hash.clone(), genesis.clone());
+    let mut head = genesis.hash.clone();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(head);
+    };
+    for (line_no, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() { continue; }
+        let b: Block = serde_json::from_str(line).map_err(|e| {
+            io::Error::other(format!("{path}:{}: corrupt chain log line: {e}", line_no + 1))
+        })?;
+        let cur = blocks.get(&head).unwrap().clone();
+        if prefer(&cur, &b) { head = b.hash.clone(); }
+        blocks.insert(b.hash.clone(), b);
+    }
+    Ok(head)
 }
 
 fn main() -> io::Result<()> {
-    let (steps, out_path) = parse_args();
+    let (steps, out_path, chain_log_path) = parse_args();
 
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = std::path::Path::new(&chain_log_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = File::create(&out_path)?;
@@ -133,11 +180,20 @@ fn main() -> io::Result<()> {
     let mut fast_sync_remaining: u64 = 0;
     let mut complete_streak: u64 = 0;
 
-    // chain
+    // chain: replayed from chain_log_path if it already holds a previous
+    // run's blocks, so the ledger actually persists across process exits
+    // instead of always starting fresh from genesis.
     let mut blocks: HashMap<String, Block> = HashMap::new();
     let genesis = Block { height: 0, parent: "".into(), state: vec![0.0; d], confidence: 1.0, sig_weight: 999.0, reconciles: vec![], hash: "GENESIS".into() };
-    blocks.insert(genesis.hash.clone(), genesis.clone());
-    let mut head = genesis.hash.clone();
+    let mut head = load_chain_log(&chain_log_path, &genesis, &mut blocks)?;
+    let loaded_blocks = blocks.len() - 1; // exclude genesis
+    if loaded_blocks > 0 {
+        eprintln!(
+            "resumed from {chain_log_path}: {loaded_blocks} blocks, head height {}",
+            blocks.get(&head).unwrap().height
+        );
+    }
+    let mut chain_log = std::fs::OpenOptions::new().create(true).append(true).open(&chain_log_path)?;
 
     let quorum_w: f64 = rel_sum * 0.55; // weighted quorum
     let fork_prob: f64 = 0.10;
@@ -155,13 +211,20 @@ fn main() -> io::Result<()> {
 
         // observe
         for i in 0..n {
-            let noise = match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 };
+            let is_malicious = MALICIOUS_NODES.contains(&i);
+            let noise = if is_malicious {
+                MALICIOUS_SIGMA
+            } else {
+                match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 }
+            };
             sigma[i] = noise;
             let bias = if i % 11 == 0 { 0.05 } else { 0.0 };
             let mut ov = vec![0.0; d];
             for k in 0..d {
+                // Always draw, whether or not it's used, so the RNG
+                // stream doesn't depend on which nodes are malicious.
                 let eps: f64 = rng.sample::<f64, _>(StandardNormal) * noise;
-                ov[k] = truth[k] + bias + eps;
+                ov[k] = if is_malicious { truth[k] + LIE_BIAS } else { truth[k] + bias + eps };
             }
             obs_vec[i] = ov;
         }
@@ -234,8 +297,15 @@ fn main() -> io::Result<()> {
                 }
                 continue;
             }
-            let e_self = l2(&v_sub(&obs_vec[i], &truth));
-            let e_fused = l2(&v_sub(&x_vec[i], &truth));
+            // Against head_block.state (the chain's last agreed-upon
+            // state, public to every node), not truth: no real node can
+            // compare to ground truth. Comparing to refs[i] instead would
+            // be circular - x_vec[i] is itself a blend toward refs[i], so
+            // it would always look like an improvement by construction.
+            // head_block.state is independent of this step's blend, so
+            // this can genuinely go either way.
+            let e_self = l2(&v_sub(&obs_vec[i], &head_block.state));
+            let e_fused = l2(&v_sub(&x_vec[i], &head_block.state));
             let delta_e = e_self - e_fused;
             for (j, share) in shares[i].iter().cloned() {
                 let wij = w_out[i].get(&j).cloned().unwrap_or(0.0);
@@ -261,55 +331,79 @@ fn main() -> io::Result<()> {
         if all_ok { complete_streak += 1; } else { complete_streak = 0; }
         let done = complete_streak >= complete_cycles;
 
-        // propose blocks (forks)
+        // propose blocks (forks): every proposal this step extends the
+        // SAME parent at the SAME height, so a fork_prob step can produce
+        // two true siblings instead of one candidate silently building on
+        // top of the other. The winner is chosen once, after every
+        // proposal for this step exists, not by racing head forward
+        // after each one - racing forward is what let the second
+        // proposal end up parented on the first (see git history for the
+        // bug this replaced).
         let proposals = if rng.gen::<f64>() < fork_prob { forks += 1; 2 } else { 1 };
-        let mut created: Vec<String> = vec![];
+        let candidate_height = head_block.height + 1;
+        let mut created: Vec<Block> = vec![];
 
         for _ in 0..proposals {
+            // Each proposer sees only a random subset of the network's
+            // current x_vec, modeling asynchronous/partitioned
+            // visibility - without this, cand (and everything derived
+            // from it) is a deterministic function of x_vec alone, so two
+            // proposals in the same fork step were always byte-identical
+            // and reconciliation could never actually fire.
+            let contributors: Vec<usize> = (0..n).filter(|_| rng.gen::<f64>() < 0.85).collect();
+            let contributors: Vec<usize> =
+                if contributors.is_empty() { (0..n).collect() } else { contributors };
+
             let mut cand = vec![0.0; d];
-            for i in 0..n { for k in 0..d { cand[k] += x_vec[i][k]; } }
-            for k in 0..d { cand[k] /= n as f64; }
+            for &i in &contributors { for k in 0..d { cand[k] += x_vec[i][k]; } }
+            for k in 0..d { cand[k] /= contributors.len() as f64; }
 
             let mut var = 0.0;
-            for i in 0..n {
+            for &i in &contributors {
                 let diff = v_sub(&x_vec[i], &cand);
                 var += l2(&diff).powi(2);
             }
-            var /= n as f64;
+            var /= contributors.len() as f64;
             let conf = 1.0 / (1.0 + var);
 
-            // weighted signatures: sign if candidate improves vs head; else partial
-            let e_head = l2(&v_sub(&head_block.state, &truth));
-            let e_cand = l2(&v_sub(&cand, &truth));
+            // Each node signs based on its OWN locked estimate x_vec[i],
+            // weighted by its reliability, not ground truth: does the
+            // candidate look closer to what this node itself believes
+            // than the current head does.
             let mut sigw = 0.0;
-            if e_cand <= e_head {
-                sigw = rel_sum;
-            } else {
-                for i in 0..n { if i % 3 == 0 { sigw += 0.25 * rel[i]; } }
+            for i in 0..n {
+                let e_head_i = l2(&v_sub(&head_block.state, &x_vec[i]));
+                let e_cand_i = l2(&v_sub(&cand, &x_vec[i]));
+                if e_cand_i <= e_head_i {
+                    sigw += rel[i];
+                }
             }
 
             if sigw >= quorum_w {
-                let parent = head.clone();
-                let height = blocks.get(&head).unwrap().height + 1;
-                let hash = hash_block(height, &parent, &cand, conf, sigw, &[]);
-                let b = Block { height, parent: parent.clone(), state: cand, confidence: conf, sig_weight: sigw, reconciles: vec![], hash: hash.clone() };
+                let hash = hash_block(candidate_height, &head_block.hash, &cand, conf, sigw, &[]);
+                let b = Block { height: candidate_height, parent: head_block.hash.clone(), state: cand, confidence: conf, sig_weight: sigw, reconciles: vec![], hash: hash.clone() };
                 blocks.insert(hash.clone(), b.clone());
-                created.push(hash.clone());
-                let cur = blocks.get(&head).unwrap().clone();
-                if prefer(&cur, &b) { head = hash; }
+                writeln!(chain_log, "{}", serde_json::to_string(&b).unwrap())?;
+                chain_log.flush()?;
+                created.push(b);
             }
         }
 
-        let hh = blocks.get(&head).unwrap().height;
         if !created.is_empty() {
-            let entry = height_candidates.entry(hh).or_insert_with(Vec::new);
-            for x in created {
-                if !entry.contains(&x) { entry.push(x); }
+            let mut best = head_block.clone();
+            for b in &created {
+                if prefer(&best, b) { best = b.clone(); }
+            }
+            head = best.hash.clone();
+
+            let entry = height_candidates.entry(candidate_height).or_insert_with(Vec::new);
+            for b in &created {
+                if !entry.contains(&b.hash) { entry.push(b.hash.clone()); }
             }
         }
 
         // reconcile forks at same height
-        if let Some(cands) = height_candidates.get(&hh).cloned() {
+        if let Some(cands) = height_candidates.get(&candidate_height).cloned() {
             if cands.len() >= 2 {
                 let others: Vec<String> = cands.into_iter().filter(|x| x != &head).collect();
                 if !others.is_empty() {
@@ -322,9 +416,11 @@ fn main() -> io::Result<()> {
                     let hash = hash_block(height, &parent, &state, conf, sigw, &others);
                     let rb = Block { height, parent: parent.clone(), state, confidence: conf, sig_weight: sigw, reconciles: others, hash: hash.clone() };
                     blocks.insert(hash.clone(), rb.clone());
+                    writeln!(chain_log, "{}", serde_json::to_string(&rb).unwrap())?;
+                    chain_log.flush()?;
                     let cur = blocks.get(&head).unwrap().clone();
                     if prefer(&cur, &rb) { head = hash; }
-                    height_candidates.insert(hh, vec![head.clone()]);
+                    height_candidates.insert(candidate_height, vec![head.clone()]);
                 }
             }
         }
@@ -360,6 +456,20 @@ fn main() -> io::Result<()> {
 
         if done { break; }
     }
+
+    println!("\n--- adversarial summary ---");
+    let final_state = &blocks.get(&head).unwrap().state;
+    println!("|head.state - truth| = {:.4}", l2(&v_sub(final_state, &truth)));
+
+    let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let incoming = |m: usize| -> Vec<f64> { w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect() };
+    let honest_incoming: Vec<f64> = (0..n).filter(|i| !MALICIOUS_NODES.contains(i)).flat_map(incoming).collect();
+    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter().copied().flat_map(incoming).collect();
+    println!(
+        "mean incoming trust weight: honest={:.4} (n={})  malicious={:.4} (n={})",
+        mean(&honest_incoming), honest_incoming.len(),
+        mean(&malicious_incoming), malicious_incoming.len()
+    );
 
     Ok(())
 }

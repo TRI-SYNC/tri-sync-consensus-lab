@@ -4,6 +4,19 @@ use rand::rngs::StdRng;
 /// Fixed by default so a run can be reproduced exactly; not yet exposed
 /// as a CLI flag.
 const SEED: u64 = 42;
+
+/// Nodes that report a deliberate, consistent lie instead of an honest
+/// noisy reading - conflicting data, not a Sybil cluster or an
+/// equivocating signer. 6 of 30 = 20% of the network, avoiding the
+/// indices that already get the small honest observation bias below.
+const MALICIOUS_NODES: [usize; 6] = [3, 8, 13, 18, 23, 28];
+/// The fixed offset a malicious node reports instead of the truth.
+const LIE_BIAS: f64 = 3.0;
+/// Malicious nodes get the network's lowest noise bucket, so
+/// `invariants::clarity_gate` (via the self-weight below) never treats
+/// them as suspiciously noisy - only the trust-weighting mechanism can
+/// catch them.
+const MALICIOUS_SIGMA: f64 = 0.12;
 use rand_distr::StandardNormal;
 
 use tri_sync::{invariants, telemetry};
@@ -112,14 +125,21 @@ fn main() {
 
         // observe
         for i in 0..n {
-            let noise = match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 };
+            let is_malicious = MALICIOUS_NODES.contains(&i);
+            let noise = if is_malicious {
+                MALICIOUS_SIGMA
+            } else {
+                match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 }
+            };
             sigma[i] = noise;
             let bias = if i % 11 == 0 { 0.05 } else { 0.0 };
 
             let mut ov = vec![0.0; d];
             for k in 0..d {
+                // Always draw, whether or not it's used, so the RNG
+                // stream doesn't depend on which nodes are malicious.
                 let eps: f64 = rng.sample::<f64, _>(StandardNormal) * noise;
-                ov[k] = truth[k] + bias + eps;
+                ov[k] = if is_malicious { truth[k] + LIE_BIAS } else { truth[k] + bias + eps };
             }
             obs_vec[i] = ov;
         }
@@ -253,4 +273,30 @@ fn main() {
             break;
         }
     }
+
+    println!("\n--- adversarial summary ---");
+    let honest_err: Vec<f64> = (0..n)
+        .filter(|i| !MALICIOUS_NODES.contains(i))
+        .map(|i| l2(&v_sub(&x_vec[i], &truth)))
+        .collect();
+    let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    println!("mean |x - truth| for honest nodes: {:.4}", mean(&honest_err));
+
+    // Incoming trust: for each node m, every OTHER node's edge weight
+    // toward m, across the whole directed graph. If the network learned
+    // to distrust a liar, its incoming weight should be measurably lower
+    // than an honest node's.
+    let incoming = |m: usize| -> Vec<f64> {
+        w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect()
+    };
+    let honest_incoming: Vec<f64> = (0..n)
+        .filter(|i| !MALICIOUS_NODES.contains(i))
+        .flat_map(incoming)
+        .collect();
+    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter().copied().flat_map(incoming).collect();
+    println!(
+        "mean incoming trust weight: honest={:.4} (n={})  malicious={:.4} (n={})",
+        mean(&honest_incoming), honest_incoming.len(),
+        mean(&malicious_incoming), malicious_incoming.len()
+    );
 }

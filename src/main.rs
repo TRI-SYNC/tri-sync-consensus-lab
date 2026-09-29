@@ -6,6 +6,24 @@ use rand::rngs::StdRng;
 const SEED: u64 = 42;
 use rand_distr::StandardNormal;
 
+/// Nodes that report a deliberate, consistent lie instead of an honest
+/// noisy reading - not a Sybil cluster or an equivocating signer, just
+/// conflicting data: a fabricated value that doesn't track `truth`.
+/// Chosen to be a clear minority (5 of 25 = 20%) of the network.
+const MALICIOUS_NODES: [usize; 5] = [3, 8, 13, 18, 23];
+
+/// The fixed offset a malicious node reports instead of the truth. Large
+/// enough to matter (bigger than `eps_align`), not so large it would be
+/// caught by a naive bounds check alone.
+const LIE_BIAS: f64 = 3.0;
+
+/// Malicious nodes get the network's lowest (most "confident-looking")
+/// noise bucket, so `invariants::clarity_gate` never flags them - they
+/// aren't caught by looking noisy. If anything catches them, it has to be
+/// `consensus::robust_fuse`'s trimming or `trust_graph`'s reliability
+/// scoring, not the noise-based gate.
+const MALICIOUS_SIGMA: f64 = 0.15;
+
 use tri_sync::types::{NodeState, Observation, TelemetryRow};
 use tri_sync::{consensus, invariants, node, phase, telemetry, trust_graph};
 
@@ -45,6 +63,10 @@ fn main() {
     let mut version: u64 = 0;
     let mut fast_sync_remaining: u64 = 0;
     let mut complete_streak: u64 = 0;
+    // Always overwritten before use: the loop only exits via `break`
+    // after its body (which sets this) has run at least once.
+    #[allow(unused_assignments)]
+    let mut r_star_final: f64 = 0.0;
 
     telemetry::print_header();
 
@@ -62,12 +84,20 @@ fn main() {
         let mut reliabilities: Vec<f64> = Vec::with_capacity(n);
 
         for (i, nd) in nodes.iter_mut().enumerate() {
-            let sigma = match i % 6 {
-                0 => 0.15, 1 => 0.25, 2 => 0.35, 3 => 0.55, 4 => 0.90, _ => 1.30
+            let is_malicious = MALICIOUS_NODES.contains(&i);
+            let sigma = if is_malicious {
+                MALICIOUS_SIGMA
+            } else {
+                match i % 6 {
+                    0 => 0.15, 1 => 0.25, 2 => 0.35, 3 => 0.55, 4 => 0.90, _ => 1.30
+                }
             };
             let bias = if i % 11 == 0 { 0.08 } else if i % 17 == 0 { -0.08 } else { 0.0 };
+            // Always draw, whether or not it's used, so the RNG stream
+            // doesn't depend on which nodes are malicious - only what
+            // each node reports does.
             let noise: f64 = rng.sample::<f64, _>(StandardNormal) * sigma;
-            let obs_val = truth + bias + noise;
+            let obs_val = if is_malicious { truth + LIE_BIAS } else { truth + bias + noise };
 
             let obs = Observation { node_id: i, value: obs_val, sigma, t };
             node::set_observation(nd, obs.clone());
@@ -80,6 +110,7 @@ fn main() {
         version += 1;
         let rstar = consensus::robust_fuse(&observations, &reliabilities, 0.18, version);
         let r_star = rstar.value;
+        r_star_final = r_star;
 
         // SELF -> lock (no drift) with clarity gate
         let tau = if fast_sync_remaining > 0 { tau_fast } else { tau_normal };
@@ -140,8 +171,38 @@ fn main() {
             break;
         }
         if t >= 250 {
-            println!("\nℹ️  Not completed within step budget (normal under frequent shocks).");
+            // Completion requires every node, honest or not, within
+            // eps_align of r_star - malicious nodes keep re-injecting
+            // LIE_BIAS every step, so they never actually converge and
+            // `done` structurally can't fire while they're present. That
+            // is the expected outcome here, not a failure of the run.
+            println!(
+                "\nℹ️  Not completed within step budget (expected: malicious nodes \
+                 never converge, so global completion can't fire while they're present)."
+            );
             break;
         }
+    }
+
+    println!("\n--- adversarial summary ---");
+    println!("truth={truth:.4}  r_star={r_star_final:.4}  |truth - r_star|={:.4}",
+        (truth - r_star_final).abs());
+
+    let honest_rel: Vec<f64> = nodes.iter().enumerate()
+        .filter(|(i, _)| !MALICIOUS_NODES.contains(i))
+        .map(|(_, nd)| nd.reliability)
+        .collect();
+    let malicious_rel: Vec<f64> = MALICIOUS_NODES.iter().map(|&i| nodes[i].reliability).collect();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / (v.len().max(1) as f64);
+
+    println!(
+        "mean reliability: honest={:.4} (n={})  malicious={:.4} (n={})",
+        mean(&honest_rel), honest_rel.len(), mean(&malicious_rel), malicious_rel.len()
+    );
+    for &i in &MALICIOUS_NODES {
+        println!(
+            "  malicious node {i}: reliability={:.4}  |x - r_star|={:.4}",
+            nodes[i].reliability, (nodes[i].x - r_star_final).abs()
+        );
     }
 }
