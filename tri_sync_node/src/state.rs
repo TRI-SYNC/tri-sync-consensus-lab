@@ -1,11 +1,14 @@
-//! In-memory node state: this node's keypair, its genesis-only chain,
-//! and its trust view of each configured peer.
+//! Node state: this node's keypair, its chain, and its trust view of
+//! each configured peer - built fresh via [`NodeState::init`] or
+//! restored from an LMDB [`crate::persistence::Store`] via
+//! [`NodeState::load_or_init`].
 //!
 //! Building this from `tri_sync_core` types (rather than duplicating
-//! them) is the whole point of Stage 1's extraction. Persisting this
-//! state to disk is Stage 4; networking it is Stage 5.
+//! them) is the whole point of Stage 1's extraction. Networking it is
+//! Stage 5.
 
 use crate::config::NodeConfig;
+use crate::persistence::{PersistError, Store, TrustEntry};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{CryptoRng, RngCore};
 use std::collections::HashMap;
@@ -66,6 +69,56 @@ impl NodeState {
     pub fn head(&self) -> &Block {
         self.chain.last().expect("chain always has at least the genesis block")
     }
+
+    /// Restores state from `store` if it holds a previously-persisted
+    /// signing key, merging in neutral trust for any peer in `config`
+    /// that isn't in the store yet (e.g. newly added since last run).
+    /// Otherwise builds fresh state via [`NodeState::init`] and persists
+    /// it immediately. Returns `(state, was_loaded_from_disk)`.
+    pub fn load_or_init(
+        config: &NodeConfig,
+        store: &Store,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(NodeState, bool), PersistError> {
+        let Some(signing_key) = store.get_signing_key()? else {
+            let state = NodeState::init(config, rng);
+            store.put_signing_key(&state.signing_key)?;
+            store.put_epoch(state.epoch)?;
+            store.put_block(&state.chain[0])?;
+            for (&peer_id, &edge_weight) in &state.edge_weight {
+                let reliability = state.reliability[&peer_id];
+                store.put_trust(peer_id, TrustEntry { edge_weight, reliability })?;
+            }
+            return Ok((state, false));
+        };
+
+        let verifying_key = signing_key.verifying_key();
+        let epoch = store.get_epoch()?.unwrap_or(0);
+        let mut chain = store.all_blocks()?;
+        if chain.is_empty() {
+            chain.push(Block::genesis(config.dim));
+        }
+
+        let mut edge_weight = HashMap::new();
+        let mut reliability = HashMap::new();
+        for peer in &config.peers {
+            let entry = match store.get_trust(peer.id)? {
+                Some(e) => e,
+                None => {
+                    let fresh = TrustEntry { edge_weight: NEUTRAL_EDGE_WEIGHT, reliability: NEUTRAL_RELIABILITY };
+                    store.put_trust(peer.id, fresh)?;
+                    fresh
+                }
+            };
+            edge_weight.insert(peer.id, entry.edge_weight);
+            reliability.insert(peer.id, entry.reliability);
+        }
+
+        Ok((
+            NodeState { node_id: config.node_id, chain, signing_key, verifying_key, epoch, edge_weight, reliability },
+            true,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +134,7 @@ mod tests {
             dim: 3,
             listen_addr: "0.0.0.0:9000".to_string(),
             license_path: "license.toml".to_string(),
+            data_dir: "data".to_string(),
             peers: vec![
                 PeerConfig { id: 1, addr: "127.0.0.1:9001".to_string() },
                 PeerConfig { id: 2, addr: "127.0.0.1:9002".to_string() },
@@ -135,5 +189,57 @@ mod tests {
         let state = NodeState::init(&config, &mut rng);
         assert!(state.edge_weight.is_empty());
         assert!(state.reliability.is_empty());
+    }
+
+    // --- load_or_init ---
+
+    #[test]
+    fn load_or_init_persists_fresh_state_and_reports_it_was_not_loaded() {
+        let dir = crate::test_support::TempDir::new("load_or_init_fresh");
+        let store = Store::open(dir.path()).unwrap();
+        let config = test_config();
+        let (state, loaded) = NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(1)).unwrap();
+        assert!(!loaded);
+        assert_eq!(store.get_signing_key().unwrap().unwrap().to_bytes(), state.signing_key.to_bytes());
+        assert_eq!(store.all_blocks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn load_or_init_restores_the_same_identity_and_chain_across_a_simulated_restart() {
+        let dir = crate::test_support::TempDir::new("load_or_init_restart");
+        let config = test_config();
+
+        let first_pubkey = {
+            let store = Store::open(dir.path()).unwrap();
+            let (state, loaded) = NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(1)).unwrap();
+            assert!(!loaded);
+            state.verifying_key
+        }; // store dropped: simulates the process exiting
+
+        let store = Store::open(dir.path()).unwrap();
+        let (state, loaded) = NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(999)).unwrap();
+        assert!(loaded, "second call should have found the persisted identity");
+        assert_eq!(state.verifying_key, first_pubkey, "restart must not generate a new identity");
+        assert_eq!(state.chain.len(), 1);
+    }
+
+    #[test]
+    fn load_or_init_fills_in_neutral_trust_for_a_peer_added_after_the_last_restart() {
+        let dir = crate::test_support::TempDir::new("load_or_init_new_peer");
+        let mut config = test_config();
+        config.peers.truncate(1); // only peer 1, first run
+
+        {
+            let store = Store::open(dir.path()).unwrap();
+            NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(1)).unwrap();
+        }
+
+        config.peers.push(PeerConfig { id: 2, addr: "127.0.0.1:9002".to_string() }); // peer 2 added later
+        let store = Store::open(dir.path()).unwrap();
+        let (state, loaded) = NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(1)).unwrap();
+        assert!(loaded);
+        assert_eq!(state.edge_weight.get(&1), Some(&NEUTRAL_EDGE_WEIGHT), "existing peer's trust preserved");
+        assert_eq!(state.edge_weight.get(&2), Some(&NEUTRAL_EDGE_WEIGHT), "new peer gets neutral trust");
+        assert_eq!(store.get_trust(2).unwrap(), Some(TrustEntry { edge_weight: NEUTRAL_EDGE_WEIGHT, reliability: NEUTRAL_RELIABILITY }));
     }
 }

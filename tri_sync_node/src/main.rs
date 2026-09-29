@@ -10,7 +10,10 @@
 
 mod config;
 mod license;
+mod persistence;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use rand::rngs::OsRng;
 use std::path::PathBuf;
@@ -68,15 +71,31 @@ fn main() -> ExitCode {
         lic.org, lic.max_nodes, lic.features, lic.expiry
     );
 
-    let node_state = state::NodeState::init(&config, &mut OsRng);
+    let store = match persistence::Store::open(std::path::Path::new(&config.data_dir)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tri_sync_node: cannot open data_dir {}: {e}", config.data_dir);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (node_state, loaded_from_disk) = match state::NodeState::load_or_init(&config, &store, &mut OsRng) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tri_sync_node: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     println!(
-        "tri_sync_node: node {} initialized - dim={} listen_addr={} peers={:?} pubkey={} genesis_hash={}",
+        "tri_sync_node: node {} {} - dim={} listen_addr={} peers={:?} pubkey={} head_height={} head_hash={}",
         node_state.node_id,
+        if loaded_from_disk { "restored from data_dir" } else { "initialized fresh" },
         config.dim,
         config.listen_addr,
         config.peers.iter().map(|p| p.id).collect::<Vec<_>>(),
         hex::encode(node_state.verifying_key.to_bytes()),
+        node_state.head().height,
         node_state.head().hash,
     );
 

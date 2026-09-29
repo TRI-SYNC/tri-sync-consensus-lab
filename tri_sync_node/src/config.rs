@@ -18,12 +18,18 @@ pub struct NodeConfig {
     pub listen_addr: String,
     #[serde(default = "default_license_path")]
     pub license_path: String,
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
 
 fn default_license_path() -> String {
     "license.toml".to_string()
+}
+
+fn default_data_dir() -> String {
+    "data".to_string()
 }
 
 impl NodeConfig {
