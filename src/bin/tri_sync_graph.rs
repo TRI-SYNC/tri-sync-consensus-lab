@@ -7,9 +7,23 @@
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 
-/// Fixed by default so a run can be reproduced exactly; not yet exposed
-/// as a CLI flag.
+/// Default seed; override with `--seed <u64>` for a different (still
+/// reproducible) run.
 const SEED: u64 = 42;
+
+fn parse_args() -> u64 {
+    let mut seed = SEED;
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--seed" {
+            i += 1;
+            seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed);
+        }
+        i += 1;
+    }
+    seed
+}
 
 /// Nodes that report a deliberate, consistent lie instead of an honest
 /// noisy reading - conflicting data, not a Sybil cluster or an
@@ -324,7 +338,8 @@ fn print_adversarial_summary(outcome: &Outcome) {
 }
 
 fn main() {
-    let outcome = simulate(SEED, true);
+    let seed = parse_args();
+    let outcome = simulate(seed, true);
     print_adversarial_summary(&outcome);
 }
 

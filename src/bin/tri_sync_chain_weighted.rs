@@ -69,7 +69,8 @@ fn prefer(a: &Block, b: &Block) -> bool {
     false
 }
 
-fn parse_args() -> (u64, String, String) {
+fn parse_args() -> (u64, u64, String, String) {
+    let mut seed: u64 = SEED;
     let mut steps: u64 = 600;
     let mut out = "../telemetry/telemetry.jsonl".to_string();
     let mut chain_log = "../telemetry/tri_sync_chain_weighted.blocks.jsonl".to_string();
@@ -77,6 +78,7 @@ fn parse_args() -> (u64, String, String) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--seed" => { i += 1; seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed); }
             "--steps" => { i += 1; steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(steps); }
             "--out" => { i += 1; out = args.get(i).cloned().unwrap_or(out); }
             "--chain-log" => { i += 1; chain_log = args.get(i).cloned().unwrap_or(chain_log); }
@@ -84,7 +86,7 @@ fn parse_args() -> (u64, String, String) {
         }
         i += 1;
     }
-    (steps, out, chain_log)
+    (seed, steps, out, chain_log)
 }
 
 /// Loads a persisted chain log (one JSON `Block` per line) into `blocks`,
@@ -515,8 +517,8 @@ fn print_adversarial_summary(outcome: &Outcome) {
 }
 
 fn main() -> io::Result<()> {
-    let (steps, out_path, chain_log_path) = parse_args();
-    let outcome = simulate(SEED, steps, &out_path, &chain_log_path, true)?;
+    let (seed, steps, out_path, chain_log_path) = parse_args();
+    let outcome = simulate(seed, steps, &out_path, &chain_log_path, true)?;
     print_adversarial_summary(&outcome);
     Ok(())
 }
