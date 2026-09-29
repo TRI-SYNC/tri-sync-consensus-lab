@@ -408,7 +408,7 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         let mut sumw = 0.0;
         let mut cnt = 0usize;
         for i in 0..n {
-            for (_, wij) in w_out[i].iter() { sumw += *wij; cnt += 1; }
+            for wij in w_out[i].values() { sumw += *wij; cnt += 1; }
         }
         let mean_w = if cnt == 0 { 0.0 } else { sumw / (cnt as f64) };
 
