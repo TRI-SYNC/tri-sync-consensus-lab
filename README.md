@@ -63,6 +63,23 @@ key rotation - the rest have no cryptography. Cargo package: `tri_sync`.
 This is a research/prototype sandbox, not a production consensus system.
 Concretely, as of this commit:
 
+- **Robustness and convergence testing don't require an adversarial node
+  at all - that was true of the original design, before any adversarial
+  model existed.** Heterogeneous per-node noise (`sigma` varies by
+  `i % 6`), biased sensors (fixed per-node offsets), random shocks to
+  `truth`, asymmetric directed trust edges, the Δe learning rule that
+  downweights neighbors who worsen the fused estimate, the clarity gate
+  that locks out noisy nodes, and trimmed-mean fusion that resists
+  outliers already exercise stability and convergence under difficult,
+  unbiased-in-intent stochastic conditions on their own. The adversarial
+  node model below tests something categorically different: not
+  difficulty, but deliberate, coordinated, persistent misinformation - a
+  node reporting a fixed offset every step, specifically tuned to sit in
+  the lowest noise bucket so the clarity gate's noise heuristic can't
+  catch it by construction. It's an addition for that specific, narrower
+  question (can the trust mechanism catch something actively trying not
+  to look suspicious), not a prerequisite for testing normal stability
+  or convergence.
 - **Fixed, in all six binaries: a real adversarial node model.** A fixed
   minority of nodes (`ADVERSARIAL_NODES`, ~20% of the network in each
   binary) report a deliberate, consistent deviation (`truth +
