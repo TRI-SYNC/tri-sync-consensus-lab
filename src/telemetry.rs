@@ -2,26 +2,15 @@
 
 use crate::types::TelemetryRow;
 
-/// Prints the column header line matching [`print_row`]'s layout.
 pub fn print_header() {
-    println!(
-        "{:>6} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>6}",
-        "t", "truth", "r_star", "disagree", "clarified", "mean_rel", "fastsync", "streak", "done"
-    );
+    println!("t    truth     R*        D      fast  clar  meanRel  streak  done");
+    println!("------------------------------------------------------------------");
 }
 
-/// Prints one telemetry row, aligned to [`print_header`]'s columns.
-pub fn print_row(row: &TelemetryRow) {
+pub fn print_row(r: &TelemetryRow) {
     println!(
-        "{:>6} {:>10.4} {:>10.4} {:>10.4} {:>10} {:>10.4} {:>8} {:>8} {:>6}",
-        row.t,
-        row.truth,
-        row.r_star,
-        row.disagreement,
-        row.clarified,
-        row.mean_reliability,
-        row.fast_sync_remaining,
-        row.complete_streak,
-        row.done
+        "{:3}  {:8.3}  {:8.3}  {:6.3}   {:3}   {:3}   {:7.3}   {:4}   {}",
+        r.t, r.truth, r.r_star, r.disagreement, r.fast_sync_remaining, r.clarified,
+        r.mean_reliability, r.complete_streak, r.done
     );
 }

@@ -1,6 +1,34 @@
-//! Shared data shapes reported out of a simulation run.
+//! Shared data shapes for a node-based simulation and its telemetry.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// A single node's reading at step `t`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Observation {
+    pub node_id: usize,
+    pub value: f64,
+    pub sigma: f64,
+    pub t: u64,
+}
+
+/// A fused reference value: [`crate::consensus::robust_fuse`]'s output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RStar {
+    pub value: f64,
+    pub confidence: f64,
+    pub version: u64,
+    pub t: u64,
+}
+
+/// A node's local state: its locked estimate, its reliability weight, its
+/// most recent observation, and whether it was too noisy to lock this step.
+#[derive(Debug, Clone)]
+pub struct NodeState {
+    pub x: f64,
+    pub reliability: f64,
+    pub last_obs: Option<Observation>,
+    pub clarified: bool,
+}
 
 /// One step's worth of simulation telemetry.
 #[derive(Debug, Clone, Copy, Serialize)]

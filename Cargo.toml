@@ -1,6 +1,6 @@
 [package]
-name = "tri-sync-consensus-lab"
-version = "0.1.0"
+name = "tri_sync"
+version = "0.2.0"
 edition = "2021"
 description = "Simulation testbed for trust-weighted sensor fusion and block-based agreement across noisy, adversarial-free nodes; telemetry-instrumented, not yet cryptographically secured."
 publish = false
@@ -10,31 +10,35 @@ name = "tri_sync"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sim"
-path = "src/bin/sim.rs"
+name = "tri_sync_scalar"
+path = "src/main.rs"
 
 [[bin]]
-name = "sim_chain_basic"
-path = "src/bin/sim_chain_basic.rs"
+name = "tri_sync_graph"
+path = "src/bin/tri_sync_graph.rs"
 
 [[bin]]
-name = "sim_chain_reconcile"
-path = "src/bin/sim_chain_reconcile.rs"
+name = "tri_sync_chain"
+path = "src/bin/tri_sync_chain.rs"
 
 [[bin]]
-name = "sim_chain_signed"
-path = "src/bin/sim_chain_signed.rs"
+name = "tri_sync_chain_weighted"
+path = "src/bin/tri_sync_chain_weighted.rs"
 
 [[bin]]
-name = "server"
-path = "src/bin/server.rs"
+name = "tri_sync_chain_crypto"
+path = "src/bin/tri_sync_chain_crypto.rs"
+
+[[bin]]
+name = "tri_sync_http"
+path = "src/bin/tri_sync_http.rs"
 
 [dependencies]
-rand = "0.8"
-rand_distr = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rand = "0.8"
+rand_distr = "0.4"
 sha2 = "0.10"
 hex = "0.4"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 tiny_http = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
