@@ -2,7 +2,7 @@
 name = "tri_sync"
 version = "0.2.0"
 edition = "2021"
-description = "Simulation testbed for trust-weighted sensor fusion and block-based agreement across noisy, adversarial-free nodes; telemetry-instrumented, not yet cryptographically secured."
+description = "Simulation testbed for trust-weighted sensor fusion and block-based agreement across noisy, adversarial nodes; telemetry-instrumented. One variant adds real Ed25519 signing and epoch key rotation."
 publish = false
 
 [lib]

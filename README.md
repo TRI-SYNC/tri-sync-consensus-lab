@@ -3,8 +3,9 @@
 [![CI](https://github.com/TRI-SYNC/tri-sync-consensus-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/TRI-SYNC/tri-sync-consensus-lab/actions/workflows/ci.yml)
 
 Simulation testbed for trust-weighted sensor fusion and block-based
-agreement across noisy, adversarial-free nodes; telemetry-instrumented,
-not yet cryptographically secured. Cargo package: `tri_sync`.
+agreement across noisy, adversarial nodes; telemetry-instrumented. One
+variant (`tri_sync_chain_crypto`) adds real Ed25519 signing and epoch
+key rotation - the rest have no cryptography. Cargo package: `tri_sync`.
 
 ## What's here
 
