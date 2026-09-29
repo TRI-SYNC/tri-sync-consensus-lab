@@ -221,3 +221,51 @@ cargo run --bin tri_sync_http -- --file /tmp/telemetry.jsonl --port 8787
 `--chain-log` defaults to `../telemetry/<binary-name>.blocks.jsonl` if omitted;
 re-running with the same path resumes that binary's chain (see the
 persistence scope caveat above for what does and doesn't carry over).
+All five simulation binaries also take `--seed <u64>` to reproduce a
+different run than the default (`--seed 42`); `tri_sync_http` has no RNG
+and doesn't take one.
+
+## Testing
+
+```bash
+cargo test --workspace
+```
+
+42 tests, zero `clippy --all-targets -- -D warnings` warnings, both
+enforced in CI (`.github/workflows/ci.yml`, badge above). Each binary's
+`main()` is a thin CLI wrapper around a `simulate()` (or `run_server()`)
+function that takes its config as plain arguments and returns an
+`Outcome` struct, so tests call it directly instead of scraping stdout
+or spawning a subprocess - every claim in the Status section above is
+backed by a test, not just a one-off run that was checked by hand and
+then discarded:
+
+- **Reproducibility** - the same seed produces byte-identical output,
+  checked for all six binaries.
+- **Adversarial trust/reliability separation** - malicious nodes end up
+  measurably less trusted than honest ones, checked for all six
+  binaries at a step count known to actually show it (see the
+  `tri_sync_chain_crypto` note above for why that number matters).
+- **Fork/reconcile structural invariants** - every block's height is
+  exactly its parent's plus one, and two blocks sharing a height share a
+  parent, checked across a full run's block set, not just spot-checked;
+  plus a check that real forks and reconciles actually occur, in
+  `tri_sync_chain_weighted` and `tri_sync_chain_crypto`.
+- **Signature validity** - every block signature verifies against the
+  verifying-key registry snapshotted from the epoch it was actually
+  signed under (not just whichever registry the run ended on), in
+  `tri_sync_chain_crypto`.
+- **Persistence** - a resumed run's head height picks up where the
+  previous run left off, and a corrupted chain-log line is a hard error
+  rather than being silently skipped, in all three chain binaries.
+- **Real streaming** - `tri_sync_http`'s `/events` delivers a line
+  appended after the connection opened, on that same connection, well
+  within the tailer's poll interval; `/health` stays responsive while
+  `/events` is open; a connection past the concurrency cap gets `503`
+  without disturbing connections already under it.
+
+A few of these were sanity-checked in the other direction too: the
+streaming and connection-cap tests were run against a temporarily
+reintroduced version of the bug they're meant to catch (the old
+batch-response behavior; the cap check disabled) to confirm they
+actually fail, not just that they currently pass.

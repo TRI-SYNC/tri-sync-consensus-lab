@@ -62,8 +62,13 @@ mod sha256 {
     }
 }
 
+/// True if `b` is preferred over `a` as head. Height dominates
+/// absolutely - a taller chain always wins regardless of how
+/// well-supported or confident a same-or-lower-height rival is - and
+/// only among equal heights does sig_weight (how much support a block
+/// actually got) get to break the tie before confidence (how tight the
+/// contributing estimates were) does.
 fn choose_head(a: &Block, b: &Block) -> bool {
-    // return true if b is preferred over a
     if b.height != a.height { return b.height > a.height; }
     if (b.sig_weight - a.sig_weight).abs() > f64::EPSILON { return b.sig_weight > a.sig_weight; }
     if (b.confidence - a.confidence).abs() > f64::EPSILON { return b.confidence > a.confidence; }

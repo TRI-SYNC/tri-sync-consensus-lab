@@ -43,6 +43,9 @@ fn hex16(bytes: &[u8]) -> String {
     h[..16].to_string()
 }
 
+/// Digests a state vector into a fixed-size hash instead of formatting it
+/// directly into the canonical signing string below - keeps `canon_string`
+/// a fixed shape regardless of the vector's dimensionality.
 fn hash_vec(v: &[f64]) -> String {
     let mut hasher = Sha256::new();
     for x in v {
@@ -52,6 +55,10 @@ fn hash_vec(v: &[f64]) -> String {
     hex16(&hasher.finalize())
 }
 
+/// Same reasoning as `hash_vec`, for the list of a reconcile block's
+/// superseded sibling hashes: a fixed-size digest instead of a
+/// canon_string whose length would otherwise grow with how many
+/// siblings a given fork happened to produce.
 fn hash_list(xs: &[String]) -> String {
     let mut hasher = Sha256::new();
     for s in xs {
@@ -91,6 +98,12 @@ fn block_hash(canon: &str) -> String {
     hex16(&hasher.finalize())
 }
 
+/// True if `b` is preferred over `a` as head. Height dominates
+/// absolutely - a taller chain always wins regardless of how
+/// well-supported or confident a same-or-lower-height rival is - and
+/// only among equal heights does sig_weight (how much support a block
+/// actually got) get to break the tie before confidence (how tight the
+/// contributing estimates were) does.
 fn prefer(a: &Block, b: &Block) -> bool {
     if b.height != a.height { return b.height > a.height; }
     if (b.sig_weight - a.sig_weight).abs() > f64::EPSILON { return b.sig_weight > a.sig_weight; }
