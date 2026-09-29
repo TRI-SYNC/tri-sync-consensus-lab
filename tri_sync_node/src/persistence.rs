@@ -146,6 +146,22 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
+    fn corrupt_signing_key_bytes_are_a_hard_error_not_a_silent_regeneration() {
+        let dir = TempDir::new("corrupt_key");
+        let store = Store::open(dir.path()).unwrap();
+        // Bypass put_signing_key to write a malformed value directly,
+        // simulating on-disk corruption or a foreign writer.
+        let mut wtxn = store.env.write_txn().unwrap();
+        store.keys.put(&mut wtxn, SIGNING_KEY_KEY, b"not 32 bytes").unwrap();
+        wtxn.commit().unwrap();
+
+        match store.get_signing_key() {
+            Err(PersistError(msg)) => assert!(msg.contains("corrupt"), "unexpected message: {msg}"),
+            other => panic!("expected a hard error on corrupt key bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_block_written_can_be_read_back_by_height() {
         let dir = TempDir::new("blocks");
         let store = Store::open(dir.path()).unwrap();
