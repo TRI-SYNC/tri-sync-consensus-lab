@@ -7,7 +7,11 @@ on:
 
 jobs:
   build-test-lint:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -16,12 +20,20 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
+      # --release throughout: tri_sync_chain_crypto's tests do real
+      # ed25519 signing over hundreds of steps, and a debug build makes
+      # that ~100x slower for no correctness benefit (no debug_assert!s
+      # anywhere in this crate depend on running unoptimized) - and
+      # building once in release rather than once per profile avoids
+      # paying for both.
       - name: Build (lib + all six binaries)
-        run: cargo build --workspace --verbose
+        run: cargo build --workspace --release --verbose
 
       - name: Test (lib tests + each binary's sim/streaming tests)
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --release --verbose
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
