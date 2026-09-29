@@ -292,5 +292,11 @@ actually fail, not just that they currently pass.
 
 ## License
 
-All rights reserved - see [LICENSE](LICENSE). This is not published to
-crates.io (`publish = false`) and carries no open-source license.
+All rights reserved by default - see [LICENSE.md](LICENSE.md). Public
+visibility of this repository does not grant any right to use, copy,
+modify, or redistribute it. Four separate license tiers (non-commercial
+source, commercial, internal-use, and open-reference) can be granted in
+writing by the copyright holder - see `LICENSE.md` for what each
+permits and which parts of the repository they cover. This crate is
+not published to crates.io (`publish = false`) and carries no
+open-source license.
