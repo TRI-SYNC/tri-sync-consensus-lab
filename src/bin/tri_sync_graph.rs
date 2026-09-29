@@ -1,4 +1,9 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+
+/// Fixed by default so a run can be reproduced exactly; not yet exposed
+/// as a CLI flag.
+const SEED: u64 = 42;
 use rand_distr::StandardNormal;
 
 use tri_sync::{invariants, telemetry};
@@ -28,13 +33,20 @@ fn fuse_vec(values: &[Vec<f64>], weights: &[f64], trim_frac: f64) -> Vec<f64> {
 }
 
 fn main() {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(SEED);
 
     let n: usize = 30;
     let d: usize = 4;
 
     // directed weights w_out[i][j]
-    let mut w_out: Vec<std::collections::HashMap<usize, f64>> = vec![std::collections::HashMap::new(); n];
+    // BTreeMap, not HashMap: its iteration order is deterministic (ascending
+    // by key) regardless of the process's random hash seed, whereas
+    // HashMap's is not - and w_out is iterated inside a floating-point
+    // sum/sort that feeds back into itself every step, so a random
+    // iteration order alone was enough to make runs unreproducible even
+    // with a fixed RNG seed.
+    let mut w_out: Vec<std::collections::BTreeMap<usize, f64>> =
+        vec![std::collections::BTreeMap::new(); n];
 
     for i in 0..n {
         for (step, w0) in [(1usize, 1.0f64), (2usize, 0.8f64)] {

@@ -3,17 +3,17 @@
 use crate::types::NodeState;
 
 /// Moves `node.reliability` toward a target derived from how close its
-/// locked estimate is to `truth`, at learning rate `alpha`, clamped to
-/// `[floor, ceil]`.
+/// locked estimate is to the fused reference `r_star`, at learning rate
+/// `alpha`, clamped to `[floor, ceil]`.
 ///
-/// This is not something a real node could run: `truth` is the simulation's
-/// ground truth, not anything a distributed node has access to. A
-/// deployable version of this would compare a node's estimate against the
-/// fused reference (`consensus::RStar`) or its neighbors' estimates
-/// instead - never against the answer the simulation is trying to
-/// discover. Implemented as called for; not a design endorsement.
-pub fn update_reliability(node: &mut NodeState, truth: f64, alpha: f64, floor: f64, ceil: f64) {
-    let error = (node.x - truth).abs();
+/// Scores against `r_star` (`consensus::RStar::value`), not ground truth:
+/// a real node has no access to the answer the simulation is trying to
+/// discover, only to the group's own fused estimate. A node whose
+/// observations keep disagreeing with the group still shows up here,
+/// because `fuse_lock` only partially pulls `node.x` toward `r_star` (see
+/// its self-weighting) - it doesn't erase the disagreement, just damps it.
+pub fn update_reliability(node: &mut NodeState, r_star: f64, alpha: f64, floor: f64, ceil: f64) {
+    let error = (node.x - r_star).abs();
     let target = 1.0 / (1.0 + error);
     let updated = node.reliability + alpha * (target - node.reliability);
     node.reliability = updated.clamp(floor, ceil);

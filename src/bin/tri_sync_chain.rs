@@ -1,7 +1,12 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+
+/// Fixed by default so a run can be reproduced exactly; not yet exposed
+/// as a CLI flag.
+const SEED: u64 = 42;
 use rand_distr::StandardNormal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, Write};
 
@@ -75,12 +80,17 @@ fn main() -> io::Result<()> {
 
     let mut file = File::create(&out_path)?;
 
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(SEED);
     let n: usize = 30;
     let d: usize = 4;
 
     // Directed weights w_out[i][j]
-    let mut w_out: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
+    // BTreeMap, not HashMap: deterministic iteration order regardless of
+    // the process's random hash seed. w_out is iterated inside a
+    // floating-point sum/sort that feeds back into itself every step, so a
+    // random iteration order alone made runs unreproducible even with a
+    // fixed RNG seed.
+    let mut w_out: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); n];
     for i in 0..n {
         for (step, w0) in [(1usize, 1.0f64), (2usize, 0.8f64)] {
             let j = (i + step) % n;

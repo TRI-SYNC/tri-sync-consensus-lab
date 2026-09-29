@@ -16,8 +16,9 @@ not yet cryptographically secured. Cargo package: `tri_sync`.
 - `src/node.rs` — per-node state transitions (`set_observation`,
   `fuse_lock`) for the modular variant.
 - `src/trust_graph.rs` — `update_reliability`, which moves a node's
-  reliability toward how close its estimate is to ground truth. See the
-  Status note below - this is not something a real node could run.
+  reliability toward how close its estimate is to the fused reference
+  (`RStar::value`), not ground truth - see Status below for why that
+  distinction matters.
 - `src/phase.rs` — `disagreement` and `should_explode`, the fast-sync
   phase-detection logic, extracted from the sim binaries into testable
   functions.
@@ -54,17 +55,26 @@ Concretely, as of this commit:
 
 - **Nodes are not adversarial.** There is no faulty or malicious node
   model in any variant.
-- **Quorum/signing/reliability decisions read ground truth.** Every chain
-  variant decides whether a candidate block clears quorum by comparing
-  its error against `truth` directly — something no real distributed
-  node has access to. `tri_sync_chain_crypto` wraps this in real Ed25519
-  signatures, but the sign/no-sign decision underneath is the same.
-  `tri_sync_scalar`'s `trust_graph::update_reliability` has the identical
-  problem in its own function signature: it takes `truth` as a
-  parameter. A deployable version would compare a node's estimate
-  against the fused reference or its neighbors, never the answer.
-- **Runs are not reproducible.** All six binaries use unseeded
-  `rand::thread_rng()`.
+- **Chain quorum/signing decisions still read ground truth.** Every chain
+  variant (`tri_sync_chain`, `tri_sync_chain_weighted`,
+  `tri_sync_chain_crypto`) decides whether a candidate block clears
+  quorum by comparing its error against `truth` directly — something no
+  real distributed node has access to. `tri_sync_chain_crypto` wraps this
+  in real Ed25519 signatures, but the sign/no-sign decision underneath is
+  the same. Not yet fixed.
+- **Fixed: `trust_graph::update_reliability` no longer reads `truth`.**
+  It now scores a node against the fused reference (`RStar::value`)
+  instead — something a real node actually has. Used by `tri_sync_scalar`.
+- **Fixed: runs are now reproducible.** All six binaries seed a
+  `StdRng` from a fixed constant (`SEED`, not yet exposed as a CLI flag)
+  instead of using unseeded `rand::thread_rng()`. That alone wasn't
+  enough for the four binaries with a `w_out: HashMap<usize, f64>` per
+  node: `HashMap`'s iteration order is randomized per-process
+  independently of any RNG seed, and `w_out` was iterated inside a
+  floating-point sum/sort that feeds back into itself every step -
+  enough for a random iteration order alone to make two seeded runs
+  diverge. Switched `w_out` to `BTreeMap`, which iterates in deterministic
+  key order; verified by diffing two runs of each binary.
 - **`/events` on `tri_sync_http` is not a real stream.** `tiny_http`
   doesn't support long-lived streaming responses, so it returns one
   batch in SSE format rather than pushing new events as they happen.

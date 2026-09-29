@@ -1,11 +1,16 @@
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+
+/// Fixed by default so a run can be reproduced exactly; not yet exposed
+/// as a CLI flag.
+const SEED: u64 = 42;
 use rand_distr::StandardNormal;
 
 use tri_sync::types::{NodeState, Observation, TelemetryRow};
 use tri_sync::{consensus, invariants, node, phase, telemetry, trust_graph};
 
 fn main() {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(SEED);
 
     let n = 25usize;
     let mut nodes: Vec<NodeState> = (0..n).map(|_| NodeState{
@@ -96,7 +101,7 @@ fn main() {
 
         // Trust update
         for nd in nodes.iter_mut() {
-            trust_graph::update_reliability(nd, truth, alpha, floor, ceil);
+            trust_graph::update_reliability(nd, r_star, alpha, floor, ceil);
         }
 
         // Phase transition
