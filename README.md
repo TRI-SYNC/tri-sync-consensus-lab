@@ -269,3 +269,8 @@ streaming and connection-cap tests were run against a temporarily
 reintroduced version of the bug they're meant to catch (the old
 batch-response behavior; the cap check disabled) to confirm they
 actually fail, not just that they currently pass.
+
+## License
+
+All rights reserved - see [LICENSE](LICENSE). This is not published to
+crates.io (`publish = false`) and carries no open-source license.
