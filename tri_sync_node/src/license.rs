@@ -41,11 +41,11 @@ pub struct License {
     pub expiry: String,
 }
 
-// Consumed by node.toml-driven enforcement in Stage 3 (peer count and
-// feature gating aren't checkable until node.toml exists); already
-// exercised by this module's own tests.
-#[allow(dead_code)]
 impl License {
+    // Feature gating isn't wired to any specific feature name yet
+    // (Stage 5+ networking/persistence code will use this); already
+    // exercised by this module's own tests.
+    #[allow(dead_code)]
     pub fn has_feature(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
     }

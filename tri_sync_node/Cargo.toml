@@ -16,6 +16,4 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
-
-[dev-dependencies]
 rand = "0.8"
