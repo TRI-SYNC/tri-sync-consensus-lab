@@ -25,18 +25,19 @@ fn parse_args() -> u64 {
     seed
 }
 
-/// Nodes that report a deliberate, consistent lie instead of an honest
-/// noisy reading - conflicting data, not a Sybil cluster or an
+/// Nodes that report a deliberate, consistent deviation instead of a
+/// baseline noisy reading - conflicting data, not a Sybil cluster or an
 /// equivocating signer. 6 of 30 = 20% of the network, avoiding the
-/// indices that already get the small honest observation bias below.
-const MALICIOUS_NODES: [usize; 6] = [3, 8, 13, 18, 23, 28];
-/// The fixed offset a malicious node reports instead of the truth.
-const LIE_BIAS: f64 = 3.0;
-/// Malicious nodes get the network's lowest noise bucket, so
+/// indices that already get the small baseline observation bias below.
+/// "Adversarial" describes the effect, not a claim about why.
+const ADVERSARIAL_NODES: [usize; 6] = [3, 8, 13, 18, 23, 28];
+/// The fixed offset an adversarial node reports instead of the truth.
+const DEVIATION_BIAS: f64 = 3.0;
+/// Adversarial nodes get the network's lowest noise bucket, so
 /// `invariants::clarity_gate` (via the self-weight below) never treats
 /// them as suspiciously noisy - only the trust-weighting mechanism can
 /// catch them.
-const MALICIOUS_SIGMA: f64 = 0.12;
+const ADVERSARIAL_SIGMA: f64 = 0.12;
 use rand_distr::StandardNormal;
 
 use tri_sync::{invariants, telemetry};
@@ -153,9 +154,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
 
         // observe
         for i in 0..n {
-            let is_malicious = MALICIOUS_NODES.contains(&i);
-            let noise = if is_malicious {
-                MALICIOUS_SIGMA
+            let is_adversarial = ADVERSARIAL_NODES.contains(&i);
+            let noise = if is_adversarial {
+                ADVERSARIAL_SIGMA
             } else {
                 match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 }
             };
@@ -165,9 +166,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
             let mut ov = vec![0.0; d];
             for k in 0..d {
                 // Always draw, whether or not it's used, so the RNG
-                // stream doesn't depend on which nodes are malicious.
+                // stream doesn't depend on which nodes are adversarial.
                 let eps: f64 = rng.sample::<f64, _>(StandardNormal) * noise;
-                ov[k] = if is_malicious { truth[k] + LIE_BIAS } else { truth[k] + bias + eps };
+                ov[k] = if is_adversarial { truth[k] + DEVIATION_BIAS } else { truth[k] + bias + eps };
             }
             obs_vec[i] = ov;
         }
@@ -308,8 +309,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
 fn mean(v: &[f64]) -> f64 { if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 } }
 
 /// Every OTHER node's edge weight toward node `m`, across the whole
-/// directed graph. If the network learned to distrust a liar, its
-/// incoming weight should be measurably lower than an honest node's.
+/// directed graph. If the network learned to distrust an adversarial
+/// node, its incoming weight should be measurably lower than a
+/// baseline node's.
 fn incoming(w_out: &[std::collections::BTreeMap<usize, f64>], m: usize) -> Vec<f64> {
     w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect()
 }
@@ -317,23 +319,23 @@ fn incoming(w_out: &[std::collections::BTreeMap<usize, f64>], m: usize) -> Vec<f
 fn print_adversarial_summary(outcome: &Outcome) {
     let n = outcome.x_vec.len();
     println!("\n--- adversarial summary ---");
-    let honest_err: Vec<f64> = (0..n)
-        .filter(|i| !MALICIOUS_NODES.contains(i))
+    let baseline_err: Vec<f64> = (0..n)
+        .filter(|i| !ADVERSARIAL_NODES.contains(i))
         .map(|i| l2(&v_sub(&outcome.x_vec[i], &outcome.truth)))
         .collect();
-    println!("mean |x - truth| for honest nodes: {:.4}", mean(&honest_err));
+    println!("mean |x - truth| for baseline nodes: {:.4}", mean(&baseline_err));
 
-    let honest_incoming: Vec<f64> = (0..n)
-        .filter(|i| !MALICIOUS_NODES.contains(i))
+    let baseline_incoming: Vec<f64> = (0..n)
+        .filter(|i| !ADVERSARIAL_NODES.contains(i))
         .flat_map(|i| incoming(&outcome.w_out, i))
         .collect();
-    let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter()
+    let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES.iter()
         .flat_map(|&i| incoming(&outcome.w_out, i))
         .collect();
     println!(
-        "mean incoming trust weight: honest={:.4} (n={})  malicious={:.4} (n={})",
-        mean(&honest_incoming), honest_incoming.len(),
-        mean(&malicious_incoming), malicious_incoming.len()
+        "mean incoming trust weight: baseline={:.4} (n={})  adversarial={:.4} (n={})",
+        mean(&baseline_incoming), baseline_incoming.len(),
+        mean(&adversarial_incoming), adversarial_incoming.len()
     );
 }
 
@@ -359,20 +361,20 @@ mod sim_tests {
     }
 
     #[test]
-    fn liars_end_up_with_lower_incoming_trust_than_honest_nodes() {
+    fn adversarial_nodes_end_up_with_lower_incoming_trust_than_baseline_nodes() {
         let outcome = simulate(SEED, false);
         let n = outcome.x_vec.len();
-        let honest_incoming: Vec<f64> = (0..n)
-            .filter(|i| !MALICIOUS_NODES.contains(i))
+        let baseline_incoming: Vec<f64> = (0..n)
+            .filter(|i| !ADVERSARIAL_NODES.contains(i))
             .flat_map(|i| incoming(&outcome.w_out, i))
             .collect();
-        let malicious_incoming: Vec<f64> = MALICIOUS_NODES.iter()
+        let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES.iter()
             .flat_map(|&i| incoming(&outcome.w_out, i))
             .collect();
         assert!(
-            mean(&malicious_incoming) < mean(&honest_incoming) - 0.1,
-            "malicious={} honest={}",
-            mean(&malicious_incoming), mean(&honest_incoming)
+            mean(&adversarial_incoming) < mean(&baseline_incoming) - 0.1,
+            "adversarial={} baseline={}",
+            mean(&adversarial_incoming), mean(&baseline_incoming)
         );
     }
 }

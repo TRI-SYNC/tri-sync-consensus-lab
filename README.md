@@ -28,11 +28,11 @@ key rotation - the rest have no cryptography. Cargo package: `tri_sync`.
 - `src/main.rs` (bin `tri_sync_scalar`) — a scalar-truth rewrite of the
   fusion loop (no chain) built on the modules above instead of one inline
   function; `n=25` nodes, single-value ground truth rather than a
-  4-vector. 5 of the 25 nodes (`MALICIOUS_NODES`) are adversarial: they
-  report a fixed, deliberate lie (`LIE_BIAS`) instead of an honest noisy
-  reading, and get the network's lowest noise bucket so the noise-based
-  clarity gate never flags them - see Status below for what this
-  actually demonstrates.
+  4-vector. 5 of the 25 nodes (`ADVERSARIAL_NODES`) are adversarial: they
+  report a fixed, deliberate deviation (`DEVIATION_BIAS`) instead of a
+  baseline noisy reading, and get the network's lowest noise bucket so
+  the noise-based clarity gate never flags them - see Status below for
+  what this actually demonstrates.
 - `src/bin/tri_sync_graph.rs` (bin `tri_sync_graph`) — no chain: `n` nodes
   with a directed trust graph observe a drifting, occasionally-shocked
   ground truth with per-node noise, fuse neighbor readings with a
@@ -64,27 +64,30 @@ This is a research/prototype sandbox, not a production consensus system.
 Concretely, as of this commit:
 
 - **Fixed, in all six binaries: a real adversarial node model.** A fixed
-  minority of nodes (`MALICIOUS_NODES`, ~20% of the network in each
-  binary) report a deliberate, consistent lie (`truth + LIE_BIAS`, no
-  noise) instead of an honest reading, and are given the network's
-  lowest noise bucket so `invariants::clarity_gate` never flags them -
-  the only thing that can catch them is the trust/fusion mechanism
-  itself, not a noise-based heuristic. The RNG is always drawn (even
-  when the sample is unused) so the RNG stream doesn't depend on which
-  nodes happen to be malicious, keeping runs reproducible either way.
-  Verified per binary with a real run and an end-of-run adversarial
-  summary:
+  minority of nodes (`ADVERSARIAL_NODES`, ~20% of the network in each
+  binary) report a deliberate, consistent deviation (`truth +
+  DEVIATION_BIAS`, no noise) instead of a baseline reading, and are given
+  the network's lowest noise bucket so `invariants::clarity_gate` never
+  flags them - only the trust/fusion mechanism itself responds to them,
+  not a noise-based heuristic. The RNG is always drawn (even when the
+  sample is unused) so the RNG stream doesn't depend on which nodes are
+  adversarial, keeping runs reproducible either way. This is what lets
+  the network self-correct: no component ever singles out which nodes
+  deviate, so the same fusion and trust-weighting logic that handles
+  ordinary noise handles this too. Verified per binary with a real run
+  and an end-of-run adversarial summary:
   - `tri_sync_scalar` (`SEED=42`, 250 steps): fused reference stays
-    close to truth despite the liars (`|truth - r_star| = 0.095` against
-    a `LIE_BIAS` of `3.0`), and liars' reliability measurably and
-    persistently separates from honest nodes' (`0.30` vs `0.71` mean, a
-    2.4x gap). One honest side effect: completion (`done`) requires
-    *every* node, liars included, within `eps_align` of `r_star`, and
-    liars never converge - so this binary now always runs to the full
-    step budget while they're present rather than reporting sustained
-    alignment, which is correct, not a regression.
+    close to truth despite the deviating nodes (`|truth - r_star| =
+    0.095` against a `DEVIATION_BIAS` of `3.0`), and their reliability
+    measurably and persistently settles below the baseline nodes'
+    (`0.30` vs `0.71` mean, a 2.4x gap). One side effect: completion
+    (`done`) requires *every* node, deviating ones included, within
+    `eps_align` of `r_star`, and they never converge - so this binary
+    now always runs to the full step budget while they're present
+    rather than reporting sustained alignment, which is correct, not a
+    regression.
   - `tri_sync_graph`: mean incoming trust weight separates
-    (`honest=1.5750` vs `malicious=1.2711`), more modestly than the
+    (`baseline=1.5750` vs `adversarial=1.2711`), more modestly than the
     centralized-fusion case above since there's no single global
     reliability field to sharpen against - each node only ever sees its
     own neighbors' edges.
@@ -92,14 +95,15 @@ Concretely, as of this commit:
     separation, measured against `head_block.state` rather than `truth`
     (see the ground-truth item below for why).
   - `tri_sync_chain_crypto`: separation is real but slow to resolve - at
-    300 steps it's actually inverted (`malicious=2.58` vs `honest=2.55`),
-    only becoming the expected direction by 600
-    (`honest=2.27` vs `malicious=1.99`), since it's a deliberately-damped
-    multiplicative update that just needs enough iterations. This is why
-    the CLI default is `--steps 600`, not merely a starting point to
-    raise if you want to see the separation - it was never shipped at
-    300, that number only ever came from an ad hoc verification probe
-    during development. Overriding `--steps` down below the default
+    300 steps it's actually inverted (`adversarial=2.58` vs
+    `baseline=2.55`), only becoming the expected direction by 600
+    (`baseline=2.27` vs `adversarial=1.99`), since it's a
+    deliberately-damped multiplicative update that just needs enough
+    iterations. This is why the CLI default is `--steps 600`, not
+    merely a starting point to raise if you want to see the separation
+    - it was never shipped at 300, that number only ever came from an
+    ad hoc verification probe during development. Overriding `--steps`
+    down below the default
     risks reading a still-converging trend as a conclusion.
 - **Fixed: no decision anywhere reads ground truth anymore.**
   `trust_graph::update_reliability` (used by `tri_sync_scalar`) now scores
@@ -243,8 +247,8 @@ then discarded:
 
 - **Reproducibility** - the same seed produces byte-identical output,
   checked for all six binaries.
-- **Adversarial trust/reliability separation** - malicious nodes end up
-  measurably less trusted than honest ones, checked for all six
+- **Adversarial trust/reliability separation** - adversarial nodes end up
+  measurably less trusted than baseline ones, checked for all six
   binaries at a step count known to actually show it (see the
   `tri_sync_chain_crypto` note above for why that number matters).
 - **Fork/reconcile structural invariants** - every block's height is
