@@ -11,9 +11,17 @@
 //! verifies against the claimed sender's *configured* pubkey - never
 //! whatever pubkey a message happens to carry - on receipt. This
 //! module still doesn't verify anything itself; it only defines what
-//! gets signed. Note this closes spoofing, not replay: an old,
-//! validly-signed message can still be re-sent verbatim until a view
-//! number or similar is added.
+//! gets signed.
+//!
+//! [`BlockProposalMsg`]/[`BlockVoteMsg`] additionally carry a `view`
+//! number, folded into what they sign via [`view_block_canon`] rather
+//! than the block's own [`block_canon`] alone - a signature made for
+//! one view can never be replayed into a different one, even if the
+//! block content is identical. Right now every height only ever has
+//! one view (nothing bumps it yet - that's the liveness/view-change
+//! stage), so this doesn't change observable behavior today; it's the
+//! mechanism that stage relies on for safety, tested on its own before
+//! anything drives it.
 //!
 //! The transport layer ([`crate::net`]) deliberately does not verify
 //! peer TLS certificates either - see that module's doc comment for
@@ -65,6 +73,7 @@ pub fn state_canon(sender: usize, state: &[f64], confidence: f64) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockProposalMsg {
     pub sender: usize,
+    pub view: u64,
     pub block: Block,
 }
 
@@ -72,9 +81,25 @@ pub struct BlockProposalMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlockVoteMsg {
     pub sender: usize,
+    pub view: u64,
     pub block_hash: String,
     pub pubkey_hex: String,
     pub sig_hex: String,
+}
+
+/// The canonical form of `block` alone (independent of view) - what
+/// identifies a specific proposed block regardless of which view
+/// produced it. Used for `Block::hash` / `BlockVoteMsg::block_hash`.
+pub fn block_canon(block: &Block) -> String {
+    let state_hash = chain::hash_vec(&block.state);
+    let reconciles_hash = chain::hash_list(&block.reconciles);
+    chain::canon_string(block.height, &block.parent, &state_hash, block.confidence, &reconciles_hash, block.epoch)
+}
+
+/// The exact string a [`BlockProposalMsg`]/[`BlockVoteMsg`] signs: the
+/// view folded in front of the block's own canonical form.
+pub fn view_block_canon(view: u64, block: &Block) -> String {
+    format!("view|{view}|{}", block_canon(block))
 }
 
 /// A gossiped update to how much `sender` trusts `about_peer`.
@@ -100,9 +125,10 @@ mod tests {
         let messages = vec![
             Message::Observation(ObservationMsg { sender: 1, values: vec![1.0, 2.0], sig_hex: "aa".to_string() }),
             Message::State(StateMsg { sender: 1, state: vec![1.0], confidence: 0.9, sig_hex: "bb".to_string() }),
-            Message::BlockProposal(BlockProposalMsg { sender: 1, block: Block::genesis(2) }),
+            Message::BlockProposal(BlockProposalMsg { sender: 1, view: 0, block: Block::genesis(2) }),
             Message::BlockVote(BlockVoteMsg {
                 sender: 1,
+                view: 0,
                 block_hash: "abc".to_string(),
                 pubkey_hex: "def".to_string(),
                 sig_hex: "ghi".to_string(),
@@ -141,6 +167,21 @@ mod tests {
         assert_ne!(trust_update_canon(1, 2, 1.5), trust_update_canon(2, 2, 1.5));
         assert_ne!(trust_update_canon(1, 2, 1.5), trust_update_canon(1, 3, 1.5));
         assert_ne!(trust_update_canon(1, 2, 1.5), trust_update_canon(1, 2, 1.6));
+    }
+
+    #[test]
+    fn view_block_canon_is_sensitive_to_view_even_for_the_identical_block() {
+        let block = Block::genesis(2);
+        assert_eq!(view_block_canon(0, &block), view_block_canon(0, &block));
+        assert_ne!(view_block_canon(0, &block), view_block_canon(1, &block));
+    }
+
+    #[test]
+    fn view_block_canon_still_reflects_changes_to_the_block_itself() {
+        let a = Block::genesis(2);
+        let mut b = Block::genesis(2);
+        b.height = 5;
+        assert_ne!(view_block_canon(0, &a), view_block_canon(0, &b));
     }
 
     #[test]

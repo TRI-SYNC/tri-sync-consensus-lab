@@ -25,6 +25,15 @@
 //! - Peer public keys are static, from `node.toml` - there's no
 //!   in-band key discovery or epoch-based re-keying across the
 //!   network yet.
+//! - No liveness fallback: if the expected proposer for a height never
+//!   proposes (offline, slow, malicious), the chain just stalls at
+//!   that height - there's no timeout or backup proposer. Every
+//!   proposal/vote already carries a `view` number
+//!   (`protocol::view_block_canon`), which is what a future view-change
+//!   mechanism needs to safely hand off to a different proposer
+//!   without an old view's messages being replayable into the new
+//!   one - but nothing here bumps that number yet, so today every
+//!   height only ever has one view.
 
 use crate::config::NodeConfig;
 use crate::metrics::Metrics;
@@ -79,6 +88,8 @@ struct RoundState {
     candidates: HashMap<String, Block>,
     /// Collected signatures by block hash.
     votes: HashMap<String, Vec<SigEntry>>,
+    /// The accepted view number per height - see `current_view`.
+    view_for_height: HashMap<u64, u64>,
 }
 
 /// A synthetic "true" trajectory every node observes noisily -
@@ -112,10 +123,13 @@ fn decode_signature(hex_str: &str) -> Option<Signature> {
     Some(Signature::from_bytes(&arr))
 }
 
-fn block_canon(block: &Block) -> String {
-    let state_hash = chain::hash_vec(&block.state);
-    let reconciles_hash = chain::hash_list(&block.reconciles);
-    chain::canon_string(block.height, &block.parent, &state_hash, block.confidence, &reconciles_hash, block.epoch)
+/// The view this node currently accepts for `height` - 0 until
+/// something bumps it (nothing does yet; that's the view-change
+/// stage). Any proposal/vote for `height` at a different view is
+/// rejected: lower means a stale/replayed message, higher means a
+/// view this node hasn't caught up to.
+fn current_view(rs: &RoundState, height: u64) -> u64 {
+    *rs.view_for_height.get(&height).unwrap_or(&0)
 }
 
 /// Verifies `sig_hex` over `canon` against `sender`'s *configured*
@@ -246,19 +260,21 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
         sig_weight: 0.0,
         hash: String::new(),
     };
-    let canon = block_canon(&block);
-    block.hash = chain::block_hash(&canon);
-    let my_sig = crypto::sign_canon(&node.signing_key, &canon);
+    let identity_canon = protocol::block_canon(&block);
+    block.hash = chain::block_hash(&identity_canon);
+    let view = current_view(rs, block.height);
+    let signing_canon = protocol::view_block_canon(view, &block);
+    let my_sig = crypto::sign_canon(&node.signing_key, &signing_canon);
     let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
     block.signatures = vec![my_entry.clone()];
     block.sig_weight = 1.0;
 
-    log(format!("proposing height={} hash={} state={:?}", block.height, block.hash, block.state));
+    log(format!("proposing height={} view={view} hash={} state={:?}", block.height, block.hash, block.state));
 
     rs.candidates.insert(block.hash.clone(), block.clone());
     rs.votes.entry(block.hash.clone()).or_default().push(my_entry);
 
-    broadcast(ctx, &Message::BlockProposal(BlockProposalMsg { sender: node.node_id, block: block.clone() })).await;
+    broadcast(ctx, &Message::BlockProposal(BlockProposalMsg { sender: node.node_id, view, block: block.clone() })).await;
     maybe_commit(ctx, node, store, rs, &block.hash).await;
 }
 
@@ -304,16 +320,25 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         eprintln!("tri_sync_node: ignoring proposal from {} - expected proposer is {}", p.sender, expected);
         return;
     }
+    let expected_view = current_view(rs, p.block.height);
+    if p.view != expected_view {
+        eprintln!(
+            "tri_sync_node: ignoring proposal from {} for view {} - this node is at view {expected_view} for height {}",
+            p.sender, p.view, p.block.height
+        );
+        return;
+    }
     let Some(peer) = ctx.peers.get(&p.sender) else { return };
     let Some(their_sig_entry) = p.block.signatures.first() else { return };
     let Some(sig) = decode_signature(&their_sig_entry.sig_hex) else { return };
 
-    let canon = block_canon(&p.block);
-    if !crypto::verify_canon(&peer.pubkey, &canon, &sig) {
+    let identity_canon = protocol::block_canon(&p.block);
+    let signing_canon = protocol::view_block_canon(p.view, &p.block);
+    if !crypto::verify_canon(&peer.pubkey, &signing_canon, &sig) {
         eprintln!("tri_sync_node: invalid proposer signature from {}", p.sender);
         return;
     }
-    let block_hash = chain::block_hash(&canon);
+    let block_hash = chain::block_hash(&identity_canon);
     if block_hash != p.block.hash {
         eprintln!("tri_sync_node: proposal hash mismatch from {}", p.sender);
         return;
@@ -333,15 +358,16 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
 
     let already_voted = rs.votes[&block_hash].iter().any(|e| e.node_id == node.node_id);
     if !already_voted {
-        let my_sig = crypto::sign_canon(&node.signing_key, &canon);
+        let my_sig = crypto::sign_canon(&node.signing_key, &signing_canon);
         let my_entry =
             SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
         rs.votes.get_mut(&block_hash).unwrap().push(my_entry.clone());
-        log(format!("voting for height={} hash={block_hash}", p.block.height));
+        log(format!("voting for height={} view={} hash={block_hash}", p.block.height, p.view));
         broadcast(
             ctx,
             &Message::BlockVote(BlockVoteMsg {
                 sender: node.node_id,
+                view: p.view,
                 block_hash: block_hash.clone(),
                 pubkey_hex: my_entry.pubkey_hex,
                 sig_hex: my_entry.sig_hex,
@@ -365,9 +391,17 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     let Some(block) = rs.candidates.get(&v.block_hash).cloned() else {
         return; // vote arrived before the proposal - dropped; no retry in this stage
     };
+    let expected_view = current_view(rs, block.height);
+    if v.view != expected_view {
+        eprintln!(
+            "tri_sync_node: ignoring vote from {} for view {} - this node is at view {expected_view} for height {}",
+            v.sender, v.view, block.height
+        );
+        return;
+    }
     let Some(sig) = decode_signature(&v.sig_hex) else { return };
-    let canon = block_canon(&block);
-    if !crypto::verify_canon(&known_pubkey, &canon, &sig) {
+    let signing_canon = protocol::view_block_canon(v.view, &block);
+    if !crypto::verify_canon(&known_pubkey, &signing_canon, &sig) {
         eprintln!("tri_sync_node: invalid vote signature from {}", v.sender);
         return;
     }
@@ -502,7 +536,7 @@ mod tests {
     fn block_canon_matches_chain_canon_string() {
         let block = Block { height: 1, parent: "GENESIS".to_string(), state: vec![1.0, 2.0], confidence: 0.9, reconciles: vec![], epoch: 0, signatures: vec![], sig_weight: 0.0, hash: String::new() };
         let expected = chain::canon_string(1, "GENESIS", &chain::hash_vec(&[1.0, 2.0]), 0.9, &chain::hash_list(&[]), 0);
-        assert_eq!(block_canon(&block), expected);
+        assert_eq!(protocol::block_canon(&block), expected);
     }
 
     #[test]
@@ -598,6 +632,75 @@ mod tests {
         on_message(&ctx, &mut node, &store, &mut rs, spoofed).await;
 
         assert!(!rs.latest_observations.contains_key(&1), "a forged observation must never be accepted as peer 1's real data");
+    }
+
+    /// The real property this stage exists to prove: once this node's
+    /// accepted view for a height has moved past 0, a proposal signed
+    /// for the abandoned view 0 - with a completely genuine signature
+    /// from the correct proposer - is still rejected. Without the view
+    /// check, this exact message would be replayable indefinitely.
+    #[tokio::test]
+    async fn a_proposal_signed_for_an_abandoned_view_is_rejected_despite_a_genuine_signature() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("stale_view_proposal");
+        let store = Store::open(dir.path()).unwrap();
+
+        let head = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![0.0, 0.0],
+            confidence: 1.0,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 1.0,
+            hash: "head1".to_string(),
+        };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), head.clone()],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        // This node has already view-changed height 2 up to view 1 -
+        // simulated directly since Hardening 4 is what will drive this
+        // automatically; the rejection logic under test doesn't care
+        // how the bump happened.
+        rs.view_for_height.insert(2, 1);
+
+        // Peer 1 is the real expected proposer for head.height=1
+        // (all_ids=[0,1], 1 % 2 == 1), and genuinely signs at view 0 -
+        // the view this node has already abandoned for height 2.
+        let mut block = Block {
+            height: 2,
+            parent: head.hash.clone(),
+            state: vec![1.0, 1.0],
+            confidence: 0.9,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 0.0,
+            hash: String::new(),
+        };
+        let identity_canon = protocol::block_canon(&block);
+        block.hash = chain::block_hash(&identity_canon);
+        let stale_view = 0u64;
+        let signing_canon = protocol::view_block_canon(stale_view, &block);
+        let sig = crypto::sign_canon(&peer_sk, &signing_canon);
+        block.signatures = vec![SigEntry {
+            node_id: 1,
+            pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()),
+            sig_hex: hex::encode(sig.to_bytes()),
+        }];
+        block.sig_weight = 1.0;
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: stale_view, block }).await;
+
+        assert!(rs.candidates.is_empty(), "a proposal signed for an abandoned view must never be cached as a live candidate");
     }
 
     /// The real end-to-end claim this stage exists to prove: two
