@@ -9,6 +9,12 @@ use serde::Deserialize;
 pub struct PeerConfig {
     pub id: usize,
     pub addr: String,
+    /// This peer's Ed25519 public key, hex-encoded - exchanged out of
+    /// band before deployment (there is no in-band key discovery yet).
+    /// Required so block proposals and votes from this peer can be
+    /// verified against a key the operator actually expects, not
+    /// whatever key a message happens to claim.
+    pub pubkey_hex: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -20,6 +26,8 @@ pub struct NodeConfig {
     pub license_path: String,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    #[serde(default = "default_round_interval_secs")]
+    pub round_interval_secs: u64,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
@@ -30,6 +38,10 @@ fn default_license_path() -> String {
 
 fn default_data_dir() -> String {
     "data".to_string()
+}
+
+fn default_round_interval_secs() -> u64 {
+    3
 }
 
 impl NodeConfig {
@@ -47,6 +59,8 @@ pub enum ConfigError {
     EmptyListenAddr,
     DuplicatePeerId(usize),
     PeerIdMatchesOwnNodeId(usize),
+    BadPeerPubkey(usize),
+    ZeroRoundInterval,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -59,6 +73,10 @@ impl std::fmt::Display for ConfigError {
             ConfigError::PeerIdMatchesOwnNodeId(id) => {
                 write!(f, "node.toml: peer id {id} is the same as this node's own node_id")
             }
+            ConfigError::BadPeerPubkey(id) => {
+                write!(f, "node.toml: peer id {id}'s pubkey_hex is not a valid 32-byte hex-encoded Ed25519 public key")
+            }
+            ConfigError::ZeroRoundInterval => write!(f, "node.toml: round_interval_secs must be at least 1"),
         }
     }
 }
@@ -75,6 +93,9 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
     if config.listen_addr.trim().is_empty() {
         return Err(ConfigError::EmptyListenAddr);
     }
+    if config.round_interval_secs == 0 {
+        return Err(ConfigError::ZeroRoundInterval);
+    }
 
     let mut seen = std::collections::HashSet::new();
     for peer in &config.peers {
@@ -83,6 +104,10 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
         }
         if !seen.insert(peer.id) {
             return Err(ConfigError::DuplicatePeerId(peer.id));
+        }
+        let valid_pubkey = hex::decode(&peer.pubkey_hex).ok().filter(|b| b.len() == 32).is_some();
+        if !valid_pubkey {
+            return Err(ConfigError::BadPeerPubkey(peer.id));
         }
     }
 
@@ -93,9 +118,12 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
 mod tests {
     use super::*;
 
+    const DUMMY_PUBKEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
     #[test]
     fn a_well_formed_config_with_peers_parses_and_validates() {
-        let toml = r#"
+        let toml = format!(
+            r#"
             node_id = 0
             dim = 3
             listen_addr = "0.0.0.0:9000"
@@ -103,17 +131,22 @@ mod tests {
             [[peers]]
             id = 1
             addr = "127.0.0.1:9001"
+            pubkey_hex = "{k}"
 
             [[peers]]
             id = 2
             addr = "127.0.0.1:9002"
-        "#;
-        let config = load_from_str(toml).expect("should parse");
+            pubkey_hex = "{k}"
+        "#,
+            k = &DUMMY_PUBKEY[..64]
+        );
+        let config = load_from_str(&toml).expect("should parse");
         assert_eq!(config.node_id, 0);
         assert_eq!(config.dim, 3);
         assert_eq!(config.peers.len(), 2);
         assert_eq!(config.network_size(), 3);
         assert_eq!(config.license_path, "license.toml");
+        assert_eq!(config.round_interval_secs, 3);
     }
 
     #[test]
@@ -126,6 +159,29 @@ mod tests {
         "#;
         let config = load_from_str(toml).expect("should parse");
         assert_eq!(config.license_path, "custom_license.toml");
+    }
+
+    #[test]
+    fn round_interval_secs_defaults_when_omitted_but_can_be_overridden() {
+        let toml = r#"
+            node_id = 0
+            dim = 1
+            listen_addr = "0.0.0.0:9000"
+            round_interval_secs = 10
+        "#;
+        let config = load_from_str(toml).expect("should parse");
+        assert_eq!(config.round_interval_secs, 10);
+    }
+
+    #[test]
+    fn zero_round_interval_is_rejected() {
+        let toml = r#"
+            node_id = 0
+            dim = 1
+            listen_addr = "0.0.0.0:9000"
+            round_interval_secs = 0
+        "#;
+        assert_eq!(load_from_str(toml), Err(ConfigError::ZeroRoundInterval));
     }
 
     #[test]
@@ -161,7 +217,8 @@ mod tests {
 
     #[test]
     fn a_peer_sharing_this_nodes_own_id_is_rejected() {
-        let toml = r#"
+        let toml = format!(
+            r#"
             node_id = 5
             dim = 1
             listen_addr = "0.0.0.0:9000"
@@ -169,12 +226,38 @@ mod tests {
             [[peers]]
             id = 5
             addr = "127.0.0.1:9001"
-        "#;
-        assert_eq!(load_from_str(toml), Err(ConfigError::PeerIdMatchesOwnNodeId(5)));
+            pubkey_hex = "{}"
+        "#,
+            &DUMMY_PUBKEY[..64]
+        );
+        assert_eq!(load_from_str(&toml), Err(ConfigError::PeerIdMatchesOwnNodeId(5)));
     }
 
     #[test]
     fn duplicate_peer_ids_are_rejected() {
+        let toml = format!(
+            r#"
+            node_id = 0
+            dim = 1
+            listen_addr = "0.0.0.0:9000"
+
+            [[peers]]
+            id = 1
+            addr = "127.0.0.1:9001"
+            pubkey_hex = "{k}"
+
+            [[peers]]
+            id = 1
+            addr = "127.0.0.1:9002"
+            pubkey_hex = "{k}"
+        "#,
+            k = &DUMMY_PUBKEY[..64]
+        );
+        assert_eq!(load_from_str(&toml), Err(ConfigError::DuplicatePeerId(1)));
+    }
+
+    #[test]
+    fn a_malformed_peer_pubkey_is_rejected() {
         let toml = r#"
             node_id = 0
             dim = 1
@@ -183,12 +266,38 @@ mod tests {
             [[peers]]
             id = 1
             addr = "127.0.0.1:9001"
+            pubkey_hex = "not hex"
+        "#;
+        assert_eq!(load_from_str(toml), Err(ConfigError::BadPeerPubkey(1)));
+    }
+
+    #[test]
+    fn a_peer_pubkey_of_the_wrong_length_is_rejected() {
+        let toml = r#"
+            node_id = 0
+            dim = 1
+            listen_addr = "0.0.0.0:9000"
 
             [[peers]]
             id = 1
-            addr = "127.0.0.1:9002"
+            addr = "127.0.0.1:9001"
+            pubkey_hex = "abcd"
         "#;
-        assert_eq!(load_from_str(toml), Err(ConfigError::DuplicatePeerId(1)));
+        assert_eq!(load_from_str(toml), Err(ConfigError::BadPeerPubkey(1)));
+    }
+
+    #[test]
+    fn a_peer_missing_pubkey_hex_is_rejected_without_panicking() {
+        let toml = r#"
+            node_id = 0
+            dim = 1
+            listen_addr = "0.0.0.0:9000"
+
+            [[peers]]
+            id = 1
+            addr = "127.0.0.1:9001"
+        "#;
+        assert!(matches!(load_from_str(toml), Err(ConfigError::Toml(_))));
     }
 
     #[test]

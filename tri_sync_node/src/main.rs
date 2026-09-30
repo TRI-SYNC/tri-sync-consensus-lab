@@ -1,16 +1,16 @@
 //! `tri_sync_node`: self-hosted, network-capable tri-sync node.
 //!
 //! This binary loads `node.toml`, verifies `license.toml` against it,
-//! initializes or restores state (keys, chain, trust), and then serves
-//! the QUIC P2P transport, printing every message it receives. Running
-//! real consensus rounds over that transport is the next stage - see
-//! the crate's git history for the staged build-out.
+//! initializes or restores state (keys, chain, trust), starts the QUIC
+//! P2P transport, and runs the networked consensus round loop - see
+//! [`tri_sync_node::consensus`] for what that loop actually does and
+//! what's simplified about it.
 
 use rand::rngs::OsRng;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tri_sync_node::{config, license, net, persistence, state};
+use tri_sync_node::{config, consensus, license, net, persistence, state};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -20,10 +20,22 @@ async fn main() -> ExitCode {
     // `--duration <secs>`: run the server for a bounded time then exit
     // cleanly, instead of forever. Meant for scripted tests; a real
     // deployment is run with no duration and left running until killed.
+    //
+    // `--show-identity`: initialize (or load) state and print this
+    // node's public key, then exit immediately - no QUIC server, no
+    // consensus round. An operator needs this to learn a new node's
+    // pubkey before distributing it into peers' node.toml files; it
+    // also avoids what a bootstrap-then-reconfigure workflow would
+    // otherwise trip over, since the consensus loop's round timer fires
+    // an immediate first tick and (with no peers yet configured) would
+    // self-commit a block before the real peer list is ever written.
     let mut duration_secs: Option<u64> = None;
+    let mut show_identity_only = false;
     while let Some(arg) = args.next() {
-        if arg == "--duration" {
-            duration_secs = args.next().and_then(|s| s.parse().ok());
+        match arg.as_str() {
+            "--duration" => duration_secs = args.next().and_then(|s| s.parse().ok()),
+            "--show-identity" => show_identity_only = true,
+            _ => {}
         }
     }
 
@@ -104,6 +116,10 @@ async fn main() -> ExitCode {
         node_state.head().hash,
     );
 
+    if show_identity_only {
+        return ExitCode::SUCCESS;
+    }
+
     let listen_addr: std::net::SocketAddr = match config.listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -112,10 +128,17 @@ async fn main() -> ExitCode {
         }
     };
 
-    let endpoint = match net::make_server_endpoint(listen_addr) {
+    let server_endpoint = match net::make_server_endpoint(listen_addr) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("tri_sync_node: cannot start QUIC server on {listen_addr}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client_endpoint = match net::make_client_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("tri_sync_node: cannot start QUIC client endpoint: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -123,27 +146,11 @@ async fn main() -> ExitCode {
     println!("tri_sync_node: listening on {listen_addr}");
     let _ = std::io::stdout().flush();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(net::serve(endpoint, tx));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(net::serve(server_endpoint, tx));
 
-    let print_loop = async {
-        while let Some((remote, msg)) = rx.recv().await {
-            println!("tri_sync_node: received from {remote}: {msg:?}");
-            // stdout is fully (not line-) buffered when redirected to a
-            // file or pipe, so a killed process can lose buffered log
-            // lines - flush after every message so a tailed log is
-            // never behind reality.
-            let _ = std::io::stdout().flush();
-        }
-    };
-
-    match duration_secs {
-        Some(secs) => {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(secs), print_loop).await;
-            println!("tri_sync_node: --duration elapsed, shutting down cleanly.");
-        }
-        None => print_loop.await,
-    }
+    let duration = duration_secs.map(std::time::Duration::from_secs);
+    consensus::run(config, node_state, store, client_endpoint, rx, duration).await;
 
     ExitCode::SUCCESS
 }

@@ -4,6 +4,7 @@
 //! P2P transport.
 
 pub mod config;
+pub mod consensus;
 pub mod license;
 pub mod net;
 pub mod persistence;

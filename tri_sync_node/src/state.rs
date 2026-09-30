@@ -25,11 +25,6 @@ pub const NEUTRAL_EDGE_WEIGHT: f64 = 1.0;
 /// trusted nor distrusted until evidence says otherwise.
 pub const NEUTRAL_RELIABILITY: f64 = 0.5;
 
-// signing_key/epoch/edge_weight/reliability aren't read by this stage's
-// main.rs yet - they're consumed once P2P transport and consensus
-// rounds (Stage 5+) actually sign messages and update trust. Already
-// exercised by this module's own tests.
-#[allow(dead_code)]
 pub struct NodeState {
     pub node_id: usize,
     pub chain: Vec<Block>,
@@ -128,6 +123,8 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
+    const DUMMY_PUBKEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
     fn test_config() -> NodeConfig {
         NodeConfig {
             node_id: 0,
@@ -135,9 +132,10 @@ mod tests {
             listen_addr: "0.0.0.0:9000".to_string(),
             license_path: "license.toml".to_string(),
             data_dir: "data".to_string(),
+            round_interval_secs: 3,
             peers: vec![
-                PeerConfig { id: 1, addr: "127.0.0.1:9001".to_string() },
-                PeerConfig { id: 2, addr: "127.0.0.1:9002".to_string() },
+                PeerConfig { id: 1, addr: "127.0.0.1:9001".to_string(), pubkey_hex: DUMMY_PUBKEY[..64].to_string() },
+                PeerConfig { id: 2, addr: "127.0.0.1:9002".to_string(), pubkey_hex: DUMMY_PUBKEY[..64].to_string() },
             ],
         }
     }
@@ -234,7 +232,11 @@ mod tests {
             NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(1)).unwrap();
         }
 
-        config.peers.push(PeerConfig { id: 2, addr: "127.0.0.1:9002".to_string() }); // peer 2 added later
+        config.peers.push(PeerConfig {
+            id: 2,
+            addr: "127.0.0.1:9002".to_string(),
+            pubkey_hex: DUMMY_PUBKEY[..64].to_string(),
+        }); // peer 2 added later
         let store = Store::open(dir.path()).unwrap();
         let (state, loaded) = NodeState::load_or_init(&config, &store, &mut StdRng::seed_from_u64(1)).unwrap();
         assert!(loaded);
