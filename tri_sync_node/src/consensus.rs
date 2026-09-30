@@ -27,6 +27,7 @@
 //!   network yet.
 
 use crate::config::NodeConfig;
+use crate::metrics::Metrics;
 use crate::net;
 use crate::persistence::{Store, TrustEntry};
 use crate::protocol::{BlockProposalMsg, BlockVoteMsg, Message, ObservationMsg, TrustUpdateMsg};
@@ -36,6 +37,8 @@ use rand::SeedableRng;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tri_sync_core::chain::{self, Block, SigEntry};
 use tri_sync_core::crypto;
@@ -60,6 +63,7 @@ struct Ctx {
     peers: HashMap<usize, PeerInfo>,
     all_ids: Vec<usize>,
     endpoint: quinn::Endpoint,
+    metrics: Arc<Metrics>,
 }
 
 #[derive(Default)]
@@ -137,6 +141,7 @@ pub async fn run(
     endpoint: quinn::Endpoint,
     mut incoming: tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, Message)>,
     duration: Option<Duration>,
+    metrics: Arc<Metrics>,
 ) {
     let peers: HashMap<usize, PeerInfo> = config
         .peers
@@ -150,7 +155,8 @@ pub async fn run(
     let mut all_ids: Vec<usize> = peers.keys().cloned().chain(std::iter::once(node.node_id)).collect();
     all_ids.sort_unstable();
 
-    let ctx = Ctx { config, peers, all_ids, endpoint };
+    metrics.head_height.store(node.head().height, Ordering::Relaxed);
+    let ctx = Ctx { config, peers, all_ids, endpoint, metrics };
     let mut rs = RoundState::default();
     let mut rng = rand::rngs::StdRng::from_entropy();
 
@@ -281,6 +287,12 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         return;
     }
 
+    let is_new_fork = !rs.candidates.contains_key(&block_hash)
+        && rs.candidates.values().any(|b| b.height == p.block.height && b.hash != block_hash);
+    if is_new_fork {
+        ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
+        log(format!("fork observed at height={}: competing candidate {block_hash}", p.block.height));
+    }
     rs.candidates.entry(block_hash.clone()).or_insert_with(|| p.block.clone());
     let tally = rs.votes.entry(block_hash.clone()).or_default();
     if !tally.iter().any(|e| e.node_id == p.sender) {
@@ -356,6 +368,10 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     if let Err(e) = store.put_block(&block) {
         eprintln!("tri_sync_node: failed to persist committed block: {e}");
     }
+    ctx.metrics.head_height.store(block.height, Ordering::Relaxed);
+    if !block.reconciles.is_empty() {
+        ctx.metrics.reconciles_total.fetch_add(1, Ordering::Relaxed);
+    }
     log(format!("COMMITTED height={} hash={} sig_weight={} state={:?}", block.height, block.hash, block.sig_weight, block.state));
 
     rs.candidates.retain(|_, b| b.height > block.height);
@@ -403,6 +419,11 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
             eprintln!("tri_sync_node: failed to persist trust update for peer {peer_id}: {e}");
         }
         broadcast(ctx, &Message::TrustUpdate(TrustUpdateMsg { sender: node.node_id, about_peer: peer_id, edge_weight: new_w })).await;
+    }
+
+    if !node.edge_weight.is_empty() {
+        let mean = node.edge_weight.values().sum::<f64>() / node.edge_weight.len() as f64;
+        ctx.metrics.set_mean_trust_weight(mean);
     }
 }
 
@@ -487,6 +508,7 @@ mod tests {
             license_path: String::new(),
             data_dir: String::new(),
             round_interval_secs: 1,
+            metrics_addr: None,
             peers: vec![PeerConfig { id: 1, addr: addr_b.to_string(), pubkey_hex: hex::encode(sk_b.verifying_key().to_bytes()) }],
         };
         let config_b = NodeConfig {
@@ -496,6 +518,7 @@ mod tests {
             license_path: String::new(),
             data_dir: String::new(),
             round_interval_secs: 1,
+            metrics_addr: None,
             peers: vec![PeerConfig { id: 0, addr: addr_a.to_string(), pubkey_hex: hex::encode(sk_a.verifying_key().to_bytes()) }],
         };
 
@@ -530,7 +553,12 @@ mod tests {
         let client_b = net::make_client_endpoint().unwrap();
 
         let duration = Duration::from_secs(6);
-        tokio::join!(run(config_a, node_a, store_a, client_a, rx_a, Some(duration)), run(config_b, node_b, store_b, client_b, rx_b, Some(duration)));
+        let metrics_a = Arc::new(Metrics::default());
+        let metrics_b = Arc::new(Metrics::default());
+        tokio::join!(
+            run(config_a, node_a, store_a, client_a, rx_a, Some(duration), metrics_a.clone()),
+            run(config_b, node_b, store_b, client_b, rx_b, Some(duration), metrics_b.clone())
+        );
 
         let blocks_a = Store::open(dir_a.path()).unwrap().all_blocks().unwrap();
         let blocks_b = Store::open(dir_b.path()).unwrap().all_blocks().unwrap();
@@ -544,5 +572,12 @@ mod tests {
             assert_eq!(blocks_a[i].hash, blocks_b[i].hash, "both nodes must agree on block {}'s hash", blocks_a[i].height);
             assert_eq!(blocks_a[i].sig_weight, 2.0, "a 2-node network should always reach full 2-of-2 quorum");
         }
+
+        let last_a = blocks_a.last().unwrap();
+        let last_b = blocks_b.last().unwrap();
+        assert_eq!(metrics_a.head_height.load(Ordering::Relaxed), last_a.height, "metrics head_height should track the real committed chain");
+        assert_eq!(metrics_b.head_height.load(Ordering::Relaxed), last_b.height);
+        assert!(metrics_a.mean_trust_weight() > 0.0, "trust toward the peer should have grown from real observations");
+        assert!(metrics_b.mean_trust_weight() > 0.0);
     }
 }

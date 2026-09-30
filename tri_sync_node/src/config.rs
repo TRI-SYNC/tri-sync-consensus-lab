@@ -28,6 +28,10 @@ pub struct NodeConfig {
     pub data_dir: String,
     #[serde(default = "default_round_interval_secs")]
     pub round_interval_secs: u64,
+    /// Address to serve Prometheus metrics on (`/metrics`), e.g.
+    /// `"127.0.0.1:9898"`. Omit to disable - metrics are optional.
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
 }
@@ -61,6 +65,7 @@ pub enum ConfigError {
     PeerIdMatchesOwnNodeId(usize),
     BadPeerPubkey(usize),
     ZeroRoundInterval,
+    BadMetricsAddr(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -77,6 +82,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "node.toml: peer id {id}'s pubkey_hex is not a valid 32-byte hex-encoded Ed25519 public key")
             }
             ConfigError::ZeroRoundInterval => write!(f, "node.toml: round_interval_secs must be at least 1"),
+            ConfigError::BadMetricsAddr(a) => write!(f, "node.toml: metrics_addr '{a}' is not a valid host:port address"),
         }
     }
 }
@@ -95,6 +101,11 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
     }
     if config.round_interval_secs == 0 {
         return Err(ConfigError::ZeroRoundInterval);
+    }
+    if let Some(addr) = &config.metrics_addr {
+        if addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(ConfigError::BadMetricsAddr(addr.clone()));
+        }
     }
 
     let mut seen = std::collections::HashSet::new();

@@ -6,6 +6,7 @@
 pub mod config;
 pub mod consensus;
 pub mod license;
+pub mod metrics;
 pub mod net;
 pub mod persistence;
 pub mod protocol;

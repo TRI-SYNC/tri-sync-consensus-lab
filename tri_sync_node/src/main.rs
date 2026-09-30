@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use tri_sync_node::{config, consensus, license, net, persistence, state};
+use tri_sync_node::{config, consensus, license, metrics, net, persistence, state};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -146,11 +146,20 @@ async fn main() -> ExitCode {
     println!("tri_sync_node: listening on {listen_addr}");
     let _ = std::io::stdout().flush();
 
+    let node_metrics = std::sync::Arc::new(metrics::Metrics::default());
+    if let Some(metrics_addr_str) = &config.metrics_addr {
+        let metrics_addr: std::net::SocketAddr = metrics_addr_str.parse().expect("validated at config load");
+        match metrics::serve(metrics_addr, node_metrics.clone()) {
+            Ok(_handle) => println!("tri_sync_node: serving Prometheus metrics on http://{metrics_addr}/metrics"),
+            Err(e) => eprintln!("tri_sync_node: cannot start metrics server on {metrics_addr}: {e}"),
+        }
+    }
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(net::serve(server_endpoint, tx));
 
     let duration = duration_secs.map(std::time::Duration::from_secs);
-    consensus::run(config, node_state, store, client_endpoint, rx, duration).await;
+    consensus::run(config, node_state, store, client_endpoint, rx, duration, node_metrics).await;
 
     ExitCode::SUCCESS
 }

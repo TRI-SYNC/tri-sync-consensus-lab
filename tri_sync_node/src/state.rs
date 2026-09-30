@@ -133,6 +133,7 @@ mod tests {
             license_path: "license.toml".to_string(),
             data_dir: "data".to_string(),
             round_interval_secs: 3,
+            metrics_addr: None,
             peers: vec![
                 PeerConfig { id: 1, addr: "127.0.0.1:9001".to_string(), pubkey_hex: DUMMY_PUBKEY[..64].to_string() },
                 PeerConfig { id: 2, addr: "127.0.0.1:9002".to_string(), pubkey_hex: DUMMY_PUBKEY[..64].to_string() },

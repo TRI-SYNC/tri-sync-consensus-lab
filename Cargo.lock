@@ -1585,6 +1585,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tiny_http",
  "tokio",
  "toml",
  "tri_sync_core",
