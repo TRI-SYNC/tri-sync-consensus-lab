@@ -153,13 +153,17 @@ pub async fn run(
     duration: Option<Duration>,
     metrics: Arc<Metrics>,
 ) {
+    // config::load_from_str already rejected any unparseable peer addr
+    // or pubkey_hex - expect(), not filter_map's silent drop, so a
+    // config that somehow reaches here malformed fails loudly instead
+    // of quietly shrinking the network.
     let peers: HashMap<usize, PeerInfo> = config
         .peers
         .iter()
-        .filter_map(|p| {
-            let addr = p.addr.parse().ok()?;
-            let pubkey = decode_verifying_key(&p.pubkey_hex)?;
-            Some((p.id, PeerInfo { addr, pubkey }))
+        .map(|p| {
+            let addr = p.addr.parse().expect("validated at config load");
+            let pubkey = decode_verifying_key(&p.pubkey_hex).expect("validated at config load");
+            (p.id, PeerInfo { addr, pubkey })
         })
         .collect();
     let mut all_ids: Vec<usize> = peers.keys().cloned().chain(std::iter::once(node.node_id)).collect();
