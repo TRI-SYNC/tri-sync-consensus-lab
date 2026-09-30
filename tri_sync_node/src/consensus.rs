@@ -30,7 +30,7 @@ use crate::config::NodeConfig;
 use crate::metrics::Metrics;
 use crate::net;
 use crate::persistence::{Store, TrustEntry};
-use crate::protocol::{BlockProposalMsg, BlockVoteMsg, Message, ObservationMsg, TrustUpdateMsg};
+use crate::protocol::{self, BlockProposalMsg, BlockVoteMsg, Message, ObservationMsg, TrustUpdateMsg};
 use crate::state::NodeState;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::SeedableRng;
@@ -118,6 +118,16 @@ fn block_canon(block: &Block) -> String {
     chain::canon_string(block.height, &block.parent, &state_hash, block.confidence, &reconciles_hash, block.epoch)
 }
 
+/// Verifies `sig_hex` over `canon` against `sender`'s *configured*
+/// pubkey (never a pubkey the message itself claims) - `false` for an
+/// unknown sender, malformed signature, or bad match. The shared check
+/// behind authenticating observation, state, and trust-update gossip.
+fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> bool {
+    let Some(peer) = ctx.peers.get(&sender) else { return false };
+    let Some(sig) = decode_signature(sig_hex) else { return false };
+    crypto::verify_canon(&peer.pubkey, canon, &sig)
+}
+
 async fn broadcast(ctx: &Ctx, msg: &Message) {
     for peer in ctx.peers.values() {
         if let Err(e) = net::send_message(&ctx.endpoint, peer.addr, msg).await {
@@ -200,7 +210,9 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
 
     let obs = noisy_observation(ctx.config.dim, next_height, node.node_id, rng);
     rs.latest_observations.insert(node.node_id, obs.clone());
-    broadcast(ctx, &Message::Observation(ObservationMsg { sender: node.node_id, values: obs })).await;
+    let obs_canon = protocol::observation_canon(node.node_id, &obs);
+    let obs_sig = crypto::sign_canon(&node.signing_key, &obs_canon);
+    broadcast(ctx, &Message::Observation(ObservationMsg { sender: node.node_id, values: obs, sig_hex: hex::encode(obs_sig.to_bytes()) })).await;
 
     let proposer = expected_proposer(&ctx.all_ids, head.height);
     let already_proposed_here = rs.candidates.values().any(|b| b.parent == head.hash && b.height == next_height);
@@ -249,16 +261,32 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
 async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, msg: Message) {
     match msg {
         Message::Observation(o) => {
-            if ctx.peers.contains_key(&o.sender) {
+            let canon = protocol::observation_canon(o.sender, &o.values);
+            if verify_from_peer(ctx, o.sender, &canon, &o.sig_hex) {
                 rs.latest_observations.insert(o.sender, o.values);
+            } else {
+                eprintln!("tri_sync_node: rejected observation from {} - unknown sender or invalid signature", o.sender);
             }
         }
         Message::BlockProposal(p) => handle_proposal(ctx, node, store, rs, p).await,
         Message::BlockVote(v) => handle_vote(ctx, node, store, rs, v).await,
         Message::TrustUpdate(t) => {
-            log(format!("peer {} reports edge_weight {:.3} toward peer {}", t.sender, t.edge_weight, t.about_peer));
+            let canon = protocol::trust_update_canon(t.sender, t.about_peer, t.edge_weight);
+            if verify_from_peer(ctx, t.sender, &canon, &t.sig_hex) {
+                log(format!("peer {} reports edge_weight {:.3} toward peer {}", t.sender, t.edge_weight, t.about_peer));
+            } else {
+                eprintln!("tri_sync_node: rejected trust-update from {} - unknown sender or invalid signature", t.sender);
+            }
         }
-        Message::State(_) => {} // informational only in this stage
+        // Informational only in this stage - nothing acts on a peer's
+        // broadcast state yet - but still authenticated so a bad
+        // signature is visible rather than silently accepted.
+        Message::State(s) => {
+            let canon = protocol::state_canon(s.sender, &s.state, s.confidence);
+            if !verify_from_peer(ctx, s.sender, &canon, &s.sig_hex) {
+                eprintln!("tri_sync_node: rejected state broadcast from {} - unknown sender or invalid signature", s.sender);
+            }
+        }
     }
 }
 
@@ -418,7 +446,18 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
         if let Err(e) = store.put_trust(peer_id, TrustEntry { edge_weight: new_w, reliability: new_rel }) {
             eprintln!("tri_sync_node: failed to persist trust update for peer {peer_id}: {e}");
         }
-        broadcast(ctx, &Message::TrustUpdate(TrustUpdateMsg { sender: node.node_id, about_peer: peer_id, edge_weight: new_w })).await;
+        let trust_canon = protocol::trust_update_canon(node.node_id, peer_id, new_w);
+        let trust_sig = crypto::sign_canon(&node.signing_key, &trust_canon);
+        broadcast(
+            ctx,
+            &Message::TrustUpdate(TrustUpdateMsg {
+                sender: node.node_id,
+                about_peer: peer_id,
+                edge_weight: new_w,
+                sig_hex: hex::encode(trust_sig.to_bytes()),
+            }),
+        )
+        .await;
     }
 
     if !node.edge_weight.is_empty() {
@@ -473,6 +512,88 @@ mod tests {
     fn decode_verifying_key_rejects_garbage() {
         assert_eq!(decode_verifying_key("not hex"), None);
         assert_eq!(decode_verifying_key("abcd"), None);
+    }
+
+    fn test_ctx_with_one_peer() -> (Ctx, ed25519_dalek::SigningKey, ed25519_dalek::SigningKey) {
+        use crate::config::PeerConfig;
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: vec![PeerConfig { id: 1, addr: "127.0.0.1:1".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) }],
+        };
+        let peers = HashMap::from([(1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key() })]);
+        let endpoint = net::make_client_endpoint().unwrap();
+        let ctx = Ctx { config, peers, all_ids: vec![0, 1], endpoint, metrics: Arc::new(Metrics::default()) };
+        (ctx, self_sk, peer_sk)
+    }
+
+    #[tokio::test]
+    async fn verify_from_peer_accepts_a_genuinely_valid_signature() {
+        let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
+        let canon = protocol::observation_canon(1, &[1.0, 2.0]);
+        let sig = crypto::sign_canon(&peer_sk, &canon);
+        assert!(verify_from_peer(&ctx, 1, &canon, &hex::encode(sig.to_bytes())));
+    }
+
+    #[tokio::test]
+    async fn verify_from_peer_rejects_an_unconfigured_sender() {
+        let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
+        let canon = protocol::observation_canon(99, &[1.0, 2.0]);
+        let sig = crypto::sign_canon(&peer_sk, &canon);
+        assert!(!verify_from_peer(&ctx, 99, &canon, &hex::encode(sig.to_bytes())), "sender 99 isn't a configured peer");
+    }
+
+    #[tokio::test]
+    async fn verify_from_peer_rejects_a_signature_from_the_wrong_key() {
+        let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer();
+        let canon = protocol::observation_canon(1, &[1.0, 2.0]);
+        // Signed by node 0's own key, not peer 1's configured key - the
+        // exact spoofing attempt this authentication closes.
+        let forged_sig = crypto::sign_canon(&self_sk, &canon);
+        assert!(!verify_from_peer(&ctx, 1, &canon, &hex::encode(forged_sig.to_bytes())));
+    }
+
+    #[tokio::test]
+    async fn verify_from_peer_rejects_tampered_content_under_a_genuine_signature() {
+        let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
+        let real_canon = protocol::observation_canon(1, &[1.0, 2.0]);
+        let sig = crypto::sign_canon(&peer_sk, &real_canon);
+        let tampered_canon = protocol::observation_canon(1, &[1.0, 999.0]);
+        assert!(!verify_from_peer(&ctx, 1, &tampered_canon, &hex::encode(sig.to_bytes())));
+    }
+
+    #[tokio::test]
+    async fn a_spoofed_observation_is_never_folded_into_this_nodes_state() {
+        let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("spoofed_observation");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // Claims to be peer 1 but is signed with node 0's own key.
+        let fake_values = vec![999.0, 999.0];
+        let canon = protocol::observation_canon(1, &fake_values);
+        let forged_sig = crypto::sign_canon(&self_sk, &canon);
+        let spoofed = Message::Observation(ObservationMsg { sender: 1, values: fake_values, sig_hex: hex::encode(forged_sig.to_bytes()) });
+
+        on_message(&ctx, &mut node, &store, &mut rs, spoofed).await;
+
+        assert!(!rs.latest_observations.contains_key(&1), "a forged observation must never be accepted as peer 1's real data");
     }
 
     /// The real end-to-end claim this stage exists to prove: two

@@ -214,7 +214,7 @@ mod tests {
         tokio::spawn(serve(server_endpoint, tx));
 
         let client_endpoint = make_client_endpoint().unwrap();
-        let msg = Message::Observation(ObservationMsg { sender: 7, values: vec![1.0, 2.0, 3.0] });
+        let msg = Message::Observation(ObservationMsg { sender: 7, values: vec![1.0, 2.0, 3.0], sig_hex: "aa".to_string() });
         send_message(&client_endpoint, server_addr, &msg).await.unwrap();
 
         let (_, received) = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -229,7 +229,7 @@ mod tests {
         let client_endpoint = make_client_endpoint().unwrap();
         // Nothing listens on this loopback port.
         let dead_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let msg = Message::Observation(ObservationMsg { sender: 1, values: vec![0.0] });
+        let msg = Message::Observation(ObservationMsg { sender: 1, values: vec![0.0], sig_hex: "aa".to_string() });
 
         let started = tokio::time::Instant::now();
         let result = send_message(&client_endpoint, dead_addr, &msg).await;
