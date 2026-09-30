@@ -54,7 +54,7 @@ pub struct SigEntry {
     pub sig_hex: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Block {
     pub height: u64,
     pub parent: String,

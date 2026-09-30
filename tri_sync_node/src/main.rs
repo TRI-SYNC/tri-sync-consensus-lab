@@ -1,26 +1,31 @@
 //! `tri_sync_node`: self-hosted, network-capable tri-sync node.
 //!
-//! This binary currently loads `node.toml`, verifies `license.toml`
-//! against it, and initializes in-memory state (keys, genesis chain,
-//! trust toward configured peers) - Stages 1-3 of the
-//! networked-commercial-node feature. Starting the P2P transport,
-//! persisting state, and running real consensus rounds over the network
-//! are later stages - see the crate's git history for the staged
-//! build-out.
-
-mod config;
-mod license;
-mod persistence;
-mod state;
-#[cfg(test)]
-mod test_support;
+//! This binary loads `node.toml`, verifies `license.toml` against it,
+//! initializes or restores state (keys, chain, trust), and then serves
+//! the QUIC P2P transport, printing every message it receives. Running
+//! real consensus rounds over that transport is the next stage - see
+//! the crate's git history for the staged build-out.
 
 use rand::rngs::OsRng;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tri_sync_node::{config, license, net, persistence, state};
 
-fn main() -> ExitCode {
-    let node_toml_path = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("node.toml"));
+#[tokio::main]
+async fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    let node_toml_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("node.toml"));
+
+    // `--duration <secs>`: run the server for a bounded time then exit
+    // cleanly, instead of forever. Meant for scripted tests; a real
+    // deployment is run with no duration and left running until killed.
+    let mut duration_secs: Option<u64> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--duration" {
+            duration_secs = args.next().and_then(|s| s.parse().ok());
+        }
+    }
 
     let node_toml_str = match std::fs::read_to_string(&node_toml_path) {
         Ok(s) => s,
@@ -99,6 +104,46 @@ fn main() -> ExitCode {
         node_state.head().hash,
     );
 
-    println!("tri_sync_node: no P2P transport yet (later stage) - shutting down cleanly.");
+    let listen_addr: std::net::SocketAddr = match config.listen_addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("tri_sync_node: invalid listen_addr '{}': {e}", config.listen_addr);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let endpoint = match net::make_server_endpoint(listen_addr) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("tri_sync_node: cannot start QUIC server on {listen_addr}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("tri_sync_node: listening on {listen_addr}");
+    let _ = std::io::stdout().flush();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(net::serve(endpoint, tx));
+
+    let print_loop = async {
+        while let Some((remote, msg)) = rx.recv().await {
+            println!("tri_sync_node: received from {remote}: {msg:?}");
+            // stdout is fully (not line-) buffered when redirected to a
+            // file or pipe, so a killed process can lose buffered log
+            // lines - flush after every message so a tailed log is
+            // never behind reality.
+            let _ = std::io::stdout().flush();
+        }
+    };
+
+    match duration_secs {
+        Some(secs) => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(secs), print_loop).await;
+            println!("tri_sync_node: --duration elapsed, shutting down cleanly.");
+        }
+        None => print_loop.await,
+    }
+
     ExitCode::SUCCESS
 }
