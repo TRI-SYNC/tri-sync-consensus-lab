@@ -23,6 +23,9 @@ pub struct Metrics {
     pub head_height: AtomicU64,
     pub forks_total: AtomicU64,
     pub reconciles_total: AtomicU64,
+    /// Times this node bumped a height's view after its proposer timed
+    /// out - see `crate::consensus`'s liveness/view-change handling.
+    pub view_changes_total: AtomicU64,
     mean_trust_weight_bits: AtomicU64,
 }
 
@@ -48,11 +51,15 @@ impl Metrics {
              tri_sync_reconciles_total {}\n\
              # HELP tri_sync_mean_trust_weight Mean edge weight across all tracked peers.\n\
              # TYPE tri_sync_mean_trust_weight gauge\n\
-             tri_sync_mean_trust_weight {}\n",
+             tri_sync_mean_trust_weight {}\n\
+             # HELP tri_sync_view_changes_total Times a height's proposer timed out and view advanced.\n\
+             # TYPE tri_sync_view_changes_total counter\n\
+             tri_sync_view_changes_total {}\n",
             self.head_height.load(Ordering::Relaxed),
             self.forks_total.load(Ordering::Relaxed),
             self.reconciles_total.load(Ordering::Relaxed),
             self.mean_trust_weight(),
+            self.view_changes_total.load(Ordering::Relaxed),
         )
     }
 }
@@ -93,6 +100,7 @@ mod tests {
         metrics.head_height.store(7, Ordering::Relaxed);
         metrics.forks_total.store(2, Ordering::Relaxed);
         metrics.reconciles_total.store(1, Ordering::Relaxed);
+        metrics.view_changes_total.store(4, Ordering::Relaxed);
         metrics.set_mean_trust_weight(1.5);
 
         let text = metrics.render();
@@ -100,6 +108,7 @@ mod tests {
         assert!(text.contains("tri_sync_forks_total 2"));
         assert!(text.contains("tri_sync_reconciles_total 1"));
         assert!(text.contains("tri_sync_mean_trust_weight 1.5"));
+        assert!(text.contains("tri_sync_view_changes_total 4"));
     }
 
     #[test]

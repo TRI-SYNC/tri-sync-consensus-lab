@@ -83,13 +83,22 @@ struct RoundState {
     /// just means fusion falls back to slightly stale data instead of
     /// blocking.
     latest_observations: HashMap<usize, Vec<f64>>,
-    /// Candidate blocks by hash, kept until superseded by a committed
-    /// block at the same or greater height.
-    candidates: HashMap<String, Block>,
+    /// Candidate blocks by hash, paired with the view that produced
+    /// them, kept until superseded by a committed block at the same or
+    /// greater height. The view is tracked alongside the block (not
+    /// on `Block` itself, which knows nothing about view-change) so a
+    /// candidate from an abandoned view can be told apart from a fresh
+    /// one at the same height.
+    candidates: HashMap<String, (u64, Block)>,
     /// Collected signatures by block hash.
     votes: HashMap<String, Vec<SigEntry>>,
     /// The accepted view number per height - see `current_view`.
     view_for_height: HashMap<u64, u64>,
+    /// The (height, view) this node is currently timing a proposer
+    /// timeout for, and when that timer started - see
+    /// `maybe_bump_view`. `None` until the first tick sets it.
+    waiting_for: Option<(u64, u64)>,
+    waiting_since: Option<tokio::time::Instant>,
 }
 
 /// A synthetic "true" trajectory every node observes noisily -
@@ -103,8 +112,12 @@ fn noisy_observation(dim: usize, height: u64, node_id: usize, rng: &mut impl ran
     synthetic_truth(dim, height).into_iter().map(|v| v + rng.gen_range(-0.5..0.5) + (node_id as f64 * 0.01)).collect()
 }
 
-fn expected_proposer(all_ids: &[usize], height: u64) -> usize {
-    all_ids[(height as usize) % all_ids.len()]
+/// The proposer for `height` at `view`: round-robins by `height + view`,
+/// so bumping the view (see `maybe_bump_view`) hands off to the next
+/// participant in a way every node computes identically without
+/// needing to coordinate who goes next.
+fn expected_proposer(all_ids: &[usize], height: u64, view: u64) -> usize {
+    all_ids[((height + view) as usize) % all_ids.len()]
 }
 
 fn quorum_for(network_size: usize) -> usize {
@@ -132,6 +145,42 @@ fn current_view(rs: &RoundState, height: u64) -> u64 {
     *rs.view_for_height.get(&height).unwrap_or(&0)
 }
 
+/// Checks whether this node has been waiting too long for `height`'s
+/// current-view proposer, and bumps the view if so. Called every tick
+/// before anything else, so a stalled proposer (offline, slow,
+/// byzantine) doesn't stall the whole network.
+///
+/// Tracks `(height, view)` rather than just a timestamp: whenever
+/// either changes underneath it (the head advanced past `height`, or
+/// the view already moved on since this was last called), the timer
+/// restarts from zero for the new pair instead of carrying over
+/// elapsed time that belonged to a different wait. Returns `true` if a
+/// bump happened just now.
+fn maybe_bump_view(rs: &mut RoundState, height: u64, timeout: Duration) -> bool {
+    let view = current_view(rs, height);
+    let now = tokio::time::Instant::now();
+
+    if rs.waiting_for != Some((height, view)) {
+        rs.waiting_for = Some((height, view));
+        rs.waiting_since = Some(now);
+        return false;
+    }
+
+    let Some(started) = rs.waiting_since else {
+        rs.waiting_since = Some(now);
+        return false;
+    };
+    if now.duration_since(started) < timeout {
+        return false;
+    }
+
+    let new_view = view + 1;
+    rs.view_for_height.insert(height, new_view);
+    rs.waiting_for = Some((height, new_view));
+    rs.waiting_since = Some(now);
+    true
+}
+
 /// Verifies `sig_hex` over `canon` against `sender`'s *configured*
 /// pubkey (never a pubkey the message itself claims) - `false` for an
 /// unknown sender, malformed signature, or bad match. The shared check
@@ -142,11 +191,25 @@ fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> boo
     crypto::verify_canon(&peer.pubkey, canon, &sig)
 }
 
-async fn broadcast(ctx: &Ctx, msg: &Message) {
+/// Fires a send to every peer as its own task and returns immediately,
+/// rather than awaiting each one in turn. Sequential awaiting was a
+/// real bug, caught by a live liveness test: one unreachable peer's
+/// full connect timeout (see `net::CONNECT_TIMEOUT`) delayed delivery
+/// to every *other* peer in the same broadcast, which starved the
+/// view-change catch-up logic of the timely delivery it depends on -
+/// two live nodes could each be stuck waiting ~5s behind a single dead
+/// third peer on every tick, drifting their view-timeout clocks apart
+/// faster than messages could ever catch up.
+fn broadcast(ctx: &Ctx, msg: &Message) {
     for peer in ctx.peers.values() {
-        if let Err(e) = net::send_message(&ctx.endpoint, peer.addr, msg).await {
-            eprintln!("tri_sync_node: send to {} failed: {e}", peer.addr);
-        }
+        let endpoint = ctx.endpoint.clone();
+        let addr = peer.addr;
+        let msg = msg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = net::send_message(&endpoint, addr, &msg).await {
+                eprintln!("tri_sync_node: send to {addr} failed: {e}");
+            }
+        });
     }
 }
 
@@ -226,20 +289,32 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
     let head = node.head().clone();
     let next_height = head.height + 1;
 
+    let view_timeout = Duration::from_secs(ctx.config.round_interval_secs.saturating_mul(3).max(1));
+    if maybe_bump_view(rs, next_height, view_timeout) {
+        let new_view = current_view(rs, next_height);
+        ctx.metrics.view_changes_total.fetch_add(1, Ordering::Relaxed);
+        log(format!(
+            "view-change: height={next_height} timed out waiting on proposer {}, advancing to view={new_view} (new proposer {})",
+            expected_proposer(&ctx.all_ids, next_height, new_view - 1),
+            expected_proposer(&ctx.all_ids, next_height, new_view)
+        ));
+    }
+
     let obs = noisy_observation(ctx.config.dim, next_height, node.node_id, rng);
     rs.latest_observations.insert(node.node_id, obs.clone());
     let obs_canon = protocol::observation_canon(node.node_id, &obs);
     let obs_sig = crypto::sign_canon(&node.signing_key, &obs_canon);
-    broadcast(ctx, &Message::Observation(ObservationMsg { sender: node.node_id, values: obs, sig_hex: hex::encode(obs_sig.to_bytes()) })).await;
+    broadcast(ctx, &Message::Observation(ObservationMsg { sender: node.node_id, values: obs, sig_hex: hex::encode(obs_sig.to_bytes()) }));
 
-    let proposer = expected_proposer(&ctx.all_ids, head.height);
-    let already_proposed_here = rs.candidates.values().any(|b| b.parent == head.hash && b.height == next_height);
+    let view = current_view(rs, next_height);
+    let proposer = expected_proposer(&ctx.all_ids, next_height, view);
+    let already_proposed_here = rs.candidates.values().any(|(v, b)| b.parent == head.hash && b.height == next_height && *v == view);
     if proposer == node.node_id && !already_proposed_here {
-        propose_block(ctx, node, store, rs, &head).await;
+        propose_block(ctx, node, store, rs, &head, view).await;
     }
 }
 
-async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, head: &Block) {
+async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, head: &Block, view: u64) {
     let ids: Vec<usize> = rs.latest_observations.keys().cloned().collect();
     let values: Vec<Vec<f64>> = ids.iter().map(|id| rs.latest_observations[id].clone()).collect();
     let weights: Vec<f64> =
@@ -262,7 +337,6 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     };
     let identity_canon = protocol::block_canon(&block);
     block.hash = chain::block_hash(&identity_canon);
-    let view = current_view(rs, block.height);
     let signing_canon = protocol::view_block_canon(view, &block);
     let my_sig = crypto::sign_canon(&node.signing_key, &signing_canon);
     let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
@@ -271,10 +345,10 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
 
     log(format!("proposing height={} view={view} hash={} state={:?}", block.height, block.hash, block.state));
 
-    rs.candidates.insert(block.hash.clone(), block.clone());
+    rs.candidates.insert(block.hash.clone(), (view, block.clone()));
     rs.votes.entry(block.hash.clone()).or_default().push(my_entry);
 
-    broadcast(ctx, &Message::BlockProposal(BlockProposalMsg { sender: node.node_id, view, block: block.clone() })).await;
+    broadcast(ctx, &Message::BlockProposal(BlockProposalMsg { sender: node.node_id, view, block: block.clone() }));
     maybe_commit(ctx, node, store, rs, &block.hash).await;
 }
 
@@ -315,17 +389,25 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     if p.block.parent != head.hash || p.block.height != head.height + 1 {
         return; // stale, forked, or premature proposal - not handled in this stage
     }
-    let expected = expected_proposer(&ctx.all_ids, head.height);
-    if p.sender != expected {
-        eprintln!("tri_sync_node: ignoring proposal from {} - expected proposer is {}", p.sender, expected);
-        return;
-    }
-    let expected_view = current_view(rs, p.block.height);
-    if p.view != expected_view {
+    // Reject only a *stale* view outright (replay of an abandoned
+    // view - Hardening 3). A view *ahead* of what this node has
+    // tracked is legitimate catch-up, not rejected here: independent
+    // per-node timeout clocks drift, and a node that's simply running
+    // a tick behind must not be permanently stuck disagreeing with
+    // the rest of the network. Whether to actually adopt it still
+    // depends on the sender being the real expected proposer and the
+    // signature checking out below - an unverified claim of a high
+    // view number proves nothing on its own.
+    if p.view < current_view(rs, p.block.height) {
         eprintln!(
-            "tri_sync_node: ignoring proposal from {} for view {} - this node is at view {expected_view} for height {}",
+            "tri_sync_node: ignoring proposal from {} for stale view {} - this node is already past it for height {}",
             p.sender, p.view, p.block.height
         );
+        return;
+    }
+    let expected = expected_proposer(&ctx.all_ids, p.block.height, p.view);
+    if p.sender != expected {
+        eprintln!("tri_sync_node: ignoring proposal from {} - expected proposer for view {} is {}", p.sender, p.view, expected);
         return;
     }
     let Some(peer) = ctx.peers.get(&p.sender) else { return };
@@ -344,13 +426,20 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         return;
     }
 
+    if p.view > current_view(rs, p.block.height) {
+        log(format!("catching up: adopting view={} for height={} from proposer {}", p.view, p.block.height, p.sender));
+        rs.view_for_height.insert(p.block.height, p.view);
+        rs.waiting_for = Some((p.block.height, p.view));
+        rs.waiting_since = Some(tokio::time::Instant::now());
+    }
+
     let is_new_fork = !rs.candidates.contains_key(&block_hash)
-        && rs.candidates.values().any(|b| b.height == p.block.height && b.hash != block_hash);
+        && rs.candidates.values().any(|(_, b)| b.height == p.block.height && b.hash != block_hash);
     if is_new_fork {
         ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
         log(format!("fork observed at height={}: competing candidate {block_hash}", p.block.height));
     }
-    rs.candidates.entry(block_hash.clone()).or_insert_with(|| p.block.clone());
+    rs.candidates.entry(block_hash.clone()).or_insert_with(|| (p.view, p.block.clone()));
     let tally = rs.votes.entry(block_hash.clone()).or_default();
     if !tally.iter().any(|e| e.node_id == p.sender) {
         tally.push(their_sig_entry.clone());
@@ -372,8 +461,7 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
                 pubkey_hex: my_entry.pubkey_hex,
                 sig_hex: my_entry.sig_hex,
             }),
-        )
-        .await;
+        );
     }
 
     maybe_commit(ctx, node, store, rs, &block_hash).await;
@@ -388,13 +476,17 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
         return;
     }
 
-    let Some(block) = rs.candidates.get(&v.block_hash).cloned() else {
+    let Some((_, block)) = rs.candidates.get(&v.block_hash).cloned() else {
         return; // vote arrived before the proposal - dropped; no retry in this stage
     };
-    let expected_view = current_view(rs, block.height);
-    if v.view != expected_view {
+    // Same "reject only if stale, catch up if ahead" rule as
+    // handle_proposal - in practice this candidate is only cached
+    // once the corresponding proposal already caught this node up to
+    // its view, so v.view > current_view should be rare, but the rule
+    // stays consistent rather than assuming that.
+    if v.view < current_view(rs, block.height) {
         eprintln!(
-            "tri_sync_node: ignoring vote from {} for view {} - this node is at view {expected_view} for height {}",
+            "tri_sync_node: ignoring vote from {} for stale view {} - this node is already past it for height {}",
             v.sender, v.view, block.height
         );
         return;
@@ -404,6 +496,11 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     if !crypto::verify_canon(&known_pubkey, &signing_canon, &sig) {
         eprintln!("tri_sync_node: invalid vote signature from {}", v.sender);
         return;
+    }
+    if v.view > current_view(rs, block.height) {
+        rs.view_for_height.insert(block.height, v.view);
+        rs.waiting_for = Some((block.height, v.view));
+        rs.waiting_since = Some(tokio::time::Instant::now());
     }
 
     let tally = rs.votes.entry(v.block_hash.clone()).or_default();
@@ -416,7 +513,7 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
 
 async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str) {
     let head = node.head().clone();
-    let Some(mut block) = rs.candidates.get(block_hash).cloned() else { return };
+    let Some((_, mut block)) = rs.candidates.get(block_hash).cloned() else { return };
     if block.parent != head.hash {
         return; // superseded by a different committed block already
     }
@@ -440,9 +537,15 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     }
     log(format!("COMMITTED height={} hash={} sig_weight={} state={:?}", block.height, block.hash, block.sig_weight, block.state));
 
-    rs.candidates.retain(|_, b| b.height > block.height);
+    rs.candidates.retain(|_, (_, b)| b.height > block.height);
     let surviving: std::collections::HashSet<String> = rs.candidates.keys().cloned().collect();
     rs.votes.retain(|h, _| surviving.contains(h));
+    // Not strictly required (the next tick's height/view mismatch in
+    // maybe_bump_view would reset this anyway), but explicit here:
+    // whatever this node was timing out on is resolved now that the
+    // height actually committed.
+    rs.waiting_for = None;
+    rs.waiting_since = None;
 }
 
 /// Real leave-one-out Δe: for each peer whose latest observation
@@ -494,8 +597,7 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
                 edge_weight: new_w,
                 sig_hex: hex::encode(trust_sig.to_bytes()),
             }),
-        )
-        .await;
+        );
     }
 
     if !node.edge_weight.is_empty() {
@@ -511,10 +613,24 @@ mod tests {
     #[test]
     fn proposer_selection_is_deterministic_and_round_robins_by_height() {
         let ids = vec![0, 1, 2];
-        assert_eq!(expected_proposer(&ids, 0), 0);
-        assert_eq!(expected_proposer(&ids, 1), 1);
-        assert_eq!(expected_proposer(&ids, 2), 2);
-        assert_eq!(expected_proposer(&ids, 3), 0);
+        assert_eq!(expected_proposer(&ids, 0, 0), 0);
+        assert_eq!(expected_proposer(&ids, 1, 0), 1);
+        assert_eq!(expected_proposer(&ids, 2, 0), 2);
+        assert_eq!(expected_proposer(&ids, 3, 0), 0);
+    }
+
+    #[test]
+    fn proposer_selection_also_round_robins_by_view_bumping_the_hand_off() {
+        let ids = vec![0, 1, 2];
+        // Same height, escalating views - each view hands off to the
+        // next participant, wrapping around.
+        assert_eq!(expected_proposer(&ids, 5, 0), expected_proposer(&ids, 5, 0));
+        let v0 = expected_proposer(&ids, 5, 0);
+        let v1 = expected_proposer(&ids, 5, 1);
+        let v2 = expected_proposer(&ids, 5, 2);
+        assert_ne!(v0, v1);
+        assert_ne!(v1, v2);
+        assert_ne!(v0, v2);
     }
 
     #[test]
@@ -524,6 +640,63 @@ mod tests {
         assert_eq!(quorum_for(3), 2);
         assert_eq!(quorum_for(4), 3);
         assert_eq!(quorum_for(5), 3);
+    }
+
+    // Uses tokio's virtual clock (paused, manually advanced) so these
+    // run instantly instead of actually sleeping for the timeout.
+
+    #[tokio::test(start_paused = true)]
+    async fn maybe_bump_view_does_nothing_before_the_timeout_elapses() {
+        let mut rs = RoundState::default();
+        let timeout = Duration::from_secs(10);
+        assert!(!maybe_bump_view(&mut rs, 5, timeout), "first call just starts the timer, it shouldn't bump yet");
+        tokio::time::advance(Duration::from_secs(5)).await; // halfway there
+        assert!(!maybe_bump_view(&mut rs, 5, timeout));
+        assert_eq!(current_view(&rs, 5), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maybe_bump_view_bumps_exactly_once_the_timeout_elapses() {
+        let mut rs = RoundState::default();
+        let timeout = Duration::from_secs(10);
+        maybe_bump_view(&mut rs, 5, timeout); // starts the timer
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(maybe_bump_view(&mut rs, 5, timeout), "the timeout has fully elapsed, this call should bump");
+        assert_eq!(current_view(&rs, 5), 1);
+
+        // Immediately calling again shouldn't bump a second time - the
+        // timer for the new view just started.
+        assert!(!maybe_bump_view(&mut rs, 5, timeout));
+        assert_eq!(current_view(&rs, 5), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maybe_bump_view_can_bump_repeatedly_if_the_new_proposer_also_stalls() {
+        let mut rs = RoundState::default();
+        let timeout = Duration::from_secs(10);
+        maybe_bump_view(&mut rs, 5, timeout);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(maybe_bump_view(&mut rs, 5, timeout));
+        assert_eq!(current_view(&rs, 5), 1);
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(maybe_bump_view(&mut rs, 5, timeout), "a second stalled proposer should bump again");
+        assert_eq!(current_view(&rs, 5), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maybe_bump_view_restarts_the_timer_when_the_height_changes() {
+        let mut rs = RoundState::default();
+        let timeout = Duration::from_secs(10);
+        maybe_bump_view(&mut rs, 5, timeout);
+        tokio::time::advance(Duration::from_secs(9)).await; // almost timed out for height 5
+
+        // The chain committed height 5 in the meantime - now waiting
+        // on height 6 instead. The 9 elapsed seconds must not carry
+        // over to height 6's fresh timer.
+        assert!(!maybe_bump_view(&mut rs, 6, timeout));
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(!maybe_bump_view(&mut rs, 6, timeout), "only 9s elapsed for height 6's own timer, not enough to bump");
     }
 
     #[test]
@@ -701,6 +874,82 @@ mod tests {
         handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: stale_view, block }).await;
 
         assert!(rs.candidates.is_empty(), "a proposal signed for an abandoned view must never be cached as a live candidate");
+    }
+
+    /// The fix for the real bug the manual liveness test caught: nodes
+    /// time out independently, so one node's view can legitimately run
+    /// ahead of another's. A validly-signed proposal from the correct
+    /// expected proposer at a *higher* view than this node has tracked
+    /// must be accepted and adopted (catch-up), not rejected the same
+    /// way a stale one is - otherwise two live nodes whose timeout
+    /// clocks drift can reject each other's proposals forever and
+    /// never converge.
+    #[tokio::test]
+    async fn a_proposal_at_a_higher_view_from_the_correct_proposer_is_accepted_and_adopted() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, all_ids=[0,1]
+        let dir = crate::test_support::TempDir::new("view_catch_up");
+        let store = Store::open(dir.path()).unwrap();
+
+        let head = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![0.0, 0.0],
+            confidence: 1.0,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 1.0,
+            hash: "head1".to_string(),
+        };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), head.clone()],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        assert_eq!(current_view(&rs, 2), 0, "this node hasn't tracked any view bump for height 2 yet");
+
+        // Peer 1 is the real expected proposer for (height=2, view=1):
+        // expected_proposer([0,1], 2, 1) == all_ids[(2+1)%2] == 1.
+        let ahead_view = 1u64;
+        assert_eq!(expected_proposer(&ctx.all_ids, 2, ahead_view), 1);
+
+        let mut block = Block {
+            height: 2,
+            parent: head.hash.clone(),
+            state: vec![2.0, 2.0],
+            confidence: 0.9,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 0.0,
+            hash: String::new(),
+        };
+        let identity_canon = protocol::block_canon(&block);
+        block.hash = chain::block_hash(&identity_canon);
+        let signing_canon = protocol::view_block_canon(ahead_view, &block);
+        let sig = crypto::sign_canon(&peer_sk, &signing_canon);
+        block.signatures = vec![SigEntry {
+            node_id: 1,
+            pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()),
+            sig_hex: hex::encode(sig.to_bytes()),
+        }];
+        block.sig_weight = 1.0;
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: ahead_view, block: block.clone() }).await;
+
+        assert_eq!(current_view(&rs, 2), ahead_view, "this node should have caught up to the peer's higher view");
+        // With only two participants, the proposer's own signature plus
+        // this node's vote already meets quorum (2), so catch-up here
+        // goes all the way to a real commit - not just passive caching
+        // - which is the actually-correct end-to-end outcome.
+        let committed = node.chain.last().expect("chain should have advanced");
+        assert_eq!(committed.hash, block.hash, "the block from the higher view should be the one that committed");
+        assert_eq!(committed.sig_weight, 2.0, "proposer's signature plus this node's vote");
     }
 
     /// The real end-to-end claim this stage exists to prove: two
