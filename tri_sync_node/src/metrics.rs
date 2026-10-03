@@ -1,6 +1,7 @@
 //! Optional Prometheus metrics: head height, forks observed, blocks
-//! that reconciled a fork, and mean trust weight toward this node's
-//! peers.
+//! that reconciled a fork, mean trust weight toward this node's peers,
+//! and (Hardening 6) per-peer network health - see `crate::health` for
+//! what "health" means here and why it's purely observational.
 //!
 //! **Honest note on `forks`/`reconciles`.** `forks_total` counts two
 //! real, distinct things (see `consensus::handle_proposal`): a
@@ -20,6 +21,8 @@
 //! re-proposal step, re-signed by a fresh quorum), which is out of
 //! scope here.
 
+use crate::health::{HealthTransition, PeerHealth};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,9 +38,21 @@ pub struct Metrics {
     /// out - see `crate::consensus`'s liveness/view-change handling.
     pub view_changes_total: AtomicU64,
     mean_trust_weight_bits: AtomicU64,
+    /// One entry per configured peer, built once at start-up from
+    /// `node.toml` - see `crate::health` for why the map itself never
+    /// needs to change after that, only the atomics inside each entry.
+    peer_health: HashMap<usize, PeerHealth>,
 }
 
 impl Metrics {
+    /// Builds a `Metrics` with a health entry pre-created for each id
+    /// in `peer_ids`, so `peer_health`/`record_send_result`/
+    /// `record_peer_seen` below are no-ops for an unconfigured id
+    /// rather than silently losing data for a configured one.
+    pub fn new(peer_ids: &[usize]) -> Metrics {
+        Metrics { peer_health: peer_ids.iter().map(|&id| (id, PeerHealth::default())).collect(), ..Default::default() }
+    }
+
     pub fn set_mean_trust_weight(&self, value: f64) {
         self.mean_trust_weight_bits.store(value.to_bits(), Ordering::Relaxed);
     }
@@ -46,8 +61,26 @@ impl Metrics {
         f64::from_bits(self.mean_trust_weight_bits.load(Ordering::Relaxed))
     }
 
+    pub fn peer_health(&self, peer_id: usize) -> Option<&PeerHealth> {
+        self.peer_health.get(&peer_id)
+    }
+
+    /// Returns `None` for an unconfigured peer id, otherwise the
+    /// `HealthTransition` `PeerHealth::record_send_result` reports -
+    /// see that method for why the transition must come from there,
+    /// not from a separate before/after comparison here.
+    pub fn record_send_result(&self, peer_id: usize, ok: bool) -> Option<HealthTransition> {
+        self.peer_health.get(&peer_id).map(|h| h.record_send_result(ok))
+    }
+
+    pub fn record_peer_seen(&self, peer_id: usize) {
+        if let Some(h) = self.peer_health.get(&peer_id) {
+            h.record_authenticated_message();
+        }
+    }
+
     fn render(&self) -> String {
-        format!(
+        let mut out = format!(
             "# HELP tri_sync_head_height Current chain head block height.\n\
              # TYPE tri_sync_head_height gauge\n\
              tri_sync_head_height {}\n\
@@ -68,7 +101,38 @@ impl Metrics {
             self.reconciles_total.load(Ordering::Relaxed),
             self.mean_trust_weight(),
             self.view_changes_total.load(Ordering::Relaxed),
-        )
+        );
+
+        if !self.peer_health.is_empty() {
+            out.push_str(
+                "# HELP tri_sync_peer_healthy Whether this node currently considers a peer healthy (1) or not (0), based on consecutive send failures.\n\
+                 # TYPE tri_sync_peer_healthy gauge\n",
+            );
+            let mut ids: Vec<&usize> = self.peer_health.keys().collect();
+            ids.sort_unstable();
+            for &id in &ids {
+                let h = &self.peer_health[id];
+                out.push_str(&format!("tri_sync_peer_healthy{{peer=\"{id}\"}} {}\n", if h.is_healthy() { 1 } else { 0 }));
+            }
+            out.push_str(
+                "# HELP tri_sync_peer_consecutive_send_failures Consecutive failed sends to a peer since its last successful send.\n\
+                 # TYPE tri_sync_peer_consecutive_send_failures gauge\n",
+            );
+            for &id in &ids {
+                out.push_str(&format!("tri_sync_peer_consecutive_send_failures{{peer=\"{id}\"}} {}\n", self.peer_health[id].consecutive_send_failures()));
+            }
+            out.push_str(
+                "# HELP tri_sync_peer_seconds_since_last_seen Seconds since the last authenticated message received from a peer. Absent if none has ever arrived.\n\
+                 # TYPE tri_sync_peer_seconds_since_last_seen gauge\n",
+            );
+            for &id in &ids {
+                if let Some(secs) = self.peer_health[id].seconds_since_last_seen() {
+                    out.push_str(&format!("tri_sync_peer_seconds_since_last_seen{{peer=\"{id}\"}} {secs}\n"));
+                }
+            }
+        }
+
+        out
     }
 }
 
@@ -126,6 +190,38 @@ mod tests {
         assert_eq!(metrics.mean_trust_weight(), 0.0);
         metrics.set_mean_trust_weight(-3.25);
         assert_eq!(metrics.mean_trust_weight(), -3.25);
+    }
+
+    #[test]
+    fn a_metrics_with_no_configured_peers_renders_no_peer_health_lines() {
+        let metrics = Metrics::default();
+        let text = metrics.render();
+        assert!(!text.contains("tri_sync_peer_healthy"), "no peers configured, nothing to report");
+    }
+
+    #[test]
+    fn render_includes_per_peer_health_for_every_configured_peer() {
+        let metrics = Metrics::new(&[1, 2]);
+        metrics.record_send_result(1, true);
+        for _ in 0..3 {
+            metrics.record_send_result(2, false);
+        }
+        metrics.record_peer_seen(1);
+
+        let text = metrics.render();
+        assert!(text.contains("tri_sync_peer_healthy{peer=\"1\"} 1"), "peer 1 just had a successful send: {text}");
+        assert!(text.contains("tri_sync_peer_healthy{peer=\"2\"} 0"), "peer 2 hit the failure threshold: {text}");
+        assert!(text.contains("tri_sync_peer_consecutive_send_failures{peer=\"2\"} 3"));
+        assert!(text.contains("tri_sync_peer_seconds_since_last_seen{peer=\"1\"}"), "peer 1 was marked seen: {text}");
+        assert!(!text.contains("tri_sync_peer_seconds_since_last_seen{peer=\"2\"}"), "peer 2 was never seen, only sent to: {text}");
+    }
+
+    #[test]
+    fn record_send_result_and_record_peer_seen_are_no_ops_for_an_unconfigured_peer() {
+        let metrics = Metrics::new(&[1]);
+        metrics.record_send_result(99, false); // must not panic
+        metrics.record_peer_seen(99);
+        assert!(metrics.peer_health(99).is_none());
     }
 
     #[test]

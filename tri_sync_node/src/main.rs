@@ -146,7 +146,8 @@ async fn main() -> ExitCode {
     println!("tri_sync_node: listening on {listen_addr}");
     let _ = std::io::stdout().flush();
 
-    let node_metrics = std::sync::Arc::new(metrics::Metrics::default());
+    let peer_ids: Vec<usize> = config.peers.iter().map(|p| p.id).collect();
+    let node_metrics = std::sync::Arc::new(metrics::Metrics::new(&peer_ids));
     if let Some(metrics_addr_str) = &config.metrics_addr {
         let metrics_addr: std::net::SocketAddr = metrics_addr_str.parse().expect("validated at config load");
         match metrics::serve(metrics_addr, node_metrics.clone()) {

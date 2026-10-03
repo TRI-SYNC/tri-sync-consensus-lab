@@ -44,8 +44,13 @@
 //!   violation, not silently auto-reorged onto unverified evidence.
 //!   Closing the remaining window needs real locking/quorum
 //!   certificates, which is out of scope for this pass.
+//! - Per-peer health (`crate::health`) is tracked and exposed via
+//!   `/metrics`, but purely observationally: it never changes who
+//!   gets proposed to, voted for, or sent messages. Deliberately not
+//!   wired into behavior - see that module's doc comment for why.
 
 use crate::config::NodeConfig;
+use crate::health;
 use crate::metrics::Metrics;
 use crate::net;
 use crate::persistence::{Store, TrustEntry};
@@ -198,7 +203,14 @@ fn maybe_bump_view(rs: &mut RoundState, height: u64, timeout: Duration) -> bool 
 fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> bool {
     let Some(peer) = ctx.peers.get(&sender) else { return false };
     let Some(sig) = decode_signature(sig_hex) else { return false };
-    crypto::verify_canon(&peer.pubkey, canon, &sig)
+    let ok = crypto::verify_canon(&peer.pubkey, canon, &sig);
+    if ok {
+        // Health only ever records a genuinely authenticated message -
+        // see crate::health's doc comment on why an unverified claim
+        // must never be able to inflate a peer's apparent health.
+        ctx.metrics.record_peer_seen(sender);
+    }
+    ok
 }
 
 /// Fires a send to every peer as its own task and returns immediately,
@@ -211,13 +223,35 @@ fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> boo
 /// third peer on every tick, drifting their view-timeout clocks apart
 /// faster than messages could ever catch up.
 fn broadcast(ctx: &Ctx, msg: &Message) {
-    for peer in ctx.peers.values() {
+    for (&id, peer) in ctx.peers.iter() {
         let endpoint = ctx.endpoint.clone();
         let addr = peer.addr;
         let msg = msg.clone();
+        let metrics = ctx.metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = net::send_message(&endpoint, addr, &msg).await {
-                eprintln!("tri_sync_node: send to {addr} failed: {e}");
+            let ok = match net::send_message(&endpoint, addr, &msg).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("tri_sync_node: send to {addr} failed: {e}");
+                    false
+                }
+            };
+            // The transition comes from PeerHealth's own atomic
+            // bookkeeping, not a before/after comparison here - this
+            // task is one of several concurrent sends to the same
+            // peer in a tick, and a local comparison raced its
+            // siblings (caught live; see crate::health's doc comment).
+            match metrics.record_send_result(id, ok) {
+                Some(health::HealthTransition::BecameUnhealthy) => {
+                    eprintln!(
+                        "tri_sync_node: peer {id} ({addr}) marked unhealthy after {} consecutive failed sends",
+                        health::UNHEALTHY_AFTER_CONSECUTIVE_FAILURES
+                    );
+                }
+                Some(health::HealthTransition::Recovered) => {
+                    log(format!("peer {id} ({addr}) recovered - a send succeeded after prior failures"));
+                }
+                Some(health::HealthTransition::NoChange) | None => {}
             }
         });
     }
@@ -426,6 +460,7 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         eprintln!("tri_sync_node: proposal hash mismatch from {}", p.sender);
         return;
     }
+    ctx.metrics.record_peer_seen(p.sender);
 
     if p.block.height <= head.height {
         // A proposal for a height this node has already committed, now
@@ -570,6 +605,8 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
         eprintln!("tri_sync_node: invalid vote signature from {}", v.sender);
         return;
     }
+    ctx.metrics.record_peer_seen(v.sender); // no-op if v.sender is this node's own id
+
     if v.view > current_view(rs, block.height) {
         rs.view_for_height.insert(block.height, v.view);
         rs.waiting_for = Some((block.height, v.view));
@@ -814,7 +851,7 @@ mod tests {
         };
         let peers = HashMap::from([(1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key() })]);
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers, all_ids: vec![0, 1], endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx { config, peers, all_ids: vec![0, 1], endpoint, metrics: Arc::new(Metrics::new(&[1])) };
         (ctx, self_sk, peer_sk)
     }
 
@@ -823,7 +860,18 @@ mod tests {
         let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
         let canon = protocol::observation_canon(1, &[1.0, 2.0]);
         let sig = crypto::sign_canon(&peer_sk, &canon);
+        assert_eq!(ctx.metrics.peer_health(1).unwrap().seconds_since_last_seen(), None, "not seen yet");
         assert!(verify_from_peer(&ctx, 1, &canon, &hex::encode(sig.to_bytes())));
+        assert!(ctx.metrics.peer_health(1).unwrap().seconds_since_last_seen().is_some(), "a genuine signature should mark the peer seen (Hardening 6)");
+    }
+
+    #[tokio::test]
+    async fn verify_from_peer_does_not_mark_an_unauthenticated_sender_seen() {
+        let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer();
+        let canon = protocol::observation_canon(1, &[1.0, 2.0]);
+        let forged_sig = crypto::sign_canon(&self_sk, &canon); // wrong key
+        assert!(!verify_from_peer(&ctx, 1, &canon, &hex::encode(forged_sig.to_bytes())));
+        assert_eq!(ctx.metrics.peer_health(1).unwrap().seconds_since_last_seen(), None, "a forged signature must never count as having seen the real peer 1");
     }
 
     #[tokio::test]
@@ -851,6 +899,32 @@ mod tests {
         let sig = crypto::sign_canon(&peer_sk, &real_canon);
         let tampered_canon = protocol::observation_canon(1, &[1.0, 999.0]);
         assert!(!verify_from_peer(&ctx, 1, &tampered_canon, &hex::encode(sig.to_bytes())));
+    }
+
+    /// `broadcast()` fires sends as detached spawned tasks (Hardening
+    /// 4's fix for the sequential-await bug) - this confirms the
+    /// health bookkeeping added in Hardening 6 actually reaches
+    /// `ctx.metrics` from inside that spawned task, against a real
+    /// unreachable address (nothing listens on 127.0.0.1:1), not just
+    /// that `PeerHealth`'s own counters work in isolation.
+    #[tokio::test]
+    async fn broadcast_records_a_real_send_failure_against_the_right_peer() {
+        let (ctx, _self_sk, _peer_sk) = test_ctx_with_one_peer(); // peer 1 at 127.0.0.1:1
+        assert_eq!(ctx.metrics.peer_health(1).unwrap().total_sends(), 0);
+
+        broadcast(&ctx, &Message::Observation(ObservationMsg { sender: 0, values: vec![1.0], sig_hex: "aa".to_string() }));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if ctx.metrics.peer_health(1).unwrap().total_sends() > 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "broadcast's spawned send never completed within the connect timeout");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(ctx.metrics.peer_health(1).unwrap().total_send_failures(), 1);
+        assert_eq!(ctx.metrics.peer_health(1).unwrap().consecutive_send_failures(), 1);
     }
 
     #[tokio::test]
