@@ -25,15 +25,25 @@
 //! - Peer public keys are static, from `node.toml` - there's no
 //!   in-band key discovery or epoch-based re-keying across the
 //!   network yet.
-//! - No liveness fallback: if the expected proposer for a height never
-//!   proposes (offline, slow, malicious), the chain just stalls at
-//!   that height - there's no timeout or backup proposer. Every
-//!   proposal/vote already carries a `view` number
-//!   (`protocol::view_block_canon`), which is what a future view-change
-//!   mechanism needs to safely hand off to a different proposer
-//!   without an old view's messages being replayable into the new
-//!   one - but nothing here bumps that number yet, so today every
-//!   height only ever has one view.
+//! - Liveness fallback exists (`maybe_bump_view` hands off to the next
+//!   proposer after a timeout, with catch-up so a lagging node adopts
+//!   a legitimate later view instead of rejecting it), but it isn't a
+//!   complete BFT view-change protocol: a node only *locks* its vote
+//!   implicitly, by however far `expected_proposer`/signature checks
+//!   let it advance, not via a quorum-certificate/"precommit" proof
+//!   that an earlier view genuinely failed. In an adversarial or
+//!   badly-partitioned network this leaves a real (if narrow) window
+//!   where votes could split across two views' candidates for the same
+//!   height. What *is* covered: a single node can never commit two
+//!   blocks at the same height (`handle_proposal`'s parent-hash check
+//!   is re-evaluated against the live head on every call, so a second
+//!   candidate for an already-committed height is rejected outright,
+//!   confirmed by a dedicated test); a proposal for an already-committed
+//!   height that `tri_sync_core::chain::prefer` ranks above what was
+//!   actually committed is detected and logged loudly as a safety
+//!   violation, not silently auto-reorged onto unverified evidence.
+//!   Closing the remaining window needs real locking/quorum
+//!   certificates, which is out of scope for this pass.
 
 use crate::config::NodeConfig;
 use crate::metrics::Metrics;
@@ -386,8 +396,86 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
 
 async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, p: BlockProposalMsg) {
     let head = node.head().clone();
+
+    // Authenticate before trusting *any* of this message's content -
+    // including the already-committed-height branch below, which used
+    // to run `chain::prefer` and log a "SAFETY VIOLATION" alarm off an
+    // unverified claim. That was a real bug: a forged message (no
+    // relation to any actual peer key) could trigger a false alarm
+    // purely as noise/confusion, since that branch returned before
+    // ever reaching the signature check that only existed later in
+    // this function for the normal height+1 path. Checking this first,
+    // for every height, closes that - at the cost of spending a
+    // signature verification on messages that stale-view/wrong-sender
+    // checks would otherwise have rejected more cheaply; correctness
+    // over that micro-optimization.
+    let Some(peer) = ctx.peers.get(&p.sender) else {
+        eprintln!("tri_sync_node: ignoring proposal from unknown sender {}", p.sender);
+        return;
+    };
+    let Some(their_sig_entry) = p.block.signatures.first() else { return };
+    let Some(sig) = decode_signature(&their_sig_entry.sig_hex) else { return };
+    let identity_canon = protocol::block_canon(&p.block);
+    let signing_canon = protocol::view_block_canon(p.view, &p.block);
+    if !crypto::verify_canon(&peer.pubkey, &signing_canon, &sig) {
+        eprintln!("tri_sync_node: invalid proposer signature from {}", p.sender);
+        return;
+    }
+    let block_hash = chain::block_hash(&identity_canon);
+    if block_hash != p.block.hash {
+        eprintln!("tri_sync_node: proposal hash mismatch from {}", p.sender);
+        return;
+    }
+
+    if p.block.height <= head.height {
+        // A proposal for a height this node has already committed, now
+        // known to be genuinely signed by `p.sender` over exactly this
+        // content. Compare it against what's actually in the chain
+        // using tri_sync_core::chain::prefer - the same fork-choice
+        // rule the original single-process simulation uses - but only
+        // to *detect and loudly surface* a possible safety violation,
+        // not to act on it: this node has no way to verify from one
+        // message alone that the alternative is genuinely more
+        // supported network-wide (versus a stale, reordered, or
+        // honestly-but-independently-proposed message), so silently
+        // rewriting already-persisted, already-committed history here
+        // would be a real reorg performed on insufficient evidence.
+        // That's a materially different (and riskier) situation than
+        // the pre-commit candidate races handled below, where nothing
+        // has been committed yet and just letting quorum decide is
+        // safe.
+        //
+        // One honest limitation even with the signature verified:
+        // `block_canon` (what's actually signed) deliberately excludes
+        // `sig_weight` - it's filled in independently by each node from
+        // its own accumulated vote count (see `maybe_commit`), not
+        // claimed by the proposer - so a genuine peer could still send
+        // a validly-signed block carrying a `sig_weight` field that
+        // doesn't match reality. `prefer()` uses that field, so this
+        // check can be fooled into comparing against an inflated number
+        // by any authenticated-but-dishonest peer, not only forged
+        // messages. That's a real gap; closing it needs sig_weight (or
+        // the quorum it represents) to be independently reconstructible
+        // from the votes carried on the block, which is out of scope
+        // for this pass - logged loudly rather than acted on either
+        // way, so the blast radius of being fooled here is a noisy log
+        // line, never a silent reorg.
+        if let Some(committed) = node.chain.get(p.block.height as usize).filter(|b| b.height == p.block.height) {
+            if committed.hash != p.block.hash && chain::prefer(committed, &p.block) {
+                ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "tri_sync_node: SAFETY VIOLATION - received a signed proposal from {} for already-committed height {} \
+                     that tri_sync_core::chain::prefer ranks above what this node committed \
+                     (their hash={} sig_weight={} vs our hash={} sig_weight={}) - NOT auto-reorging; \
+                     this needs operator attention, two conflicting blocks may have been committed network-wide.",
+                    p.sender, p.block.height, p.block.hash, p.block.sig_weight, committed.hash, committed.sig_weight
+                );
+            }
+        }
+        return;
+    }
     if p.block.parent != head.hash || p.block.height != head.height + 1 {
-        return; // stale, forked, or premature proposal - not handled in this stage
+        return; // premature - this node is behind and has no chain-sync capability yet
     }
     // Reject only a *stale* view outright (replay of an abandoned
     // view - Hardening 3). A view *ahead* of what this node has
@@ -395,9 +483,9 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     // per-node timeout clocks drift, and a node that's simply running
     // a tick behind must not be permanently stuck disagreeing with
     // the rest of the network. Whether to actually adopt it still
-    // depends on the sender being the real expected proposer and the
-    // signature checking out below - an unverified claim of a high
-    // view number proves nothing on its own.
+    // depends on the sender being the real expected proposer - checked
+    // next - and the signature above having already checked out; an
+    // unverified claim of a high view number proves nothing on its own.
     if p.view < current_view(rs, p.block.height) {
         eprintln!(
             "tri_sync_node: ignoring proposal from {} for stale view {} - this node is already past it for height {}",
@@ -408,21 +496,6 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     let expected = expected_proposer(&ctx.all_ids, p.block.height, p.view);
     if p.sender != expected {
         eprintln!("tri_sync_node: ignoring proposal from {} - expected proposer for view {} is {}", p.sender, p.view, expected);
-        return;
-    }
-    let Some(peer) = ctx.peers.get(&p.sender) else { return };
-    let Some(their_sig_entry) = p.block.signatures.first() else { return };
-    let Some(sig) = decode_signature(&their_sig_entry.sig_hex) else { return };
-
-    let identity_canon = protocol::block_canon(&p.block);
-    let signing_canon = protocol::view_block_canon(p.view, &p.block);
-    if !crypto::verify_canon(&peer.pubkey, &signing_canon, &sig) {
-        eprintln!("tri_sync_node: invalid proposer signature from {}", p.sender);
-        return;
-    }
-    let block_hash = chain::block_hash(&identity_canon);
-    if block_hash != p.block.hash {
-        eprintln!("tri_sync_node: proposal hash mismatch from {}", p.sender);
         return;
     }
 
@@ -950,6 +1023,237 @@ mod tests {
         let committed = node.chain.last().expect("chain should have advanced");
         assert_eq!(committed.hash, block.hash, "the block from the higher view should be the one that committed");
         assert_eq!(committed.sig_weight, 2.0, "proposer's signature plus this node's vote");
+    }
+
+    /// Builds a `BlockProposalMsg` genuinely signed by `signer_sk` as
+    /// `sender`, for the given height/parent/view, with `sig_weight`
+    /// set afterward to whatever the test wants to claim (never covered
+    /// by the signature - see the long comment in `handle_proposal`).
+    fn signed_proposal(sender: usize, signer_sk: &ed25519_dalek::SigningKey, height: u64, parent: &str, view: u64, sig_weight: f64) -> BlockProposalMsg {
+        let mut block = Block {
+            height,
+            parent: parent.to_string(),
+            state: vec![height as f64, height as f64],
+            confidence: 0.9,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 0.0,
+            hash: String::new(),
+        };
+        let identity_canon = protocol::block_canon(&block);
+        block.hash = chain::block_hash(&identity_canon);
+        let signing_canon = protocol::view_block_canon(view, &block);
+        let sig = crypto::sign_canon(signer_sk, &signing_canon);
+        block.signatures = vec![SigEntry {
+            node_id: sender,
+            pubkey_hex: hex::encode(signer_sk.verifying_key().to_bytes()),
+            sig_hex: hex::encode(sig.to_bytes()),
+        }];
+        block.sig_weight = sig_weight;
+        BlockProposalMsg { sender, view, block }
+    }
+
+    /// The bug this stage's own code review caught before any test
+    /// did: the already-committed-height branch used to run
+    /// `chain::prefer` and log a "SAFETY VIOLATION" off whatever a
+    /// message claimed, before any signature was checked for that
+    /// code path. A forged message - unrelated to any real peer key,
+    /// garbage `sig_hex`, an inflated `sig_weight` - must now be
+    /// rejected for being unauthenticated, never reach `prefer()`, and
+    /// never increment `forks_total`.
+    #[tokio::test]
+    async fn a_forged_proposal_for_an_already_committed_height_never_triggers_a_safety_violation() {
+        let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("forged_already_committed");
+        let store = Store::open(dir.path()).unwrap();
+
+        let committed = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![0.0, 0.0],
+            confidence: 0.5,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 1.0,
+            hash: "real-head-1".to_string(),
+        };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), committed.clone()],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // Claims to be from peer 1, massively outweighs the real
+        // commit, but carries a completely made-up signature - not
+        // produced by peer 1's or anyone's real key.
+        let mut forged = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![999.0, 999.0],
+            confidence: 0.99,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![SigEntry { node_id: 1, pubkey_hex: "ab".repeat(32), sig_hex: "cd".repeat(64) }],
+            sig_weight: 1000.0,
+            hash: String::new(),
+        };
+        let identity_canon = protocol::block_canon(&forged);
+        forged.hash = chain::block_hash(&identity_canon);
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: 0, block: forged }).await;
+
+        assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 0, "an unauthenticated message must never count as an observed fork");
+        assert_eq!(node.chain.last().unwrap().hash, "real-head-1", "committed history must never be touched by an unverified message");
+    }
+
+    /// The flip side: a *genuinely* signed proposal from a real,
+    /// configured peer, for an already-committed height, that
+    /// `chain::prefer` ranks above what this node committed, must be
+    /// detected and counted (so an operator watching `forks_total` can
+    /// notice) - but still never auto-reorged. This is a real, if
+    /// disclosed-as-narrow, use of `tri_sync_core::chain::prefer` in
+    /// the live node loop.
+    #[tokio::test]
+    async fn a_genuinely_signed_conflicting_proposal_for_an_already_committed_height_is_detected_but_not_reorged() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("genuine_conflict_already_committed");
+        let store = Store::open(dir.path()).unwrap();
+
+        let committed = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![0.0, 0.0],
+            confidence: 0.5,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 1.0,
+            hash: "real-head-1".to_string(),
+        };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), committed.clone()],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // Genuinely signed by peer 1's real configured key, for the
+        // same height, with a higher sig_weight than what actually
+        // committed - `prefer()` ranks it above `committed`.
+        let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 5.0);
+        assert_ne!(proposal.block.hash, committed.hash, "must be a genuinely different block, not the same one re-sent");
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
+
+        assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 1, "a genuinely-authenticated conflicting commit must be counted");
+        assert_eq!(node.chain.last().unwrap().hash, "real-head-1", "detecting the conflict must never silently rewrite already-committed history");
+    }
+
+    /// A genuinely signed proposal for an already-committed height
+    /// that `prefer()` does NOT rank above what's already committed
+    /// (lower sig_weight) must be silently ignored - not every
+    /// authenticated re-proposal of an old height is a fork worth
+    /// alarming about.
+    #[tokio::test]
+    async fn a_genuine_but_weaker_proposal_for_an_already_committed_height_is_silently_ignored() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("genuine_weaker_already_committed");
+        let store = Store::open(dir.path()).unwrap();
+
+        let committed = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![0.0, 0.0],
+            confidence: 0.5,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 5.0,
+            hash: "real-head-1".to_string(),
+        };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), committed.clone()],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
+
+        assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 0, "a weaker competing block is not a safety violation worth counting");
+        assert_eq!(node.chain.last().unwrap().hash, "real-head-1");
+    }
+
+    /// The structural claim documented in this module's doc comment:
+    /// a single node can never locally commit two different blocks at
+    /// the same height, because `maybe_commit`'s parent-hash check is
+    /// re-evaluated against the live head on every call. Proven here
+    /// by driving two competing, independently-proposed candidates for
+    /// the same height through the real `handle_proposal`/`maybe_commit`
+    /// path with a 1-of-1 quorum (`all_ids = [0]`), rather than just
+    /// asserted from reading the code.
+    #[tokio::test]
+    async fn a_single_node_can_never_locally_double_commit_at_the_same_height() {
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: vec![],
+        };
+        let endpoint = net::make_client_endpoint().unwrap();
+        let ctx = Ctx { config, peers: HashMap::new(), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let dir = crate::test_support::TempDir::new("no_local_double_commit");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        rs.latest_observations.insert(0, vec![1.0, 1.0]);
+
+        let head = node.head().clone();
+        propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
+        assert_eq!(node.chain.len(), 2, "1-of-1 quorum should commit immediately");
+        let first_hash = node.chain.last().unwrap().hash.clone();
+
+        // A second, independently-proposed candidate for the exact
+        // same (now-committed) height, with different content so it
+        // hashes differently. If `maybe_commit` ever re-committed on
+        // top of the already-advanced head, this would silently
+        // double the chain length or overwrite history.
+        rs.latest_observations.insert(0, vec![2.0, 2.0]);
+        let still_head_at_height_0 = Block::genesis(2); // the pre-commit head, reused as the stale parent
+        propose_block(&ctx, &mut node, &store, &mut rs, &still_head_at_height_0, 0).await;
+
+        assert_eq!(node.chain.len(), 2, "a second candidate for an already-committed height must never be committed on top");
+        assert_eq!(node.chain.last().unwrap().hash, first_hash, "the real committed block must be untouched");
     }
 
     /// The real end-to-end claim this stage exists to prove: two

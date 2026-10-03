@@ -2,15 +2,23 @@
 //! that reconciled a fork, and mean trust weight toward this node's
 //! peers.
 //!
-//! **Honest note on `forks`/`reconciles`.** This stage's consensus
-//! round (see [`crate::consensus`]) assigns exactly one deterministic
-//! proposer per height and commits by quorum, so competing candidates
-//! at the same height are rare - they're still detected and counted
-//! (see `consensus::handle_proposal`), but nothing in this stage
-//! actually exercises `tri_sync_core::chain::prefer`-based fork
-//! resolution, so in ordinary operation both of these read zero. The
-//! counters are real and wired up, not decorative, but they mostly
-//! prove there wasn't a fork rather than showing off reconciliation.
+//! **Honest note on `forks`/`reconciles`.** `forks_total` counts two
+//! real, distinct things (see `consensus::handle_proposal`): a
+//! competing pre-commit candidate at a not-yet-decided height (common
+//! during view-change hand-offs, always harmless - whichever reaches
+//! quorum first wins, the other is just dropped), and the far more
+//! serious case of a proposal for an *already-committed* height that
+//! `tri_sync_core::chain::prefer` ranks above what this node actually
+//! committed - a potential safety violation, logged loudly rather than
+//! auto-reorged, since one message isn't enough evidence to safely
+//! rewrite committed history. `reconciles_total` stays structurally at
+//! zero in this design: a block's identity and signatures are fixed at
+//! proposal time, before any fork is knowable, so there's no safe way
+//! to retroactively record which siblings a commit superseded without
+//! invalidating the very signatures that make the block trustworthy -
+//! doing that for real would need a different flow (an explicit
+//! re-proposal step, re-signed by a fresh quorum), which is out of
+//! scope here.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
