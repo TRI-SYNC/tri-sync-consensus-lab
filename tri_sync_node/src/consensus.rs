@@ -24,17 +24,42 @@
 //!   epoch is `tri_sync_core::chain::epoch_for_height(height)`, a pure
 //!   function every node computes identically with no coordination,
 //!   and `maybe_commit` updates/persists/logs `node.epoch` whenever a
-//!   committed block crosses into a new one. What it deliberately does
-//!   NOT do yet is re-key: the signing keypair stays the one from
-//!   `node.toml`/persisted identity across every epoch. Rotating keys
-//!   for real would mean a peer's configured pubkey goes stale the
-//!   moment that peer rotates, with no way for this node to learn the
-//!   new one - that needs the automated key-distribution mechanism
-//!   that's its own, later hardening pass, not something to bolt on
-//!   here incompletely.
-//! - Peer public keys are static, from `node.toml` - there's no
-//!   in-band key discovery yet (see the epoch point above for why
-//!   that's a prerequisite for real re-keying, not an independent gap).
+//!   committed block crosses into a new one. It still deliberately
+//!   does NOT tie the *signing key* to chain epoch - rotating that is
+//!   a separate, on-demand action (see the next point), not something
+//!   that happens automatically at an epoch boundary.
+//! - Peer public keys start from `node.toml`, but aren't static
+//!   anymore (Hardening 8): `--rotate-key` lets an operator generate a
+//!   new identity for this node and announce it to every configured
+//!   peer, signed by the *old* key to prove continuity;
+//!   `handle_key_rotation` is the receiving side, which verifies that
+//!   proof, updates its live `ctx.peers` entry, and persists it so a
+//!   restart doesn't need to relearn it. A strictly-increasing
+//!   `rotation_seq` per sender stops a captured announcement from
+//!   being replayed later to roll a peer's trusted key back to a
+//!   since-superseded one. Disclosed as narrow, not full membership
+//!   management: this only ever updates the key of an *existing*,
+//!   already-configured peer id - it doesn't add, remove, or discover
+//!   peers, doesn't retry a rotation a peer missed while offline, and
+//!   doesn't touch `all_ids`/quorum/`network_size`, all of which stay
+//!   exactly as `node.toml` originally described. Real dynamic
+//!   membership change is a much harder, separate problem (safely
+//!   changing who counts toward quorum needs its own agreement
+//!   protocol) and staying out of that is deliberate, not an oversight.
+//!   A real bug surfaced by an actual two-process rotation test (not a
+//!   unit test - the in-process ones all passed first try): rotating
+//!   while the rotating node's own old process was still running let
+//!   it keep signing with the old key for a few more seconds, which
+//!   peers now correctly rejected (including that node's own vote on
+//!   a block a peer was mid-committing) - and since catching up on an
+//!   already-committed height a node is *behind* on isn't something
+//!   this node loop can do (only being behind on *view* has a
+//!   catch-up path, in `handle_proposal`/`handle_vote` below), that
+//!   peer got stuck on that height permanently. Not fixed by adding
+//!   chain-sync here (out of scope for this pass); fixed by requiring
+//!   the operator to stop the old process before rotating, which a
+//!   live rerun of the same two-process scenario confirmed resolves
+//!   it completely - see `main`'s `--rotate-key` doc comment.
 //! - Liveness fallback exists (`maybe_bump_view` hands off to the next
 //!   proposer after a timeout, with catch-up so a lagging node adopts
 //!   a legitimate later view instead of rejecting it), but it isn't a
@@ -63,8 +88,8 @@ use crate::config::NodeConfig;
 use crate::health;
 use crate::metrics::Metrics;
 use crate::net;
-use crate::persistence::{Store, TrustEntry};
-use crate::protocol::{self, BlockProposalMsg, BlockVoteMsg, Message, ObservationMsg, TrustUpdateMsg};
+use crate::persistence::{PeerKeyRecord, Store, TrustEntry};
+use crate::protocol::{self, BlockProposalMsg, BlockVoteMsg, KeyRotationMsg, Message, ObservationMsg, TrustUpdateMsg};
 use crate::state::NodeState;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::SeedableRng;
@@ -87,14 +112,25 @@ const EDGE_ALPHA: f64 = 1.0;
 const EDGE_FLOOR: f64 = 0.02;
 const EDGE_CEIL: f64 = 3.0;
 
+/// `rotation_seq` is 0 for a peer still on its `node.toml`-configured
+/// key; a successful `handle_key_rotation` bumps it and replaces
+/// `pubkey` in place - see `crate::protocol`'s doc comment on
+/// `KeyRotationMsg` for why that's safe against replay.
+#[derive(Debug, Clone, Copy)]
 struct PeerInfo {
     addr: SocketAddr,
     pubkey: VerifyingKey,
+    rotation_seq: u64,
 }
 
 struct Ctx {
     config: NodeConfig,
-    peers: HashMap<usize, PeerInfo>,
+    /// Mutable at runtime (Hardening 8's key rotation), unlike every
+    /// other `Ctx` field - a `std::sync::RwLock`, not `tokio::sync`,
+    /// since every access here is a quick read-or-write with no `.await`
+    /// held across the lock (see `broadcast`'s snapshot-then-drop
+    /// pattern for why that matters to keep true).
+    peers: std::sync::RwLock<HashMap<usize, PeerInfo>>,
     all_ids: Vec<usize>,
     endpoint: quinn::Endpoint,
     metrics: Arc<Metrics>,
@@ -211,7 +247,7 @@ fn maybe_bump_view(rs: &mut RoundState, height: u64, timeout: Duration) -> bool 
 /// unknown sender, malformed signature, or bad match. The shared check
 /// behind authenticating observation, state, and trust-update gossip.
 fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> bool {
-    let Some(peer) = ctx.peers.get(&sender) else { return false };
+    let Some(peer) = ctx.peers.read().unwrap().get(&sender).copied() else { return false };
     let Some(sig) = decode_signature(sig_hex) else { return false };
     let ok = crypto::verify_canon(&peer.pubkey, canon, &sig);
     if ok {
@@ -233,7 +269,12 @@ fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> boo
 /// third peer on every tick, drifting their view-timeout clocks apart
 /// faster than messages could ever catch up.
 fn broadcast(ctx: &Ctx, msg: &Message) {
-    for (&id, peer) in ctx.peers.iter() {
+    // Snapshot and drop the lock immediately rather than hold a read
+    // guard across the loop (let alone into a spawned task): a
+    // key-rotation write must never be blocked behind, or forced to
+    // wait on, however long a round of sends takes.
+    let snapshot: Vec<(usize, PeerInfo)> = ctx.peers.read().unwrap().iter().map(|(&id, &info)| (id, info)).collect();
+    for (id, peer) in snapshot {
         let endpoint = ctx.endpoint.clone();
         let addr = peer.addr;
         let msg = msg.clone();
@@ -288,13 +329,29 @@ pub async fn run(
     // or pubkey_hex - expect(), not filter_map's silent drop, so a
     // config that somehow reaches here malformed fails loudly instead
     // of quietly shrinking the network.
+    // A persisted PeerKeyRecord (a rotation this node already accepted
+    // in some earlier run) always wins over node.toml's original entry
+    // - that's the whole point of persisting it in handle_key_rotation:
+    // an operator never has to manually edit every peer's config file
+    // again after the first time a rotation is learned.
     let peers: HashMap<usize, PeerInfo> = config
         .peers
         .iter()
         .map(|p| {
             let addr = p.addr.parse().expect("validated at config load");
+            match store.get_peer_key(p.id) {
+                Ok(Some(record)) => match decode_verifying_key(&record.pubkey_hex) {
+                    Some(pubkey) => {
+                        log(format!("peer {} loaded with its rotated key (rotation_seq={})", p.id, record.rotation_seq));
+                        return (p.id, PeerInfo { addr, pubkey, rotation_seq: record.rotation_seq });
+                    }
+                    None => eprintln!("tri_sync_node: persisted key for peer {} is corrupt, falling back to node.toml", p.id),
+                },
+                Ok(None) => {}
+                Err(e) => eprintln!("tri_sync_node: failed to read persisted key for peer {}: {e} - falling back to node.toml", p.id),
+            }
             let pubkey = decode_verifying_key(&p.pubkey_hex).expect("validated at config load");
-            (p.id, PeerInfo { addr, pubkey })
+            (p.id, PeerInfo { addr, pubkey, rotation_seq: 0 })
         })
         .collect();
     let mut all_ids: Vec<usize> = peers.keys().cloned().chain(std::iter::once(node.node_id)).collect();
@@ -304,7 +361,7 @@ pub async fn run(
     reconcile_epoch_with_chain(&mut node, &store);
     metrics.epoch.store(node.epoch, Ordering::Relaxed);
 
-    let ctx = Ctx { config, peers, all_ids, endpoint, metrics };
+    let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids, endpoint, metrics };
     let mut rs = RoundState::default();
     let mut rng = rand::rngs::StdRng::from_entropy();
 
@@ -444,7 +501,54 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
                 eprintln!("tri_sync_node: rejected state broadcast from {} - unknown sender or invalid signature", s.sender);
             }
         }
+        Message::KeyRotation(k) => handle_key_rotation(ctx, store, k).await,
     }
+}
+
+/// Accepts a peer's self-announced key rotation if (a) the sender is
+/// already a known peer, (b) `rotation_seq` is strictly ahead of the
+/// last one accepted from them (replay/rollback protection - see
+/// `crate::protocol::KeyRotationMsg`'s doc comment), and (c) the
+/// signature verifies against the sender's *currently* trusted key,
+/// proving continuity from the old identity to the new one. On
+/// success, updates the live `ctx.peers` entry immediately and
+/// persists it so a future restart doesn't need to relearn it.
+async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
+    let KeyRotationMsg { sender, new_pubkey_hex, rotation_seq, sig_hex } = msg;
+
+    let Some(current) = ctx.peers.read().unwrap().get(&sender).copied() else {
+        eprintln!("tri_sync_node: ignoring key rotation from unknown peer {sender}");
+        return;
+    };
+    if rotation_seq <= current.rotation_seq {
+        eprintln!(
+            "tri_sync_node: ignoring stale or replayed key rotation from {sender} (seq {rotation_seq} <= already-accepted {})",
+            current.rotation_seq
+        );
+        return;
+    }
+    let Some(sig) = decode_signature(&sig_hex) else { return };
+    let canon = protocol::key_rotation_canon(sender, &new_pubkey_hex, rotation_seq);
+    if !crypto::verify_canon(&current.pubkey, &canon, &sig) {
+        eprintln!("tri_sync_node: invalid key-rotation signature from {sender} - rejecting, keeping the current key");
+        return;
+    }
+    let Some(new_pubkey) = decode_verifying_key(&new_pubkey_hex) else {
+        eprintln!("tri_sync_node: key rotation from {sender} carries an unparseable new pubkey - rejecting");
+        return;
+    };
+
+    {
+        let mut peers = ctx.peers.write().unwrap();
+        if let Some(info) = peers.get_mut(&sender) {
+            info.pubkey = new_pubkey;
+            info.rotation_seq = rotation_seq;
+        }
+    }
+    if let Err(e) = store.put_peer_key(sender, &PeerKeyRecord { pubkey_hex: new_pubkey_hex, rotation_seq }) {
+        eprintln!("tri_sync_node: accepted key rotation from {sender} in memory but failed to persist it: {e}");
+    }
+    log(format!("accepted key rotation from peer {sender}: now trusting its new key (rotation_seq={rotation_seq})"));
 }
 
 async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, p: BlockProposalMsg) {
@@ -462,7 +566,7 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     // signature verification on messages that stale-view/wrong-sender
     // checks would otherwise have rejected more cheaply; correctness
     // over that micro-optimization.
-    let Some(peer) = ctx.peers.get(&p.sender) else {
+    let Some(peer) = ctx.peers.read().unwrap().get(&p.sender).copied() else {
         eprintln!("tri_sync_node: ignoring proposal from unknown sender {}", p.sender);
         return;
     };
@@ -595,7 +699,8 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
 }
 
 async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, v: BlockVoteMsg) {
-    let known_pubkey = if v.sender == node.node_id { Some(node.verifying_key) } else { ctx.peers.get(&v.sender).map(|p| p.pubkey) };
+    let known_pubkey =
+        if v.sender == node.node_id { Some(node.verifying_key) } else { ctx.peers.read().unwrap().get(&v.sender).map(|p| p.pubkey) };
     let Some(known_pubkey) = known_pubkey else { return };
     let Some(claimed_pubkey) = decode_verifying_key(&v.pubkey_hex) else { return };
     if claimed_pubkey != known_pubkey {
@@ -905,9 +1010,9 @@ mod tests {
             metrics_addr: None,
             peers: vec![PeerConfig { id: 1, addr: "127.0.0.1:1".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) }],
         };
-        let peers = HashMap::from([(1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key() })]);
+        let peers = HashMap::from([(1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key(), rotation_seq: 0 })]);
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers, all_ids: vec![0, 1], endpoint, metrics: Arc::new(Metrics::new(&[1])) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: vec![0, 1], endpoint, metrics: Arc::new(Metrics::new(&[1])) };
         (ctx, self_sk, peer_sk)
     }
 
@@ -955,6 +1060,141 @@ mod tests {
         let sig = crypto::sign_canon(&peer_sk, &real_canon);
         let tampered_canon = protocol::observation_canon(1, &[1.0, 999.0]);
         assert!(!verify_from_peer(&ctx, 1, &tampered_canon, &hex::encode(sig.to_bytes())));
+    }
+
+    fn signed_key_rotation(sender: usize, old_sk: &ed25519_dalek::SigningKey, new_pubkey_hex: &str, rotation_seq: u64) -> KeyRotationMsg {
+        let canon = protocol::key_rotation_canon(sender, new_pubkey_hex, rotation_seq);
+        let sig = crypto::sign_canon(old_sk, &canon);
+        KeyRotationMsg { sender, new_pubkey_hex: new_pubkey_hex.to_string(), rotation_seq, sig_hex: hex::encode(sig.to_bytes()) }
+    }
+
+    #[tokio::test]
+    async fn a_genuine_key_rotation_is_accepted_updates_ctx_peers_and_is_persisted() {
+        let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer(); // peer 1, currently trusted key = peer_sk
+        let dir = crate::test_support::TempDir::new("key_rotation_accepted");
+        let store = Store::open(dir.path()).unwrap();
+
+        let new_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_pubkey_hex = hex::encode(new_sk.verifying_key().to_bytes());
+        let msg = signed_key_rotation(1, &peer_sk, &new_pubkey_hex, 1);
+
+        handle_key_rotation(&ctx, &store, msg).await;
+
+        let updated = ctx.peers.read().unwrap().get(&1).copied().expect("peer 1 should still be known");
+        assert_eq!(updated.pubkey, new_sk.verifying_key(), "ctx.peers must be updated to the new key immediately");
+        assert_eq!(updated.rotation_seq, 1);
+
+        let persisted = store.get_peer_key(1).unwrap().expect("the rotation must be persisted");
+        assert_eq!(persisted.pubkey_hex, new_pubkey_hex);
+        assert_eq!(persisted.rotation_seq, 1);
+    }
+
+    /// The actual end-to-end point of accepting a rotation: a real
+    /// proposal from peer 1, signed with its *new* key, must now
+    /// verify - not just that `ctx.peers` holds the new key in
+    /// isolation (the test above), but that `handle_proposal`'s own
+    /// signature check, run fresh afterward, actually agrees.
+    #[tokio::test]
+    async fn a_proposal_signed_with_the_newly_rotated_key_verifies_after_rotation() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, all_ids=[0,1]
+        let dir = crate::test_support::TempDir::new("key_rotation_then_proposal");
+        let store = Store::open(dir.path()).unwrap();
+
+        let new_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_pubkey_hex = hex::encode(new_sk.verifying_key().to_bytes());
+        handle_key_rotation(&ctx, &store, signed_key_rotation(1, &peer_sk, &new_pubkey_hex, 1)).await;
+        assert_eq!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, new_sk.verifying_key(), "sanity: rotation took effect");
+
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // height=1, view=0: expected_proposer([0,1], 1, 0) == 1, so
+        // peer 1 is the legitimate proposer here.
+        assert_eq!(expected_proposer(&ctx.all_ids, 1, 0), 1);
+        let proposal = signed_proposal(1, &new_sk, 1, "GENESIS", 0, 1.0);
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal.clone()).await;
+
+        // With a 2-node network (quorum 2), a verified proposal from
+        // the correct proposer plus this node's own vote reaches
+        // quorum immediately and commits - maybe_commit then prunes
+        // the now-committed candidate, so checking the real chain
+        // (not rs.candidates) is the correct success signal here.
+        let committed = node.chain.last().expect("the proposal should have verified, been voted on, and committed");
+        assert_eq!(committed.hash, proposal.block.hash, "the committed block must be the one signed with the newly-rotated key");
+    }
+
+    #[tokio::test]
+    async fn a_key_rotation_signed_with_the_wrong_key_is_rejected() {
+        let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer(); // peer 1's real key is peer_sk, not self_sk
+        let dir = crate::test_support::TempDir::new("key_rotation_wrong_signer");
+        let store = Store::open(dir.path()).unwrap();
+
+        let new_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_pubkey_hex = hex::encode(new_sk.verifying_key().to_bytes());
+        // Signed by this node's own key, impersonating peer 1 - not a
+        // genuine continuity proof from peer 1's real old key.
+        let msg = signed_key_rotation(1, &self_sk, &new_pubkey_hex, 1);
+
+        handle_key_rotation(&ctx, &store, msg).await;
+
+        assert_ne!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, new_sk.verifying_key(), "an impersonated rotation must never take effect");
+        assert_eq!(store.get_peer_key(1).unwrap(), None, "nothing should be persisted either");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_from_an_unknown_sender_is_ignored() {
+        let (ctx, _self_sk, _peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("key_rotation_unknown_sender");
+        let store = Store::open(dir.path()).unwrap();
+        let unrelated_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let new_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let msg = signed_key_rotation(99, &unrelated_sk, &hex::encode(new_sk.verifying_key().to_bytes()), 1);
+
+        handle_key_rotation(&ctx, &store, msg).await; // must not panic on an unknown id
+
+        assert!(ctx.peers.read().unwrap().get(&99).is_none());
+    }
+
+    /// The real property this message type exists to prevent (see
+    /// `protocol::KeyRotationMsg`'s doc comment): a captured, genuinely
+    /// valid rotation announcement replayed *after* a later rotation
+    /// has already superseded it must not roll the trusted key back.
+    #[tokio::test]
+    async fn a_replayed_rotation_with_a_stale_seq_cannot_roll_back_a_later_one() {
+        let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("key_rotation_replay");
+        let store = Store::open(dir.path()).unwrap();
+
+        let key_b = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let rotate_to_b = signed_key_rotation(1, &peer_sk, &hex::encode(key_b.verifying_key().to_bytes()), 1);
+        handle_key_rotation(&ctx, &store, rotate_to_b.clone()).await;
+        assert_eq!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, key_b.verifying_key());
+
+        let key_c = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        // The real next rotation is signed by key_b (the now-current
+        // key) at a higher seq.
+        let rotate_to_c = signed_key_rotation(1, &key_b, &hex::encode(key_c.verifying_key().to_bytes()), 2);
+        handle_key_rotation(&ctx, &store, rotate_to_c).await;
+        assert_eq!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, key_c.verifying_key());
+
+        // An attacker replays the original A->B announcement (genuinely
+        // signed, by the real old key, but at the now-stale seq=1).
+        handle_key_rotation(&ctx, &store, rotate_to_b).await;
+
+        assert_eq!(
+            ctx.peers.read().unwrap().get(&1).unwrap().pubkey,
+            key_c.verifying_key(),
+            "a stale-seq replay must never roll the trusted key back to a superseded one"
+        );
     }
 
     /// `broadcast()` fires sends as detached spawned tasks (Hardening
@@ -1353,7 +1593,7 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: HashMap::new(), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
         let dir = crate::test_support::TempDir::new("no_local_double_commit");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -1406,7 +1646,7 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: HashMap::new(), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
         let dir = crate::test_support::TempDir::new("epoch_rotation_boundary");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {

@@ -6,10 +6,13 @@
 //! [`tri_sync_node::consensus`] for what that loop actually does and
 //! what's simplified about it.
 
+use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tri_sync_core::crypto;
+use tri_sync_node::protocol::{self, KeyRotationMsg, Message};
 use tri_sync_node::{config, consensus, license, metrics, net, persistence, state};
 
 #[tokio::main]
@@ -29,12 +32,39 @@ async fn main() -> ExitCode {
     // otherwise trip over, since the consensus loop's round timer fires
     // an immediate first tick and (with no peers yet configured) would
     // self-commit a block before the real peer list is ever written.
+    //
+    // `--rotate-key`: generate a fresh signing key, persist it as this
+    // node's new identity, and broadcast a signed announcement (proven
+    // by the *old* key) to every currently-configured peer so they
+    // update their trusted pubkey for this node automatically - see
+    // `consensus::handle_key_rotation` for how a peer accepts one.
+    // Exits immediately like `--show-identity`, rather than continuing
+    // into a normal run, so an operator can confirm the announcement
+    // went out before deciding to restart the node for real.
+    //
+    // REQUIRED operator sequence, found to matter by an actual live
+    // multi-process test, not assumed: stop this node's main process
+    // FIRST, then run `--rotate-key`, then start it again normally.
+    // Running `--rotate-key` while the old process is still live races
+    // it: the still-running old process keeps signing with the old key
+    // for as long as it's up, so a peer that already accepted the new
+    // key correctly rejects those late old-key messages (expected) -
+    // but if one of those rejected messages was this node's own vote
+    // on a block the peer is actively trying to commit, that peer can
+    // be left permanently stuck on that height, because a node that's
+    // behind another by a committed height (as opposed to merely a
+    // view) has no catch-up mechanism yet (see `consensus`'s module
+    // doc comment on chain-sync). Stopping first removes the race
+    // entirely: there's no old-keyed process left to send anything
+    // peers now correctly reject.
     let mut duration_secs: Option<u64> = None;
     let mut show_identity_only = false;
+    let mut rotate_key_only = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--duration" => duration_secs = args.next().and_then(|s| s.parse().ok()),
             "--show-identity" => show_identity_only = true,
+            "--rotate-key" => rotate_key_only = true,
             _ => {}
         }
     }
@@ -120,6 +150,10 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if rotate_key_only {
+        return rotate_key(&config, &store, &node_state.signing_key).await;
+    }
+
     let listen_addr: std::net::SocketAddr = match config.listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -163,4 +197,88 @@ async fn main() -> ExitCode {
     consensus::run(config, node_state, store, client_endpoint, rx, duration, node_metrics).await;
 
     ExitCode::SUCCESS
+}
+
+/// Generates a fresh signing key, persists it as this node's new
+/// identity, and announces it to every configured peer (signed by the
+/// *old* key, proving continuity - see `protocol::KeyRotationMsg`).
+///
+/// **Caller must have already stopped this node's own main process.**
+/// See the `--rotate-key` usage note above the `main` flag parser for
+/// the real, live-tested reason: running this alongside a still-up old
+/// process races it and can wedge a peer that's mid-vote.
+///
+/// Persists before broadcasting: if this process dies partway through
+/// notifying peers, this node's own on-disk identity is unambiguous
+/// either way, and the peers that *did* receive the announcement have
+/// already moved on - there's no way to "undo" a partial broadcast
+/// that wouldn't just be a second, equally-partial one.
+///
+/// Disclosed limitation, not solved here: a peer that's offline (or
+/// otherwise misses the announcement) at rotation time has no way to
+/// learn the new key automatically afterward - there's no retry or
+/// resend of a missed announcement in this pass. Re-running
+/// `--rotate-key` doesn't help either, since that mints a *new* key
+/// and seq rather than resending the same one; recovering a peer that
+/// missed an announcement needs a manual nudge (e.g. restarting it
+/// after it next receives a signed message from this node's new key
+/// through some other path) outside this mechanism's scope.
+async fn rotate_key(config: &config::NodeConfig, store: &persistence::Store, old_signing_key: &SigningKey) -> ExitCode {
+    let new_signing_key = SigningKey::generate(&mut OsRng);
+    let new_pubkey_hex = hex::encode(new_signing_key.verifying_key().to_bytes());
+
+    let next_seq = match store.get_own_rotation_seq() {
+        Ok(seq) => seq.unwrap_or(0) + 1,
+        Err(e) => {
+            eprintln!("tri_sync_node: cannot read this node's rotation counter: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let canon = protocol::key_rotation_canon(config.node_id, &new_pubkey_hex, next_seq);
+    let sig = crypto::sign_canon(old_signing_key, &canon);
+    let msg = Message::KeyRotation(KeyRotationMsg {
+        sender: config.node_id,
+        new_pubkey_hex: new_pubkey_hex.clone(),
+        rotation_seq: next_seq,
+        sig_hex: hex::encode(sig.to_bytes()),
+    });
+
+    if let Err(e) = store.put_signing_key(&new_signing_key) {
+        eprintln!("tri_sync_node: failed to persist the new key - aborting before notifying any peer: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = store.put_own_rotation_seq(next_seq) {
+        eprintln!("tri_sync_node: failed to persist the new rotation counter - aborting before notifying any peer: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("tri_sync_node: persisted new identity locally - new pubkey={new_pubkey_hex} rotation_seq={next_seq}");
+
+    let endpoint = match net::make_client_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("tri_sync_node: new key is persisted, but cannot open a client endpoint to notify peers: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut any_failed = false;
+    for peer in &config.peers {
+        let addr: std::net::SocketAddr = peer.addr.parse().expect("validated at config load");
+        match net::send_message(&endpoint, addr, &msg).await {
+            Ok(()) => println!("tri_sync_node: notified peer {} at {addr}", peer.id),
+            Err(e) => {
+                eprintln!("tri_sync_node: failed to notify peer {} at {addr}: {e}", peer.id);
+                any_failed = true;
+            }
+        }
+    }
+
+    println!("tri_sync_node: key rotation complete - restart this node normally to use the new identity");
+    if any_failed {
+        eprintln!("tri_sync_node: at least one peer was not notified - see the disclosed limitation in this binary's --rotate-key handling");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }

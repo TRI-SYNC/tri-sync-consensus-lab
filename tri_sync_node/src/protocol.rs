@@ -1,4 +1,4 @@
-//! The five peer-to-peer message types, wire-serialized as JSON.
+//! The six peer-to-peer message types, wire-serialized as JSON.
 //!
 //! **Every message type carries an Ed25519 signature.** Earlier this
 //! was true only of [`BlockProposalMsg`]/[`BlockVoteMsg`]; observation
@@ -26,6 +26,16 @@
 //! The transport layer ([`crate::net`]) deliberately does not verify
 //! peer TLS certificates either - see that module's doc comment for
 //! why message-level signing is the real authentication boundary.
+//!
+//! [`KeyRotationMsg`] (Hardening 8) is the odd one out: every other
+//! message signs with the sender's *current* key and is verified
+//! against it. This one signs with the sender's *old* key to vouch
+//! for a *new* one - continuity of identity across a rotation, not a
+//! claim about the message's own content. [`key_rotation_canon`]
+//! folds in a `rotation_seq` that must strictly increase per sender
+//! (tracked by whoever receives it, not by this module), so a
+//! captured announcement can't be replayed later to roll a peer's
+//! trusted key back to a since-superseded one.
 
 use serde::{Deserialize, Serialize};
 use tri_sync_core::chain::{self, Block};
@@ -37,6 +47,7 @@ pub enum Message {
     BlockProposal(BlockProposalMsg),
     BlockVote(BlockVoteMsg),
     TrustUpdate(TrustUpdateMsg),
+    KeyRotation(KeyRotationMsg),
 }
 
 /// A raw sensor observation, broadcast before fusion.
@@ -116,6 +127,23 @@ pub fn trust_update_canon(sender: usize, about_peer: usize, edge_weight: f64) ->
     format!("trust|{sender}|{about_peer}|{edge_weight:.8}")
 }
 
+/// `sender` announcing a new signing key, signed with their *old* one.
+/// See this module's doc comment for why that's the opposite of every
+/// other message type here, and why `rotation_seq` matters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRotationMsg {
+    pub sender: usize,
+    pub new_pubkey_hex: String,
+    pub rotation_seq: u64,
+    pub sig_hex: String,
+}
+
+/// The exact string a [`KeyRotationMsg`] signs - with the sender's
+/// OLD key, not the new one it's announcing.
+pub fn key_rotation_canon(sender: usize, new_pubkey_hex: &str, rotation_seq: u64) -> String {
+    format!("keyrot|{sender}|{new_pubkey_hex}|{rotation_seq}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +162,7 @@ mod tests {
                 sig_hex: "ghi".to_string(),
             }),
             Message::TrustUpdate(TrustUpdateMsg { sender: 1, about_peer: 2, edge_weight: 1.5, sig_hex: "cc".to_string() }),
+            Message::KeyRotation(KeyRotationMsg { sender: 1, new_pubkey_hex: "dd".to_string(), rotation_seq: 1, sig_hex: "ee".to_string() }),
         ];
         for msg in messages {
             let json = serde_json::to_string(&msg).unwrap();
@@ -191,8 +220,20 @@ mod tests {
         let a = observation_canon(1, &[2.0]);
         let b = state_canon(1, &[2.0], 0.0);
         let c = trust_update_canon(1, 0, 2.0);
+        let d = key_rotation_canon(1, "0", 2);
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
+        assert_ne!(a, d);
+        assert_ne!(b, d);
+        assert_ne!(c, d);
+    }
+
+    #[test]
+    fn key_rotation_canon_is_sensitive_to_every_field() {
+        assert_eq!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(1, "abcd", 5));
+        assert_ne!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(2, "abcd", 5));
+        assert_ne!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(1, "abce", 5));
+        assert_ne!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(1, "abcd", 6));
     }
 }

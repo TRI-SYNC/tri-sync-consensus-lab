@@ -1,5 +1,6 @@
 //! LMDB-backed persistence (via `heed`) for blocks, trust, this node's
-//! keypair, and epoch metadata.
+//! keypair, epoch metadata, and (Hardening 8) rotated peer keys plus
+//! this node's own key-rotation counter.
 //!
 //! `heed` was chosen over RocksDB specifically because its LMDB source
 //! is small and compiles in seconds in a sandboxed build, confirmed by
@@ -19,8 +20,21 @@ pub struct TrustEntry {
     pub reliability: f64,
 }
 
+/// A peer's current pubkey as last learned from a validly-signed
+/// [`crate::protocol::KeyRotationMsg`] (Hardening 8), superseding
+/// whatever `node.toml` originally configured for that peer.
+/// `rotation_seq` is the strictly-increasing value from that message,
+/// kept so a later restart can still reject a replayed, now-stale
+/// announcement without needing to have stayed running.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerKeyRecord {
+    pub pubkey_hex: String,
+    pub rotation_seq: u64,
+}
+
 const SIGNING_KEY_KEY: &str = "signing_key";
 const EPOCH_KEY: &str = "epoch";
+const OWN_ROTATION_SEQ_KEY: &str = "own_rotation_seq";
 
 #[derive(Debug)]
 pub struct PersistError(String);
@@ -45,11 +59,12 @@ pub struct Store {
     trust: Database<U64<BigEndian>, SerdeJson<TrustEntry>>,
     keys: Database<Str, Bytes>,
     meta: Database<Str, U64<BigEndian>>,
+    peer_keys: Database<U64<BigEndian>, SerdeJson<PeerKeyRecord>>,
 }
 
 impl Store {
     /// Opens (creating if necessary) an LMDB environment at `dir` with
-    /// the four databases this node needs.
+    /// the five databases this node needs.
     pub fn open(dir: &Path) -> Result<Store, PersistError> {
         std::fs::create_dir_all(dir).map_err(|e| PersistError(format!("creating {}: {e}", dir.display())))?;
         // SAFETY: heed's `open` is unsafe because opening the same LMDB
@@ -57,7 +72,7 @@ impl Store {
         // mismatched configuration (map size, max_dbs) is undefined
         // behavior. This node is the only process expected to open its
         // own data_dir, with a fixed max_dbs below.
-        let env = unsafe { EnvOpenOptions::new().max_dbs(4).open(dir) }
+        let env = unsafe { EnvOpenOptions::new().max_dbs(5).open(dir) }
             .map_err(|e| PersistError(format!("opening LMDB env at {}: {e}", dir.display())))?;
 
         let mut wtxn = env.write_txn()?;
@@ -65,9 +80,10 @@ impl Store {
         let trust = env.create_database(&mut wtxn, Some("trust"))?;
         let keys = env.create_database(&mut wtxn, Some("keys"))?;
         let meta = env.create_database(&mut wtxn, Some("meta"))?;
+        let peer_keys = env.create_database(&mut wtxn, Some("peer_keys"))?;
         wtxn.commit()?;
 
-        Ok(Store { env, blocks, trust, keys, meta })
+        Ok(Store { env, blocks, trust, keys, meta, peer_keys })
     }
 
     pub fn put_block(&self, block: &Block) -> Result<(), PersistError> {
@@ -134,6 +150,37 @@ impl Store {
     pub fn get_epoch(&self) -> Result<Option<u64>, PersistError> {
         let rtxn = self.env.read_txn()?;
         Ok(self.meta.get(&rtxn, EPOCH_KEY)?)
+    }
+
+    /// Records a peer's rotated key, superseding `node.toml`'s
+    /// original entry for that peer on every future load.
+    pub fn put_peer_key(&self, peer_id: usize, record: &PeerKeyRecord) -> Result<(), PersistError> {
+        let mut wtxn = self.env.write_txn()?;
+        self.peer_keys.put(&mut wtxn, &(peer_id as u64), record)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// The last key rotation accepted from `peer_id`, if any.
+    pub fn get_peer_key(&self, peer_id: usize) -> Result<Option<PeerKeyRecord>, PersistError> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.peer_keys.get(&rtxn, &(peer_id as u64))?)
+    }
+
+    /// This node's own rotation counter for its *outgoing*
+    /// [`crate::protocol::KeyRotationMsg`] announcements - distinct
+    /// from `peer_keys`, which tracks what's been accepted *from*
+    /// peers. `None` means this node has never rotated its own key.
+    pub fn put_own_rotation_seq(&self, seq: u64) -> Result<(), PersistError> {
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.put(&mut wtxn, OWN_ROTATION_SEQ_KEY, &seq)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_own_rotation_seq(&self) -> Result<Option<u64>, PersistError> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.meta.get(&rtxn, OWN_ROTATION_SEQ_KEY)?)
     }
 }
 
@@ -213,6 +260,35 @@ mod tests {
         assert_eq!(store.get_epoch().unwrap(), None);
         store.put_epoch(3).unwrap();
         assert_eq!(store.get_epoch().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn peer_key_round_trips_and_a_later_write_overwrites_the_earlier_one() {
+        let dir = TempDir::new("peer_key");
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get_peer_key(1).unwrap(), None);
+
+        let first = PeerKeyRecord { pubkey_hex: "aa".repeat(32), rotation_seq: 1 };
+        store.put_peer_key(1, &first).unwrap();
+        assert_eq!(store.get_peer_key(1).unwrap(), Some(first));
+
+        let second = PeerKeyRecord { pubkey_hex: "bb".repeat(32), rotation_seq: 2 };
+        store.put_peer_key(1, &second).unwrap();
+        assert_eq!(store.get_peer_key(1).unwrap(), Some(second), "a newer rotation must overwrite, not append");
+
+        // A different peer's record is independent.
+        assert_eq!(store.get_peer_key(2).unwrap(), None);
+    }
+
+    #[test]
+    fn own_rotation_seq_round_trips() {
+        let dir = TempDir::new("own_rotation_seq");
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get_own_rotation_seq().unwrap(), None, "never rotated yet");
+        store.put_own_rotation_seq(1).unwrap();
+        assert_eq!(store.get_own_rotation_seq().unwrap(), Some(1));
+        store.put_own_rotation_seq(2).unwrap();
+        assert_eq!(store.get_own_rotation_seq().unwrap(), Some(2));
     }
 
     #[test]
