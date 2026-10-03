@@ -97,9 +97,53 @@ pub fn prefer(a: &Block, b: &Block) -> bool {
     false
 }
 
+/// How many committed blocks make up one epoch. Arbitrary but
+/// disclosed: small enough to actually observe a rotation in a short
+/// real run or test, not tied to any particular `round_interval_secs`
+/// since epoch rotation is keyed off committed height, not wall-clock
+/// time (see `epoch_for_height`).
+pub const BLOCKS_PER_EPOCH: u64 = 10;
+
+/// The epoch a block at `height` belongs to. Deliberately a pure
+/// function of height rather than a wall-clock timer: every node
+/// converges on the same committed height through consensus itself,
+/// so deriving epoch from height means every honest node agrees on
+/// the current epoch with no separate coordination needed - unlike
+/// `crate::consensus`'s view-change timers (Hardening 4), which
+/// genuinely do drift across independently-clocked nodes and need
+/// catch-up logic precisely because of that.
+pub fn epoch_for_height(height: u64) -> u64 {
+    height / BLOCKS_PER_EPOCH
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_for_height_is_zero_for_the_whole_first_epoch() {
+        for h in 0..BLOCKS_PER_EPOCH {
+            assert_eq!(epoch_for_height(h), 0);
+        }
+    }
+
+    #[test]
+    fn epoch_for_height_increments_exactly_at_each_boundary() {
+        assert_eq!(epoch_for_height(BLOCKS_PER_EPOCH - 1), 0);
+        assert_eq!(epoch_for_height(BLOCKS_PER_EPOCH), 1);
+        assert_eq!(epoch_for_height(2 * BLOCKS_PER_EPOCH - 1), 1);
+        assert_eq!(epoch_for_height(2 * BLOCKS_PER_EPOCH), 2);
+    }
+
+    #[test]
+    fn epoch_for_height_is_monotonically_non_decreasing() {
+        let mut prev = epoch_for_height(0);
+        for h in 1..(5 * BLOCKS_PER_EPOCH) {
+            let e = epoch_for_height(h);
+            assert!(e == prev || e == prev + 1, "epoch must never jump by more than one or ever decrease");
+            prev = e;
+        }
+    }
 
     #[test]
     fn taller_chain_always_wins_regardless_of_weight_or_confidence() {

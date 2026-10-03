@@ -20,11 +20,21 @@
 //!   synchronized simulation step with shared ground truth - so two
 //!   nodes' trust views of the same peer can genuinely differ, which
 //!   is a feature (asymmetric directed trust) rather than a bug.
-//! - Epoch rotation isn't wired in: the epoch stays fixed at whatever
-//!   `NodeState::init`/`load_or_init` set it to.
+//! - Epoch rotation (Hardening 7) is real and live: every block's
+//!   epoch is `tri_sync_core::chain::epoch_for_height(height)`, a pure
+//!   function every node computes identically with no coordination,
+//!   and `maybe_commit` updates/persists/logs `node.epoch` whenever a
+//!   committed block crosses into a new one. What it deliberately does
+//!   NOT do yet is re-key: the signing keypair stays the one from
+//!   `node.toml`/persisted identity across every epoch. Rotating keys
+//!   for real would mean a peer's configured pubkey goes stale the
+//!   moment that peer rotates, with no way for this node to learn the
+//!   new one - that needs the automated key-distribution mechanism
+//!   that's its own, later hardening pass, not something to bolt on
+//!   here incompletely.
 //! - Peer public keys are static, from `node.toml` - there's no
-//!   in-band key discovery or epoch-based re-keying across the
-//!   network yet.
+//!   in-band key discovery yet (see the epoch point above for why
+//!   that's a prerequisite for real re-keying, not an independent gap).
 //! - Liveness fallback exists (`maybe_bump_view` hands off to the next
 //!   proposer after a timeout, with catch-up so a lagging node adopts
 //!   a legitimate later view instead of rejecting it), but it isn't a
@@ -291,6 +301,9 @@ pub async fn run(
     all_ids.sort_unstable();
 
     metrics.head_height.store(node.head().height, Ordering::Relaxed);
+    reconcile_epoch_with_chain(&mut node, &store);
+    metrics.epoch.store(node.epoch, Ordering::Relaxed);
+
     let ctx = Ctx { config, peers, all_ids, endpoint, metrics };
     let mut rs = RoundState::default();
     let mut rng = rand::rngs::StdRng::from_entropy();
@@ -368,13 +381,19 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     let spread = values.iter().map(|v| fusion::l2_distance(v, &fused)).sum::<f64>() / values.len() as f64;
     let confidence = (1.0 / (1.0 + spread)).clamp(0.0, 1.0);
 
+    let next_height = head.height + 1;
     let mut block = Block {
-        height: head.height + 1,
+        height: next_height,
         parent: head.hash.clone(),
         state: fused,
         confidence,
         reconciles: vec![],
-        epoch: node.epoch,
+        // Derived from height, not read from node.epoch directly - see
+        // chain::epoch_for_height's doc comment for why every node
+        // converges on the same value with no coordination needed.
+        // node.epoch is just maybe_commit's cached mirror of this,
+        // kept for logging/metrics.
+        epoch: chain::epoch_for_height(next_height),
         signatures: vec![],
         sig_weight: 0.0,
         hash: String::new(),
@@ -621,6 +640,27 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     maybe_commit(ctx, node, store, rs, &v.block_hash).await;
 }
 
+/// Corrects `node.epoch` to match what `chain::epoch_for_height` says
+/// it should be for the chain height just loaded, persisting the fix.
+/// See the call site in `run` for why the persisted value can't
+/// always be trusted as-is. A no-op (no log, no write) when they
+/// already agree, which is the overwhelmingly common case.
+fn reconcile_epoch_with_chain(node: &mut NodeState, store: &Store) {
+    let authoritative_epoch = chain::epoch_for_height(node.head().height);
+    if authoritative_epoch == node.epoch {
+        return;
+    }
+    log(format!(
+        "correcting persisted epoch {} -> {authoritative_epoch} to match loaded chain height {}",
+        node.epoch,
+        node.head().height
+    ));
+    node.epoch = authoritative_epoch;
+    if let Err(e) = store.put_epoch(authoritative_epoch) {
+        eprintln!("tri_sync_node: failed to persist corrected epoch: {e}");
+    }
+}
+
 async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str) {
     let head = node.head().clone();
     let Some((_, mut block)) = rs.candidates.get(block_hash).cloned() else { return };
@@ -646,6 +686,22 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
         ctx.metrics.reconciles_total.fetch_add(1, Ordering::Relaxed);
     }
     log(format!("COMMITTED height={} hash={} sig_weight={} state={:?}", block.height, block.hash, block.sig_weight, block.state));
+
+    // block.epoch (set by whoever proposed it, from the same pure
+    // chain::epoch_for_height every honest node computes) is now this
+    // node's own current epoch too, since this node's head just
+    // advanced to match. Persisted so a restart can see it without
+    // recomputing, and logged once per actual rotation, not every
+    // commit, so the log stays meaningful at epoch boundaries instead
+    // of repeating the same value every round_interval_secs.
+    if block.epoch != node.epoch {
+        log(format!("epoch rotated: {} -> {} at height={}", node.epoch, block.epoch, block.height));
+        node.epoch = block.epoch;
+        ctx.metrics.epoch.store(block.epoch, Ordering::Relaxed);
+        if let Err(e) = store.put_epoch(block.epoch) {
+            eprintln!("tri_sync_node: failed to persist rotated epoch: {e}");
+        }
+    }
 
     rs.candidates.retain(|_, (_, b)| b.height > block.height);
     let surviving: std::collections::HashSet<String> = rs.candidates.keys().cloned().collect();
@@ -1328,6 +1384,112 @@ mod tests {
 
         assert_eq!(node.chain.len(), 2, "a second candidate for an already-committed height must never be committed on top");
         assert_eq!(node.chain.last().unwrap().hash, first_hash, "the real committed block must be untouched");
+    }
+
+    /// Drives a real single-node (1-of-1 quorum) chain across a real
+    /// epoch boundary through the actual propose/commit path, not by
+    /// calling `chain::epoch_for_height` directly - proving
+    /// `maybe_commit` really does update, persist, and log the
+    /// rotation when it happens, and leaves `node.epoch` alone
+    /// otherwise.
+    #[tokio::test]
+    async fn maybe_commit_rotates_and_persists_the_epoch_exactly_at_the_boundary() {
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: vec![],
+        };
+        let endpoint = net::make_client_endpoint().unwrap();
+        let ctx = Ctx { config, peers: HashMap::new(), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let dir = crate::test_support::TempDir::new("epoch_rotation_boundary");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        rs.latest_observations.insert(0, vec![1.0, 1.0]);
+
+        // Commit up through height BLOCKS_PER_EPOCH - 1: still epoch 0.
+        for h in 1..chain::BLOCKS_PER_EPOCH {
+            let head = node.head().clone();
+            propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
+            assert_eq!(node.chain.last().unwrap().height, h);
+            assert_eq!(node.chain.last().unwrap().epoch, 0, "height {h} should still be epoch 0");
+            assert_eq!(node.epoch, 0);
+        }
+        assert_eq!(store.get_epoch().unwrap(), None, "nothing has rotated yet, so nothing new should be persisted beyond genesis's implicit 0");
+
+        // This commit lands exactly on height BLOCKS_PER_EPOCH - the
+        // real rotation.
+        let head = node.head().clone();
+        propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
+        let committed = node.chain.last().unwrap();
+        assert_eq!(committed.height, chain::BLOCKS_PER_EPOCH);
+        assert_eq!(committed.epoch, 1, "this height belongs to epoch 1");
+        assert_eq!(node.epoch, 1, "maybe_commit should have updated node.epoch to match");
+        assert_eq!(store.get_epoch().unwrap(), Some(1), "the rotation must be persisted, not just held in memory");
+
+        // One more commit just past the boundary: epoch should stay at
+        // 1, not keep incrementing every block.
+        let head = node.head().clone();
+        propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
+        assert_eq!(node.chain.last().unwrap().epoch, 1);
+        assert_eq!(node.epoch, 1);
+    }
+
+    #[test]
+    fn reconcile_epoch_with_chain_corrects_a_stale_persisted_epoch_to_match_height() {
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let dir = crate::test_support::TempDir::new("reconcile_epoch_stale");
+        let store = Store::open(dir.path()).unwrap();
+        let tall_block = Block { height: chain::BLOCKS_PER_EPOCH * 2, parent: "GENESIS".to_string(), ..Block::genesis(2) };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), tall_block],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0, // stale - the loaded chain's height says this should be epoch 2
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+
+        reconcile_epoch_with_chain(&mut node, &store);
+
+        assert_eq!(node.epoch, 2, "should be corrected to match the real chain height, not left at the stale loaded value");
+        assert_eq!(store.get_epoch().unwrap(), Some(2), "the correction must be persisted too");
+    }
+
+    #[test]
+    fn reconcile_epoch_with_chain_is_a_no_op_when_already_consistent() {
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let dir = crate::test_support::TempDir::new("reconcile_epoch_consistent");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+
+        reconcile_epoch_with_chain(&mut node, &store);
+
+        assert_eq!(node.epoch, 0);
+        assert_eq!(store.get_epoch().unwrap(), None, "nothing to correct, so nothing should be written");
     }
 
     /// The real end-to-end claim this stage exists to prove: two

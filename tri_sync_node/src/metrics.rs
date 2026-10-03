@@ -1,7 +1,8 @@
 //! Optional Prometheus metrics: head height, forks observed, blocks
 //! that reconciled a fork, mean trust weight toward this node's peers,
-//! and (Hardening 6) per-peer network health - see `crate::health` for
-//! what "health" means here and why it's purely observational.
+//! (Hardening 6) per-peer network health - see `crate::health` for
+//! what "health" means here and why it's purely observational - and
+//! (Hardening 7) this node's current epoch.
 //!
 //! **Honest note on `forks`/`reconciles`.** `forks_total` counts two
 //! real, distinct things (see `consensus::handle_proposal`): a
@@ -37,6 +38,8 @@ pub struct Metrics {
     /// Times this node bumped a height's view after its proposer timed
     /// out - see `crate::consensus`'s liveness/view-change handling.
     pub view_changes_total: AtomicU64,
+    /// This node's current epoch - see `tri_sync_core::chain::epoch_for_height`.
+    pub epoch: AtomicU64,
     mean_trust_weight_bits: AtomicU64,
     /// One entry per configured peer, built once at start-up from
     /// `node.toml` - see `crate::health` for why the map itself never
@@ -95,12 +98,16 @@ impl Metrics {
              tri_sync_mean_trust_weight {}\n\
              # HELP tri_sync_view_changes_total Times a height's proposer timed out and view advanced.\n\
              # TYPE tri_sync_view_changes_total counter\n\
-             tri_sync_view_changes_total {}\n",
+             tri_sync_view_changes_total {}\n\
+             # HELP tri_sync_epoch This node's current epoch, derived from its committed chain height.\n\
+             # TYPE tri_sync_epoch gauge\n\
+             tri_sync_epoch {}\n",
             self.head_height.load(Ordering::Relaxed),
             self.forks_total.load(Ordering::Relaxed),
             self.reconciles_total.load(Ordering::Relaxed),
             self.mean_trust_weight(),
             self.view_changes_total.load(Ordering::Relaxed),
+            self.epoch.load(Ordering::Relaxed),
         );
 
         if !self.peer_health.is_empty() {
@@ -173,6 +180,7 @@ mod tests {
         metrics.forks_total.store(2, Ordering::Relaxed);
         metrics.reconciles_total.store(1, Ordering::Relaxed);
         metrics.view_changes_total.store(4, Ordering::Relaxed);
+        metrics.epoch.store(3, Ordering::Relaxed);
         metrics.set_mean_trust_weight(1.5);
 
         let text = metrics.render();
@@ -181,6 +189,7 @@ mod tests {
         assert!(text.contains("tri_sync_reconciles_total 1"));
         assert!(text.contains("tri_sync_mean_trust_weight 1.5"));
         assert!(text.contains("tri_sync_view_changes_total 4"));
+        assert!(text.contains("tri_sync_epoch 3"));
     }
 
     #[test]
