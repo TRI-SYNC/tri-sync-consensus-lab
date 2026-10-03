@@ -83,9 +83,26 @@
 //!   `/metrics`, but purely observationally: it never changes who
 //!   gets proposed to, voted for, or sent messages. Deliberately not
 //!   wired into behavior - see that module's doc comment for why.
+//! - Operational hardening (Hardening 9): `run`'s loop now handles
+//!   SIGTERM/SIGINT, logging and exiting cleanly instead of relying on
+//!   `--duration` or a bare SIGKILL - the difference between a real
+//!   deployment (`systemd`/`docker stop`) being able to tell "stopped"
+//!   from "crashed" or not. Every `log`/`warn` line is now prefixed
+//!   with a UTC timestamp (`log_timestamp`, reusing `crate::license`'s
+//!   dependency-free calendar math) - added directly because of a real
+//!   debugging session (Hardening 8's live rotation test) where
+//!   correlating two unstamped node logs by eye was slow enough to
+//!   nearly obscure the actual bug. What this pass does NOT attempt:
+//!   bounding `RoundState`'s `candidates`/`votes` maps against a
+//!   legitimate-but-malicious expected proposer flooding many distinct
+//!   signed proposals for one (height, view) - a real, narrow
+//!   resource-exhaustion vector, but a different kind of fix (a cap
+//!   with its own eviction policy) than anything else in this pass,
+//!   left for a dedicated look rather than bolted on here.
 
 use crate::config::NodeConfig;
 use crate::health;
+use crate::license;
 use crate::metrics::Metrics;
 use crate::net;
 use crate::persistence::{PeerKeyRecord, Store, TrustEntry};
@@ -283,7 +300,7 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
             let ok = match net::send_message(&endpoint, addr, &msg).await {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!("tri_sync_node: send to {addr} failed: {e}");
+                    warn(format!("send to {addr} failed: {e}"));
                     false
                 }
             };
@@ -308,9 +325,32 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
     }
 }
 
+/// `YYYY-MM-DDTHH:MM:SSZ`, UTC, built from the same dependency-free
+/// calendar math `crate::license` already uses for expiry checks
+/// (`license::civil_from_days`) rather than pulling in a date/time
+/// crate just to stamp log lines.
+///
+/// Added after a real debugging session (Hardening 8's rotation live
+/// test) where correlating two separate nodes' unstamped log files by
+/// eye - "did this rejection happen before or after that restart?" -
+/// was slow and error-prone enough to nearly hide the actual bug.
+fn log_timestamp() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let (y, m, d) = license::civil_from_days((secs / 86_400) as i64);
+    let sod = secs % 86_400;
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", sod / 3600, (sod % 3600) / 60, sod % 60)
+}
+
 fn log(line: impl std::fmt::Display) {
-    println!("tri_sync_node: {line}");
+    println!("{} tri_sync_node: {line}", log_timestamp());
     let _ = std::io::stdout().flush();
+}
+
+/// Same timestamp prefix as `log`, for the warning/rejection paths
+/// that go to stderr instead - so a rejection can be correlated by
+/// time against another node's log just as easily as a success.
+fn warn(line: impl std::fmt::Display) {
+    eprintln!("{} tri_sync_node: {line}", log_timestamp());
 }
 
 /// Runs the round loop until `duration` elapses (if given) or the
@@ -345,10 +385,10 @@ pub async fn run(
                         log(format!("peer {} loaded with its rotated key (rotation_seq={})", p.id, record.rotation_seq));
                         return (p.id, PeerInfo { addr, pubkey, rotation_seq: record.rotation_seq });
                     }
-                    None => eprintln!("tri_sync_node: persisted key for peer {} is corrupt, falling back to node.toml", p.id),
+                    None => warn(format!("persisted key for peer {} is corrupt, falling back to node.toml", p.id)),
                 },
                 Ok(None) => {}
-                Err(e) => eprintln!("tri_sync_node: failed to read persisted key for peer {}: {e} - falling back to node.toml", p.id),
+                Err(e) => warn(format!("failed to read persisted key for peer {}: {e} - falling back to node.toml", p.id)),
             }
             let pubkey = decode_verifying_key(&p.pubkey_hex).expect("validated at config load");
             (p.id, PeerInfo { addr, pubkey, rotation_seq: 0 })
@@ -380,10 +420,29 @@ pub async fn run(
     };
     tokio::pin!(deadline_sleep);
 
+    // Operational hardening: a real deployment is stopped by `systemd`/
+    // `docker stop`/an operator's `kill`, all of which send SIGTERM
+    // first - without a handler, that's indistinguishable from a crash
+    // (no "shutting down cleanly" log, no chance to do so) and only
+    // SIGKILL after the grace period actually stops the process. SIGINT
+    // (Ctrl+C) is handled the same way for an operator running this in
+    // a foreground terminal. Unix-only (SIGTERM has no Windows
+    // equivalent); this project's CI matrix is Linux/macOS, both Unix.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing a SIGTERM handler should never fail outside extreme resource exhaustion");
+
     loop {
         tokio::select! {
             _ = &mut deadline_sleep => {
                 log("--duration elapsed, shutting down cleanly.");
+                break;
+            }
+            _ = sigterm.recv() => {
+                log("received SIGTERM, shutting down cleanly.");
+                break;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                log("received SIGINT, shutting down cleanly.");
                 break;
             }
             _ = ticker.tick() => {
@@ -479,7 +538,7 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
             if verify_from_peer(ctx, o.sender, &canon, &o.sig_hex) {
                 rs.latest_observations.insert(o.sender, o.values);
             } else {
-                eprintln!("tri_sync_node: rejected observation from {} - unknown sender or invalid signature", o.sender);
+                warn(format!("rejected observation from {} - unknown sender or invalid signature", o.sender));
             }
         }
         Message::BlockProposal(p) => handle_proposal(ctx, node, store, rs, p).await,
@@ -489,7 +548,7 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
             if verify_from_peer(ctx, t.sender, &canon, &t.sig_hex) {
                 log(format!("peer {} reports edge_weight {:.3} toward peer {}", t.sender, t.edge_weight, t.about_peer));
             } else {
-                eprintln!("tri_sync_node: rejected trust-update from {} - unknown sender or invalid signature", t.sender);
+                warn(format!("rejected trust-update from {} - unknown sender or invalid signature", t.sender));
             }
         }
         // Informational only in this stage - nothing acts on a peer's
@@ -498,7 +557,7 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
         Message::State(s) => {
             let canon = protocol::state_canon(s.sender, &s.state, s.confidence);
             if !verify_from_peer(ctx, s.sender, &canon, &s.sig_hex) {
-                eprintln!("tri_sync_node: rejected state broadcast from {} - unknown sender or invalid signature", s.sender);
+                warn(format!("rejected state broadcast from {} - unknown sender or invalid signature", s.sender));
             }
         }
         Message::KeyRotation(k) => handle_key_rotation(ctx, store, k).await,
@@ -517,7 +576,7 @@ async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
     let KeyRotationMsg { sender, new_pubkey_hex, rotation_seq, sig_hex } = msg;
 
     let Some(current) = ctx.peers.read().unwrap().get(&sender).copied() else {
-        eprintln!("tri_sync_node: ignoring key rotation from unknown peer {sender}");
+        warn(format!("ignoring key rotation from unknown peer {sender}"));
         return;
     };
     if rotation_seq <= current.rotation_seq {
@@ -530,11 +589,11 @@ async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
     let Some(sig) = decode_signature(&sig_hex) else { return };
     let canon = protocol::key_rotation_canon(sender, &new_pubkey_hex, rotation_seq);
     if !crypto::verify_canon(&current.pubkey, &canon, &sig) {
-        eprintln!("tri_sync_node: invalid key-rotation signature from {sender} - rejecting, keeping the current key");
+        warn(format!("invalid key-rotation signature from {sender} - rejecting, keeping the current key"));
         return;
     }
     let Some(new_pubkey) = decode_verifying_key(&new_pubkey_hex) else {
-        eprintln!("tri_sync_node: key rotation from {sender} carries an unparseable new pubkey - rejecting");
+        warn(format!("key rotation from {sender} carries an unparseable new pubkey - rejecting"));
         return;
     };
 
@@ -546,7 +605,7 @@ async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
         }
     }
     if let Err(e) = store.put_peer_key(sender, &PeerKeyRecord { pubkey_hex: new_pubkey_hex, rotation_seq }) {
-        eprintln!("tri_sync_node: accepted key rotation from {sender} in memory but failed to persist it: {e}");
+        warn(format!("accepted key rotation from {sender} in memory but failed to persist it: {e}"));
     }
     log(format!("accepted key rotation from peer {sender}: now trusting its new key (rotation_seq={rotation_seq})"));
 }
@@ -567,7 +626,7 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     // checks would otherwise have rejected more cheaply; correctness
     // over that micro-optimization.
     let Some(peer) = ctx.peers.read().unwrap().get(&p.sender).copied() else {
-        eprintln!("tri_sync_node: ignoring proposal from unknown sender {}", p.sender);
+        warn(format!("ignoring proposal from unknown sender {}", p.sender));
         return;
     };
     let Some(their_sig_entry) = p.block.signatures.first() else { return };
@@ -575,12 +634,12 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     let identity_canon = protocol::block_canon(&p.block);
     let signing_canon = protocol::view_block_canon(p.view, &p.block);
     if !crypto::verify_canon(&peer.pubkey, &signing_canon, &sig) {
-        eprintln!("tri_sync_node: invalid proposer signature from {}", p.sender);
+        warn(format!("invalid proposer signature from {}", p.sender));
         return;
     }
     let block_hash = chain::block_hash(&identity_canon);
     if block_hash != p.block.hash {
-        eprintln!("tri_sync_node: proposal hash mismatch from {}", p.sender);
+        warn(format!("proposal hash mismatch from {}", p.sender));
         return;
     }
     ctx.metrics.record_peer_seen(p.sender);
@@ -653,7 +712,7 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     }
     let expected = expected_proposer(&ctx.all_ids, p.block.height, p.view);
     if p.sender != expected {
-        eprintln!("tri_sync_node: ignoring proposal from {} - expected proposer for view {} is {}", p.sender, p.view, expected);
+        warn(format!("ignoring proposal from {} - expected proposer for view {} is {}", p.sender, p.view, expected));
         return;
     }
 
@@ -704,7 +763,7 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     let Some(known_pubkey) = known_pubkey else { return };
     let Some(claimed_pubkey) = decode_verifying_key(&v.pubkey_hex) else { return };
     if claimed_pubkey != known_pubkey {
-        eprintln!("tri_sync_node: vote from {} claims an unexpected pubkey", v.sender);
+        warn(format!("vote from {} claims an unexpected pubkey", v.sender));
         return;
     }
 
@@ -726,7 +785,7 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     let Some(sig) = decode_signature(&v.sig_hex) else { return };
     let signing_canon = protocol::view_block_canon(v.view, &block);
     if !crypto::verify_canon(&known_pubkey, &signing_canon, &sig) {
-        eprintln!("tri_sync_node: invalid vote signature from {}", v.sender);
+        warn(format!("invalid vote signature from {}", v.sender));
         return;
     }
     ctx.metrics.record_peer_seen(v.sender); // no-op if v.sender is this node's own id
@@ -762,7 +821,7 @@ fn reconcile_epoch_with_chain(node: &mut NodeState, store: &Store) {
     ));
     node.epoch = authoritative_epoch;
     if let Err(e) = store.put_epoch(authoritative_epoch) {
-        eprintln!("tri_sync_node: failed to persist corrected epoch: {e}");
+        warn(format!("failed to persist corrected epoch: {e}"));
     }
 }
 
@@ -784,7 +843,7 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
 
     node.chain.push(block.clone());
     if let Err(e) = store.put_block(&block) {
-        eprintln!("tri_sync_node: failed to persist committed block: {e}");
+        warn(format!("failed to persist committed block: {e}"));
     }
     ctx.metrics.head_height.store(block.height, Ordering::Relaxed);
     if !block.reconciles.is_empty() {
@@ -804,7 +863,7 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
         node.epoch = block.epoch;
         ctx.metrics.epoch.store(block.epoch, Ordering::Relaxed);
         if let Err(e) = store.put_epoch(block.epoch) {
-            eprintln!("tri_sync_node: failed to persist rotated epoch: {e}");
+            warn(format!("failed to persist rotated epoch: {e}"));
         }
     }
 
@@ -856,7 +915,7 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
         node.reliability.insert(peer_id, new_rel);
         node.edge_weight.insert(peer_id, new_w);
         if let Err(e) = store.put_trust(peer_id, TrustEntry { edge_weight: new_w, reliability: new_rel }) {
-            eprintln!("tri_sync_node: failed to persist trust update for peer {peer_id}: {e}");
+            warn(format!("failed to persist trust update for peer {peer_id}: {e}"));
         }
         let trust_canon = protocol::trust_update_canon(node.node_id, peer_id, new_w);
         let trust_sig = crypto::sign_canon(&node.signing_key, &trust_canon);
@@ -968,6 +1027,20 @@ mod tests {
         assert!(!maybe_bump_view(&mut rs, 6, timeout));
         tokio::time::advance(Duration::from_secs(9)).await;
         assert!(!maybe_bump_view(&mut rs, 6, timeout), "only 9s elapsed for height 6's own timer, not enough to bump");
+    }
+
+    #[test]
+    fn log_timestamp_has_the_expected_shape_and_a_plausible_year() {
+        let ts = log_timestamp();
+        assert_eq!(ts.len(), 20, "YYYY-MM-DDTHH:MM:SSZ is exactly 20 chars, got {ts:?}");
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "T");
+        assert_eq!(&ts[13..14], ":");
+        assert_eq!(&ts[16..17], ":");
+        assert_eq!(&ts[19..20], "Z");
+        let year: u32 = ts[0..4].parse().expect("year digits should parse");
+        assert!((2020..2200).contains(&year), "sanity bound on the current year, got {year}");
     }
 
     #[test]
