@@ -107,6 +107,21 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// True only if `hex_str` decodes to exactly 32 bytes that are also a
+/// valid compressed Ed25519 point - not just the right length. A real
+/// gap this closes: roughly half of all 32-byte values are *not* valid
+/// points (confirmed empirically), so a length-only check let a
+/// malformed-but-right-length `pubkey_hex` pass validation here and
+/// then panic the whole process later at `consensus.rs`'s
+/// `decode_verifying_key(...).expect("validated at config load")` -
+/// exactly the loud-failure-at-config-load-time this module's own doc
+/// comment promises, defeated by checking the wrong thing.
+fn is_valid_ed25519_pubkey_hex(hex_str: &str) -> bool {
+    let Ok(bytes) = hex::decode(hex_str) else { return false };
+    let Ok(arr): Result<[u8; 32], _> = bytes.try_into() else { return false };
+    ed25519_dalek::VerifyingKey::from_bytes(&arr).is_ok()
+}
+
 /// Parses and validates `toml_str` as a `node.toml` file. Every address
 /// field is checked for real parseability here - not just
 /// non-emptiness - so a typo'd address fails loudly at config-load
@@ -153,8 +168,7 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
         if !seen_addrs.insert(peer_addr) {
             return Err(ConfigError::DuplicatePeerAddr(peer.id));
         }
-        let valid_pubkey = hex::decode(&peer.pubkey_hex).ok().filter(|b| b.len() == 32).is_some();
-        if !valid_pubkey {
+        if !is_valid_ed25519_pubkey_hex(&peer.pubkey_hex) {
             return Err(ConfigError::BadPeerPubkey(peer.id));
         }
     }
@@ -443,6 +457,26 @@ mod tests {
             id = 1
             addr = "127.0.0.1:9001"
             pubkey_hex = "abcd"
+        "#;
+        assert_eq!(load_from_str(toml), Err(ConfigError::BadPeerPubkey(1)));
+    }
+
+    #[test]
+    fn a_peer_pubkey_of_the_right_length_but_not_a_valid_curve_point_is_rejected() {
+        // A real bug a focused code review caught: the old check only
+        // verified 32 bytes, not that they're a valid compressed
+        // Ed25519 point - roughly half of all 32-byte values aren't
+        // (confirmed empirically). This exact value decodes to 32
+        // bytes but VerifyingKey::from_bytes rejects it.
+        let toml = r#"
+            node_id = 0
+            dim = 1
+            listen_addr = "0.0.0.0:9000"
+
+            [[peers]]
+            id = 1
+            addr = "127.0.0.1:9001"
+            pubkey_hex = "0000000000000000000000000000000000000000000000000000000000000001"
         "#;
         assert_eq!(load_from_str(toml), Err(ConfigError::BadPeerPubkey(1)));
     }

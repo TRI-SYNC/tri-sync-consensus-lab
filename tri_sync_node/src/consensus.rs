@@ -767,19 +767,36 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
         return;
     }
 
-    let Some((_, block)) = rs.candidates.get(&v.block_hash).cloned() else {
+    let Some((stored_view, block)) = rs.candidates.get(&v.block_hash).cloned() else {
         return; // vote arrived before the proposal - dropped; no retry in this stage
     };
-    // Same "reject only if stale, catch up if ahead" rule as
-    // handle_proposal - in practice this candidate is only cached
-    // once the corresponding proposal already caught this node up to
-    // its view, so v.view > current_view should be rare, but the rule
-    // stays consistent rather than assuming that.
-    if v.view < current_view(rs, block.height) {
-        eprintln!(
-            "tri_sync_node: ignoring vote from {} for stale view {} - this node is already past it for height {}",
+    // A real bug, found by a focused adversarial review (not a test):
+    // this used to accept any v.view >= current_view and, if strictly
+    // greater, adopt it as the new current view - treating the vote's
+    // own view claim as evidence a round at that view genuinely
+    // happened. It doesn't: a vote is self-signed by the voter alone,
+    // who can freely construct view_block_canon(view, block) for any
+    // view number over any block they already know about, with no
+    // proposer ever actually proposing at that view. That let a single
+    // authenticated-but-malicious peer manufacture an endless stream of
+    // escalating "votes" that kept resetting every honest node's
+    // view-change timeout, so quorum could never form.
+    //
+    // The fix: a vote's view must match `stored_view` *exactly* - the
+    // view this candidate was actually cached under, which only ever
+    // happens via handle_proposal's own `p.sender == expected_proposer`
+    // check. A vote can never advance the view on its own; it can only
+    // ever agree with a view a legitimate proposal already established.
+    // (current_view(rs, height) is always >= stored_view by the time a
+    // candidate is cached - handle_proposal updates one right before
+    // the other - so this one equality check also covers the old
+    // stale-vote rejection; nothing can slip through at < stored_view
+    // either, since that's < current_view too.)
+    if v.view != stored_view {
+        warn(format!(
+            "ignoring vote from {} claiming view {} for height {} - the cached candidate is at view {stored_view}",
             v.sender, v.view, block.height
-        );
+        ));
         return;
     }
     let Some(sig) = decode_signature(&v.sig_hex) else { return };
@@ -789,12 +806,6 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
         return;
     }
     ctx.metrics.record_peer_seen(v.sender); // no-op if v.sender is this node's own id
-
-    if v.view > current_view(rs, block.height) {
-        rs.view_for_height.insert(block.height, v.view);
-        rs.waiting_for = Some((block.height, v.view));
-        rs.waiting_since = Some(tokio::time::Instant::now());
-    }
 
     let tally = rs.votes.entry(v.block_hash.clone()).or_default();
     if !tally.iter().any(|e| e.node_id == v.sender) {
@@ -870,6 +881,13 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     rs.candidates.retain(|_, (_, b)| b.height > block.height);
     let surviving: std::collections::HashSet<String> = rs.candidates.keys().cloned().collect();
     rs.votes.retain(|h, _| surviving.contains(h));
+    // A real gap a focused code review caught: this used to prune
+    // candidates/votes down to heights still in play but never
+    // view_for_height, so any height that ever needed a view-change
+    // (common in practice, not rare) left a permanent entry behind for
+    // the life of the process - unbounded growth on a long-running
+    // node. Mirrors the retain pattern above.
+    rs.view_for_height.retain(|&h, _| h > block.height);
     // Not strictly required (the next tick's height/view mismatch in
     // maybe_bump_view would reset this anyway), but explicit here:
     // whatever this node was timing out on is resolved now that the
@@ -892,12 +910,24 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
     let values: Vec<Vec<f64>> = ids.iter().map(|id| rs.latest_observations[id].clone()).collect();
     let weights: Vec<f64> =
         ids.iter().map(|&id| if id == node.node_id { 1.0 } else { *node.reliability.get(&id).unwrap_or(&0.5) }).collect();
-    let share = 1.0 / ids.len() as f64;
+    let total_weight: f64 = weights.iter().sum();
 
     for (idx, &peer_id) in ids.iter().enumerate() {
         if peer_id == node.node_id {
             continue;
         }
+        // A real bug a focused code review caught: this used to be a
+        // flat `1.0 / ids.len()` for every peer, ignoring
+        // trust::update_edge_weight's own documented contract (see
+        // tri_sync_core/src/trust.rs) that `share` is this peer's
+        // share of this node's *total* incoming trust - i.e.
+        // weight-proportional, not uniform. A barely-trusted peer's
+        // edge weight was swinging exactly as fast as an established
+        // peer's for the same-sized error, defeating the point of
+        // weighting trust at all. Falls back to the old uniform value
+        // only if every weight were somehow zero - defensive, not
+        // expected, since this node's own entry is always 1.0 above.
+        let share = if total_weight > 0.0 { weights[idx] / total_weight } else { 1.0 / ids.len() as f64 };
         let without_values: Vec<Vec<f64>> = values.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, v)| v.clone()).collect();
         let without_weights: Vec<f64> = weights.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, w)| *w).collect();
         if without_values.is_empty() {
@@ -1458,14 +1488,20 @@ mod tests {
 
         handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: ahead_view, block: block.clone() }).await;
 
-        assert_eq!(current_view(&rs, 2), ahead_view, "this node should have caught up to the peer's higher view");
         // With only two participants, the proposer's own signature plus
         // this node's vote already meets quorum (2), so catch-up here
-        // goes all the way to a real commit - not just passive caching
-        // - which is the actually-correct end-to-end outcome.
+        // goes all the way to a real commit in this same call - not
+        // just passive caching - which is the actually-correct
+        // end-to-end outcome. (Checking current_view(&rs, 2) here
+        // would no longer prove anything either way: maybe_commit now
+        // prunes view_for_height for a height the instant it commits,
+        // so its absence just means "committed", not "never caught
+        // up" - the commit itself, signed at ahead_view, is the real
+        // proof the catch-up happened.)
         let committed = node.chain.last().expect("chain should have advanced");
         assert_eq!(committed.hash, block.hash, "the block from the higher view should be the one that committed");
         assert_eq!(committed.sig_weight, 2.0, "proposer's signature plus this node's vote");
+        assert!(!rs.view_for_height.contains_key(&2), "the now-committed height's view bookkeeping should be pruned");
     }
 
     /// Builds a `BlockProposalMsg` genuinely signed by `signer_sk` as
@@ -1495,6 +1531,155 @@ mod tests {
         }];
         block.sig_weight = sig_weight;
         BlockProposalMsg { sender, view, block }
+    }
+
+    fn signed_vote(sender: usize, signer_sk: &ed25519_dalek::SigningKey, block_hash: &str, view: u64, block: &Block) -> BlockVoteMsg {
+        let signing_canon = protocol::view_block_canon(view, block);
+        let sig = crypto::sign_canon(signer_sk, &signing_canon);
+        BlockVoteMsg {
+            sender,
+            view,
+            block_hash: block_hash.to_string(),
+            pubkey_hex: hex::encode(signer_sk.verifying_key().to_bytes()),
+            sig_hex: hex::encode(sig.to_bytes()),
+        }
+    }
+
+    /// A real bug a focused code review caught: `apply_trust_updates`
+    /// used to pass the same flat `1/n` share to every peer regardless
+    /// of their actual reliability, when `trust::update_edge_weight`'s
+    /// own contract says `share` must be weight-proportional. Proven
+    /// here the direct way: run the identical scenario (same
+    /// observations, same committed block.state, same starting
+    /// edge_weight) twice, differing only in the peer's starting
+    /// `reliability` (which feeds into its `weights` entry and so its
+    /// `share`) - under the old flat-share bug the two runs produced
+    /// byte-identical resulting edge weights; under the fix they must
+    /// differ, since a higher-weight peer now gets a proportionally
+    /// larger adjustment for the same-sized error.
+    #[tokio::test]
+    async fn apply_trust_updates_gives_a_higher_weight_peer_a_larger_adjustment_for_the_same_error() {
+        async fn run_with_peer_reliability(peer_reliability: f64) -> f64 {
+            let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1
+            let dir = crate::test_support::TempDir::new(&format!("trust_share_{peer_reliability}"));
+            let store = Store::open(dir.path()).unwrap();
+            let mut node = NodeState {
+                node_id: 0,
+                chain: vec![Block::genesis(1)],
+                signing_key: self_sk.clone(),
+                verifying_key: self_sk.verifying_key(),
+                epoch: 0,
+                edge_weight: HashMap::from([(1, 1.0)]),
+                reliability: HashMap::from([(1, peer_reliability)]),
+            };
+            let mut rs = RoundState::default();
+            rs.latest_observations.insert(0, vec![0.0]);
+            rs.latest_observations.insert(1, vec![10.0]);
+            // block.state is deliberately independent of any real
+            // fusion output - apply_trust_updates only ever measures
+            // distances *from* it, so an arbitrary fixed value is
+            // enough to drive a reproducible, comparable delta_e.
+            let block = Block { height: 1, state: vec![5.0], ..Block::genesis(1) };
+
+            apply_trust_updates(&ctx, &mut node, &store, &block, &rs).await;
+
+            *node.edge_weight.get(&1).unwrap()
+        }
+
+        let low_weight_result = run_with_peer_reliability(0.1).await;
+        let high_weight_result = run_with_peer_reliability(0.9).await;
+
+        assert_ne!(
+            low_weight_result, high_weight_result,
+            "share must depend on the peer's actual weight - under the flat-1/n bug these were identical regardless of reliability"
+        );
+    }
+
+    /// A real liveness bug a focused adversarial code review caught,
+    /// not any test: `handle_vote` used to treat `v.view > current_view`
+    /// alone as proof a round at that view really happened and adopt
+    /// it, resetting the view-change timeout - but a vote is self-signed
+    /// by the voter alone, who can construct `view_block_canon(view,
+    /// block)` for *any* view over a block they already know about,
+    /// with no proposer ever actually proposing at that view. That let
+    /// a single authenticated peer manufacture an endless stream of
+    /// escalating fake votes and keep the network from ever holding a
+    /// view still long enough to reach quorum. Proven fixed here: a
+    /// vote claiming a view that doesn't match the view the candidate
+    /// was actually cached under must be rejected outright, with no
+    /// effect on this node's view bookkeeping at all.
+    #[tokio::test]
+    async fn a_vote_claiming_a_different_view_than_the_cached_candidate_cannot_escalate_the_view() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, all_ids=[0,1]
+        let dir = crate::test_support::TempDir::new("vote_view_escalation_attack");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // A genuine candidate, legitimately cached at view 0 (as
+        // handle_proposal would have left it after accepting a real
+        // proposal - constructed directly here since only the cached
+        // (view, block) state matters for this test).
+        let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
+        let block_hash = proposal.block.hash.clone();
+        rs.candidates.insert(block_hash.clone(), (0, proposal.block.clone()));
+        rs.votes.insert(block_hash.clone(), proposal.block.signatures.clone());
+        assert_eq!(current_view(&rs, 1), 0);
+
+        // The attack: peer 1 (a real, correctly-configured peer) signs
+        // a "vote" for that same block claiming view 99 - perfectly
+        // valid cryptographically, since they hold the real key and
+        // can sign any view_block_canon they like.
+        let fake_escalation = signed_vote(1, &peer_sk, &block_hash, 99, &proposal.block);
+        handle_vote(&ctx, &mut node, &store, &mut rs, fake_escalation).await;
+
+        assert_eq!(current_view(&rs, 1), 0, "a vote alone must never be able to advance the view");
+        assert!(rs.waiting_for.is_none(), "no legitimate view-change timeout should have been touched");
+        assert_eq!(rs.votes.get(&block_hash).unwrap().len(), 1, "the fabricated vote must not be tallied");
+        assert_eq!(node.chain.len(), 1, "nothing should have committed off a rejected vote");
+    }
+
+    /// The flip side: a genuine vote whose claimed view matches the
+    /// view the candidate was actually cached under must still work
+    /// normally and be able to reach quorum - the fix above closes a
+    /// hole without breaking real voting.
+    #[tokio::test]
+    async fn a_genuine_vote_at_the_candidates_actual_view_is_accepted_and_can_reach_quorum() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, quorum=2
+        let dir = crate::test_support::TempDir::new("vote_genuine_view_match");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
+        let block_hash = proposal.block.hash.clone();
+        rs.candidates.insert(block_hash.clone(), (0, proposal.block.clone()));
+        rs.votes.insert(block_hash.clone(), proposal.block.signatures.clone());
+
+        // Node 0's own vote, matching the candidate's real view - the
+        // second signature needed to reach the 2-of-2 quorum.
+        let my_vote = signed_vote(0, &self_sk, &block_hash, 0, &proposal.block);
+        handle_vote(&ctx, &mut node, &store, &mut rs, my_vote).await;
+
+        let committed = node.chain.last().expect("a genuine matching-view vote should have let this commit");
+        assert_eq!(committed.hash, block_hash);
+        assert_eq!(committed.sig_weight, 2.0);
     }
 
     /// The bug this stage's own code review caught before any test
@@ -1697,6 +1882,52 @@ mod tests {
 
         assert_eq!(node.chain.len(), 2, "a second candidate for an already-committed height must never be committed on top");
         assert_eq!(node.chain.last().unwrap().hash, first_hash, "the real committed block must be untouched");
+    }
+
+    /// A real resource leak a focused code review caught: `maybe_commit`
+    /// pruned `candidates`/`votes` down to heights still in play but
+    /// never `view_for_height`, so a height that needed a view-change -
+    /// common in practice, not a corner case - left a permanent entry
+    /// behind for the life of the process. Proven fixed by driving a
+    /// real commit through a height that has a view-change entry and
+    /// confirming it's gone afterward.
+    #[tokio::test]
+    async fn maybe_commit_prunes_view_for_height_for_the_height_that_just_committed() {
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: vec![],
+        };
+        let endpoint = net::make_client_endpoint().unwrap();
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let dir = crate::test_support::TempDir::new("prune_view_for_height");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        rs.latest_observations.insert(0, vec![1.0, 1.0]);
+        // Simulates height 1 having already gone through a view-change
+        // up to view 3 before the eventually-successful proposal.
+        rs.view_for_height.insert(1, 3);
+
+        let head = node.head().clone();
+        propose_block(&ctx, &mut node, &store, &mut rs, &head, 3).await;
+
+        assert_eq!(node.chain.len(), 2, "1-of-1 quorum should commit immediately");
+        assert!(!rs.view_for_height.contains_key(&1), "the committed height's view-change bookkeeping must be pruned, not kept forever");
     }
 
     /// Drives a real single-node (1-of-1 quorum) chain across a real
