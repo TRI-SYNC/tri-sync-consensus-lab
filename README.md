@@ -7,6 +7,17 @@ agreement across noisy, adversarial nodes; telemetry-instrumented. One
 variant (`tri_sync_chain_crypto`) adds real Ed25519 signing and epoch
 key rotation - the rest have no cryptography. Cargo package: `tri_sync`.
 
+This same repository also contains the real product built on what the
+simulation proved out: `tri_sync_core` and `tri_sync_node`, a
+self-hosted, licensed, network-capable consensus node (real QUIC+TLS
+transport, Ed25519-signed messages, LMDB persistence, Prometheus
+metrics) - see
+[The networked node (`tri_sync_node`)](#the-networked-node-tri_sync_node)
+below. The sections above and immediately below this one (What's here
+through Testing) describe only the single-process simulation; the
+networked node has its own section with its own Running/Testing/
+Known-limitations breakdown.
+
 ## What's here
 
 - `src/invariants.rs` — the `clarity_gate` a node applies to its own
@@ -289,6 +300,119 @@ streaming and connection-cap tests were run against a temporarily
 reintroduced version of the bug they're meant to catch (the old
 batch-response behavior; the cap check disabled) to confirm they
 actually fail, not just that they currently pass.
+
+## The networked node (`tri_sync_node`)
+
+Everything above this section describes `tri_sync`, the single-process
+simulation workspace used to design and validate the consensus/trust
+logic in isolation. This section describes the other two workspace
+members built on top of that validated logic: `tri_sync_core` (the
+pure consensus/trust/fusion/chain code, extracted with no I/O
+dependencies) and `tri_sync_node` (a real, self-hosted, licensed,
+network-capable consensus node - independent OS processes exchanging
+real signed messages over a real network, not a loop simulating many
+nodes in one process).
+
+What it actually is:
+
+- **Real transport.** Peers connect over QUIC with TLS 1.3
+  (`quinn`/`rustls`), not an in-process channel.
+- **Real cryptography.** Every proposal, vote, observation,
+  trust-update, and key-rotation message is Ed25519-signed and
+  verified against a known peer key before any of its content is
+  trusted - see `tri_sync_node::protocol`'s per-message canonical
+  signing strings.
+- **Real persistence.** Blocks, the trust graph, peer keys, and epoch
+  metadata are stored in LMDB (`tri_sync_node::persistence`) and
+  restored on restart.
+- **Real operational surface.** A Prometheus `/metrics` endpoint,
+  per-peer health tracking, clean SIGTERM/SIGINT shutdown, timestamped
+  logs, an offline Ed25519-signed license file
+  (`license.toml`/`LICENSE_PUBLIC_KEY_HEX`) gating node count and
+  feature flags, and an in-band key-rotation flow
+  (`--rotate-key`) for rotating a node's identity without taking the
+  whole network down.
+- **Real BFT-lite consensus over the wire**: round-robin proposer
+  selection, majority quorum, a liveness fallback that bumps the view
+  and hands off to the next proposer after a timeout, and fork
+  detection/logging - see `tri_sync_node::consensus`'s module doc
+  comment for the full, precise account of what is and isn't covered
+  (it is the authoritative source; this README summarizes it).
+
+### Running
+
+```bash
+# One-time per node: generate node.toml (see tri_sync_node/src/config.rs
+# for every field) and a license.toml (tri_sync_node/license.example.toml
+# is a real, working fixture signed with a development-only key - replace
+# LICENSE_PUBLIC_KEY_HEX in src/license.rs with a production key before
+# issuing real licenses).
+cargo run --bin tri_sync_node -- node.toml --show-identity   # prints this node's pubkey, then exits
+cargo run --bin tri_sync_node -- node.toml                   # starts the QUIC server + consensus loop, runs until killed
+cargo run --bin tri_sync_node -- node.toml --duration 60      # same, but exits cleanly after 60s (for scripted runs)
+cargo run --bin tri_sync_node -- node.toml --rotate-key       # rotates this node's signing key and announces it to its configured peers; stop the node first (see the flag's own doc comment in main.rs for why)
+```
+
+### Testing
+
+```bash
+cargo test --workspace     # includes tri_sync_core and tri_sync_node
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`tri_sync_node`'s own test suite (116 tests at time of writing) covers
+each message handler directly with real Ed25519 keys and real
+`view_block_canon`/`block_canon` signing - not mocks - including a
+dedicated adversarial-input test for every bug this project's own
+focused code-review passes have found (forged signatures, replayed/
+escalating views, malformed peer keys, a flooding expected proposer),
+plus one real two-process end-to-end test that spins up two actual OS
+processes talking QUIC over real sockets and asserts they converge on
+the same committed chain.
+
+### Known limitations and roadmap
+
+Disclosed plainly, not glossed over - the authoritative, always-current
+version of this list is `tri_sync_node::consensus`'s own module doc
+comment; the items below are the two that are large enough to call out
+at the README level rather than fix as a quick patch:
+
+1. **No full BFT locking / quorum certificates.** The liveness fallback
+   (view-change) lets a node advance past a stalled proposer, but a
+   node only *locks* its vote implicitly - by however far signature/
+   expected-proposer checks let it advance - not via a quorum-certificate
+   ("this view genuinely failed") proof. In an adversarial or
+   badly-partitioned network this leaves a real, if narrow, window
+   where votes could in principle split across two views' candidates
+   for the same height. What *is* already covered and tested: a single
+   node can never locally commit two different blocks at the same
+   height, and a proposal for an already-committed height that would
+   rank above what was actually committed is detected and logged as a
+   safety violation rather than silently auto-reorged. Closing the
+   remaining window needs a real precommit/quorum-certificate protocol
+   - a multi-week, research-grade undertaking, not a patch - and is
+   tracked as a v2 item rather than attempted piecemeal here. (Several
+   shipped BFT systems, e.g. early Tendermint, took the same sequencing:
+   ship a working v1 liveness/safety core, add full locking as a
+   dedicated follow-up.)
+2. **No dynamic peer membership.** `--rotate-key` only ever updates the
+   *key* of an already-configured peer id; it cannot add, remove, or
+   discover peers, and never touches `all_ids`/quorum/`network_size`,
+   which stay exactly as `node.toml` originally described. Safely
+   changing who counts toward quorum at runtime needs its own agreement
+   protocol over the membership set itself - also tracked as a v2 item,
+   not a fast follow.
+
+One resource-exhaustion item in the same family *was* closed, as a
+demonstration that "disclosed" items get revisited rather than
+forgotten once genuinely scoped: `RoundState`'s `candidates`/`votes`
+maps are now capped (`MAX_CANDIDATES_PER_HEIGHT`) against a
+legitimate-but-malicious expected proposer signing unboundedly many
+distinct blocks for the same (height, view) - a real, but much smaller
+and independently fixable, resource-exhaustion vector than the two
+above, verified with a dedicated test that floods past the cap and
+confirms both the bound holds and legitimate quorum-forming traffic is
+unaffected.
 
 ## License
 

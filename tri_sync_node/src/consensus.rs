@@ -92,13 +92,18 @@
 //!   dependency-free calendar math) - added directly because of a real
 //!   debugging session (Hardening 8's live rotation test) where
 //!   correlating two unstamped node logs by eye was slow enough to
-//!   nearly obscure the actual bug. What this pass does NOT attempt:
-//!   bounding `RoundState`'s `candidates`/`votes` maps against a
+//!   nearly obscure the actual bug.
+//! - `RoundState`'s `candidates`/`votes` maps are now capped
+//!   (`MAX_CANDIDATES_PER_HEIGHT`, in `handle_proposal`): a
 //!   legitimate-but-malicious expected proposer flooding many distinct
-//!   signed proposals for one (height, view) - a real, narrow
-//!   resource-exhaustion vector, but a different kind of fix (a cap
-//!   with its own eviction policy) than anything else in this pass,
-//!   left for a dedicated look rather than bolted on here.
+//!   signed proposals for one (height, view) used to grow both maps
+//!   without bound, since nothing prunes them until the height
+//!   actually commits. A new hash is dropped once the current height
+//!   already has `MAX_CANDIDATES_PER_HEIGHT` distinct candidates
+//!   cached; a repeat of an already-cached hash is unaffected, so its
+//!   vote tally can still reach quorum normally. The cap is sized to
+//!   absorb several honest view-changes' worth of legitimate
+//!   candidates, not just one.
 
 use crate::config::NodeConfig;
 use crate::health;
@@ -121,6 +126,16 @@ use tri_sync_core::crypto;
 use tri_sync_core::fusion;
 use tri_sync_core::trust;
 
+/// Caps how many distinct candidate block hashes `RoundState` will ever
+/// track for a single height at once - see `handle_proposal`'s use of
+/// it, and the module doc comment's note on the resource-exhaustion
+/// vector this closes. Sized generously enough for several honest
+/// view-changes to each leave behind their own legitimate candidate
+/// (a real, if unusual, pattern - not just the attack), while still
+/// bounding a *malicious* expected proposer's ability to flood many
+/// distinct signed proposals for one (height, view) into unbounded
+/// memory growth.
+const MAX_CANDIDATES_PER_HEIGHT: usize = 8;
 const TRIM_FRAC: f64 = 0.2;
 const RELIABILITY_ALPHA: f64 = 0.3;
 const RELIABILITY_FLOOR: f64 = 0.05;
@@ -728,6 +743,26 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     if is_new_fork {
         ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
         log(format!("fork observed at height={}: competing candidate {block_hash}", p.block.height));
+    }
+    // Closes a real, disclosed resource-exhaustion vector: a
+    // legitimate-but-malicious expected proposer is still free to sign
+    // many *distinct* blocks for the same (height, view) - nothing
+    // above this point depends on content, only on who's allowed to
+    // propose - and each distinct hash would otherwise grow
+    // `candidates`/`votes` forever, since neither is pruned until the
+    // height actually commits (see `maybe_commit`). Only a brand-new
+    // hash is capped; a repeat of one already cached still proceeds
+    // below so its vote tally can keep growing toward quorum.
+    if !rs.candidates.contains_key(&block_hash) {
+        let distinct_at_height = rs.candidates.values().filter(|(_, b)| b.height == p.block.height).count();
+        if distinct_at_height >= MAX_CANDIDATES_PER_HEIGHT {
+            warn(format!(
+                "dropping proposal from {} for height {} - already tracking {MAX_CANDIDATES_PER_HEIGHT} distinct \
+                 candidates there (resource-exhaustion cap)",
+                p.sender, p.block.height
+            ));
+            return;
+        }
     }
     rs.candidates.entry(block_hash.clone()).or_insert_with(|| (p.view, p.block.clone()));
     let tally = rs.votes.entry(block_hash.clone()).or_default();
@@ -1509,10 +1544,27 @@ mod tests {
     /// set afterward to whatever the test wants to claim (never covered
     /// by the signature - see the long comment in `handle_proposal`).
     fn signed_proposal(sender: usize, signer_sk: &ed25519_dalek::SigningKey, height: u64, parent: &str, view: u64, sig_weight: f64) -> BlockProposalMsg {
+        signed_proposal_with_state(sender, signer_sk, height, parent, view, sig_weight, vec![height as f64, height as f64])
+    }
+
+    /// Same as `signed_proposal`, but with an explicit `state` vector -
+    /// lets a test construct multiple distinctly-hashed blocks for the
+    /// same height/view (`state` feeds `block_canon`, so varying it is
+    /// the whole point here, e.g. for `MAX_CANDIDATES_PER_HEIGHT`'s
+    /// cap test).
+    fn signed_proposal_with_state(
+        sender: usize,
+        signer_sk: &ed25519_dalek::SigningKey,
+        height: u64,
+        parent: &str,
+        view: u64,
+        sig_weight: f64,
+        state: Vec<f64>,
+    ) -> BlockProposalMsg {
         let mut block = Block {
             height,
             parent: parent.to_string(),
-            state: vec![height as f64, height as f64],
+            state,
             confidence: 0.9,
             reconciles: vec![],
             epoch: 0,
@@ -1827,6 +1879,89 @@ mod tests {
 
         assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 0, "a weaker competing block is not a safety violation worth counting");
         assert_eq!(node.chain.last().unwrap().hash, "real-head-1");
+    }
+
+    /// The resource-exhaustion vector this module's doc comment
+    /// disclosed and `MAX_CANDIDATES_PER_HEIGHT` now closes: nothing
+    /// before the new cap check depends on a proposal's *content*,
+    /// only on whether `p.sender` is the legitimately expected
+    /// proposer for that (height, view) - so that one real peer, using
+    /// only their genuine key, could previously sign an unbounded
+    /// number of distinctly-hashed blocks for the same (height, view)
+    /// and grow `candidates`/`votes` forever (neither is pruned until
+    /// the height actually commits). Proven here by sending one more
+    /// distinct proposal than the cap allows, from the real expected
+    /// proposer each time, and checking the maps stopped growing - not
+    /// just asserted from reading the code.
+    #[tokio::test]
+    async fn candidates_per_height_are_capped_against_a_flooding_expected_proposer() {
+        use crate::config::PeerConfig;
+        // 4 participants (quorum = 3) rather than `test_ctx_with_one_peer`'s
+        // 2 (quorum = 2): with only 2, the very first flood proposal's
+        // embedded signature plus this node's own automatic vote would
+        // already reach quorum and commit immediately, pruning
+        // `candidates` right back down to empty before the flood could
+        // ever be observed accumulating. With quorum 3, two signatures
+        // (proposer + self) leave every flooded candidate genuinely
+        // pending, which is what this test needs to see.
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let other_sks = [ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng), ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)];
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: vec![
+                PeerConfig { id: 1, addr: "127.0.0.1:1".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) },
+                PeerConfig { id: 2, addr: "127.0.0.1:2".to_string(), pubkey_hex: hex::encode(other_sks[0].verifying_key().to_bytes()) },
+                PeerConfig { id: 3, addr: "127.0.0.1:3".to_string(), pubkey_hex: hex::encode(other_sks[1].verifying_key().to_bytes()) },
+            ],
+        };
+        let peers = HashMap::from([
+            (1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key(), rotation_seq: 0 }),
+            (2, PeerInfo { addr: "127.0.0.1:2".parse().unwrap(), pubkey: other_sks[0].verifying_key(), rotation_seq: 0 }),
+            (3, PeerInfo { addr: "127.0.0.1:3".parse().unwrap(), pubkey: other_sks[1].verifying_key(), rotation_seq: 0 }),
+        ]);
+        let endpoint = net::make_client_endpoint().unwrap();
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: vec![0, 1, 2, 3], endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
+        let dir = crate::test_support::TempDir::new("candidate_flood_cap");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        for i in 0..(MAX_CANDIDATES_PER_HEIGHT + 3) {
+            let proposal = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![i as f64, 0.0]);
+            handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
+        }
+
+        let distinct_at_height_1 = rs.candidates.values().filter(|(_, b)| b.height == 1).count();
+        assert_eq!(distinct_at_height_1, MAX_CANDIDATES_PER_HEIGHT, "the cap must hold even though every flood message was genuinely signed");
+        assert_eq!(rs.votes.len(), MAX_CANDIDATES_PER_HEIGHT, "votes is only ever populated alongside candidates, so it must be bounded the same way");
+
+        // The flip side: the very first candidate (cached before the
+        // cap was ever hit, and already carrying 2 of the 3 signatures
+        // it needs - peer 1's embedded proposal plus node 0's own
+        // automatic vote from inside `handle_proposal`) must still be
+        // perfectly usable - the cap rejects brand-new hashes once
+        // full, it does not evict or disturb anything already cached.
+        let first = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![0.0, 0.0]);
+        assert!(rs.candidates.contains_key(&first.block.hash), "a candidate cached before the cap filled up must not have been evicted");
+        assert_eq!(rs.votes.get(&first.block.hash).unwrap().len(), 2, "proposer + this node's own auto-vote, from the flood loop above");
+        let third_vote = signed_vote(2, &other_sks[0], &first.block.hash, 0, &first.block);
+        handle_vote(&ctx, &mut node, &store, &mut rs, third_vote).await;
+        assert_eq!(node.chain.last().unwrap().hash, first.block.hash, "quorum must still be reachable for an already-cached candidate despite the flood");
     }
 
     /// The structural claim documented in this module's doc comment:
