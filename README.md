@@ -316,15 +316,19 @@ nodes in one process).
 What it actually is:
 
 - **Real transport.** Peers connect over QUIC with TLS 1.3
-  (`quinn`/`rustls`), not an in-process channel.
-- **Real cryptography.** Every proposal, vote, observation,
-  trust-update, and key-rotation message is Ed25519-signed and
-  verified against a known peer key before any of its content is
+  (`quinn`/`rustls`). Each node's certificate is generated from its own
+  Ed25519 identity key, and every outbound connection is pinned to the
+  specific peer being dialed - a validly self-signed certificate for
+  the wrong identity is rejected before a single message is sent, not
+  just caught later at the message layer.
+- **Real cryptography.** Every proposal, vote, precommit, observation,
+  trust-update, key-rotation, and chain-sync message is Ed25519-signed
+  and verified against a known peer key before any of its content is
   trusted - see `tri_sync_node::protocol`'s per-message canonical
   signing strings.
-- **Real persistence.** Blocks, the trust graph, peer keys, and epoch
-  metadata are stored in LMDB (`tri_sync_node::persistence`) and
-  restored on restart.
+- **Real persistence.** Blocks, the trust graph, peer keys, epoch
+  metadata, and this node's current consensus lock are stored in LMDB
+  (`tri_sync_node::persistence`) and restored on restart.
 - **Real operational surface.** A Prometheus `/metrics` endpoint,
   per-peer health tracking, clean SIGTERM/SIGINT shutdown, timestamped
   logs, an offline Ed25519-signed license file
@@ -332,12 +336,16 @@ What it actually is:
   feature flags, and an in-band key-rotation flow
   (`--rotate-key`) for rotating a node's identity without taking the
   whole network down.
-- **Real BFT-lite consensus over the wire**: round-robin proposer
-  selection, majority quorum, a liveness fallback that bumps the view
-  and hands off to the next proposer after a timeout, and fork
-  detection/logging - see `tri_sync_node::consensus`'s module doc
-  comment for the full, precise account of what is and isn't covered
-  (it is the authoritative source; this README summarizes it).
+- **Real BFT consensus over the wire**: round-robin proposer selection,
+  a two-phase prevote/precommit quorum-certificate protocol (a node
+  locks onto a candidate only once it independently observes a real
+  prevote quorum, and a block commits only once a precommit quorum is
+  reached), a liveness fallback that bumps the view and hands off to
+  the next proposer after a timeout, chain-sync for a node that's
+  fallen behind on a committed height, and fork detection/logging - see
+  `tri_sync_node::consensus`'s module doc comment for the full, precise
+  account of what is and isn't covered (it is the authoritative
+  source; this README summarizes it).
 
 ### Running
 
@@ -360,7 +368,7 @@ cargo test --workspace     # includes tri_sync_core and tri_sync_node
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`tri_sync_node`'s own test suite (116 tests at time of writing) covers
+`tri_sync_node`'s own test suite (132 tests at time of writing) covers
 each message handler directly with real Ed25519 keys and real
 `view_block_canon`/`block_canon` signing - not mocks - including a
 dedicated adversarial-input test for every bug this project's own
@@ -374,45 +382,58 @@ the same committed chain.
 
 Disclosed plainly, not glossed over - the authoritative, always-current
 version of this list is `tri_sync_node::consensus`'s own module doc
-comment; the items below are the two that are large enough to call out
-at the README level rather than fix as a quick patch:
+comment. As of this commit there is exactly one remaining item large
+enough to call out at the README level rather than fix as a quick patch:
 
-1. **No full BFT locking / quorum certificates.** The liveness fallback
-   (view-change) lets a node advance past a stalled proposer, but a
-   node only *locks* its vote implicitly - by however far signature/
-   expected-proposer checks let it advance - not via a quorum-certificate
-   ("this view genuinely failed") proof. In an adversarial or
-   badly-partitioned network this leaves a real, if narrow, window
-   where votes could in principle split across two views' candidates
-   for the same height. What *is* already covered and tested: a single
-   node can never locally commit two different blocks at the same
-   height, and a proposal for an already-committed height that would
-   rank above what was actually committed is detected and logged as a
-   safety violation rather than silently auto-reorged. Closing the
-   remaining window needs a real precommit/quorum-certificate protocol
-   - a multi-week, research-grade undertaking, not a patch - and is
-   tracked as a v2 item rather than attempted piecemeal here. (Several
-   shipped BFT systems, e.g. early Tendermint, took the same sequencing:
-   ship a working v1 liveness/safety core, add full locking as a
-   dedicated follow-up.)
-2. **No dynamic peer membership.** `--rotate-key` only ever updates the
+1. **No dynamic peer membership.** `--rotate-key` only ever updates the
    *key* of an already-configured peer id; it cannot add, remove, or
    discover peers, and never touches `all_ids`/quorum/`network_size`,
    which stay exactly as `node.toml` originally described. Safely
    changing who counts toward quorum at runtime needs its own agreement
-   protocol over the membership set itself - also tracked as a v2 item,
-   not a fast follow.
+   protocol over the membership set itself - tracked as the next item
+   in this same push, not a fast follow left for later.
 
-One resource-exhaustion item in the same family *was* closed, as a
-demonstration that "disclosed" items get revisited rather than
-forgotten once genuinely scoped: `RoundState`'s `candidates`/`votes`
-maps are now capped (`MAX_CANDIDATES_PER_HEIGHT`) against a
-legitimate-but-malicious expected proposer signing unboundedly many
-distinct blocks for the same (height, view) - a real, but much smaller
-and independently fixable, resource-exhaustion vector than the two
-above, verified with a dedicated test that floods past the cap and
-confirms both the bound holds and legitimate quorum-forming traffic is
-unaffected.
+Four items in the same family *were* closed, as a demonstration that
+"disclosed" items get revisited and actually fixed once genuinely
+scoped, rather than forgotten:
+
+- **BFT locking / quorum certificates.** The liveness fallback
+  (view-change) used to let a node advance past a stalled proposer
+  while only *locking* its vote implicitly - by however far signature/
+  expected-proposer checks let it advance, never via a real
+  quorum-certificate proof that an earlier view genuinely failed. In
+  an adversarial or badly-partitioned network that left a real window
+  where votes could split across two views' candidates for the same
+  height. Closed with a real two-phase prevote/precommit protocol: a
+  node only locks once its own prevote tally for a (block, view) pair
+  reaches quorum - a genuine polka, not a claim - and a block commits
+  only once a *precommit* quorum (domain-separated signatures,
+  never replayable from a prevote) is reached. Proven, not just
+  implemented: a dedicated test drives two disjoint, individually
+  legitimate candidates for the same height through a real 4-node
+  quorum and confirms only one of them can ever reach a precommit QC.
+- **TLS transport identity.** The QUIC transport used to encrypt every
+  connection with a throwaway, unrelated certificate and accept any
+  server certificate at all - confidentiality with zero peer
+  authentication, resting entirely on message-level signing instead.
+  Closed: each node's certificate is now generated from its real
+  Ed25519 identity key, and every outbound connection is pinned to the
+  specific peer being dialed, rejecting a real, validly self-signed
+  certificate for the wrong identity before a single message is sent.
+- **Chain-sync.** A node behind on an already-*committed* height (not
+  merely a view, which the liveness fallback already handled) used to
+  have no recovery path at all. Closed: `handle_proposal` triggers a
+  debounced sync request the moment it sees evidence it's behind;
+  every synced block is verified independently of whoever relayed it
+  (content hash plus a real reconstructed precommit quorum), never
+  trusted merely because the response envelope was validly signed.
+- **Resource exhaustion.** `RoundState`'s candidate/vote maps are now
+  capped (`MAX_CANDIDATES_PER_HEIGHT`) against a legitimate-but-malicious
+  expected proposer signing unboundedly many distinct blocks for the
+  same (height, view).
+
+Each of the four above has a dedicated test proving the actual
+property closed, not just that the new code runs.
 
 ## License
 

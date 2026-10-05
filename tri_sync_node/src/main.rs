@@ -50,13 +50,12 @@ async fn main() -> ExitCode {
     // for as long as it's up, so a peer that already accepted the new
     // key correctly rejects those late old-key messages (expected) -
     // but if one of those rejected messages was this node's own vote
-    // on a block the peer is actively trying to commit, that peer can
-    // be left permanently stuck on that height, because a node that's
-    // behind another by a committed height (as opposed to merely a
-    // view) has no catch-up mechanism yet (see `consensus`'s module
-    // doc comment on chain-sync). Stopping first removes the race
-    // entirely: there's no old-keyed process left to send anything
-    // peers now correctly reject.
+    // on a block the peer is actively trying to commit, that peer
+    // could be left stuck on that height until chain-sync (see
+    // `consensus`'s module doc comment) kicks in and catches it back
+    // up on its own. Stopping first removes the race entirely: there's
+    // no old-keyed process left to send anything peers now correctly
+    // reject, so there's nothing to recover from in the first place.
     let mut duration_secs: Option<u64> = None;
     let mut show_identity_only = false;
     let mut rotate_key_only = false;

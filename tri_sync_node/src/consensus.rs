@@ -51,15 +51,34 @@
 //!   while the rotating node's own old process was still running let
 //!   it keep signing with the old key for a few more seconds, which
 //!   peers now correctly rejected (including that node's own vote on
-//!   a block a peer was mid-committing) - and since catching up on an
-//!   already-committed height a node is *behind* on isn't something
-//!   this node loop can do (only being behind on *view* has a
-//!   catch-up path, in `handle_proposal`/`handle_vote` below), that
-//!   peer got stuck on that height permanently. Not fixed by adding
-//!   chain-sync here (out of scope for this pass); fixed by requiring
-//!   the operator to stop the old process before rotating, which a
-//!   live rerun of the same two-process scenario confirmed resolves
-//!   it completely - see `main`'s `--rotate-key` doc comment.
+//!   a block a peer was mid-committing) - and at the time, catching up
+//!   on an already-committed height a node was *behind* on wasn't
+//!   something this node loop could do at all (only being behind on
+//!   *view* had a catch-up path). That's since been closed - see
+//!   "Chain-sync" below - but this bug was fixed the same way either
+//!   way: requiring the operator to stop the old process before
+//!   rotating, which a live rerun of the same two-process scenario
+//!   confirmed resolves it completely - see `main`'s `--rotate-key`
+//!   doc comment. Chain-sync would now also let a peer stuck like
+//!   this recover on its own rather than needing that operator step,
+//!   but the rotation race itself is still better prevented than
+//!   recovered from.
+//! - **Chain-sync**: a node behind on an already-*committed* height
+//!   (as opposed to merely a view, which the liveness fallback below
+//!   already handled) used to have no recovery path at all - a real,
+//!   disclosed gap, now closed. `handle_proposal` triggers
+//!   `maybe_request_sync` (debounced - `SYNC_REQUEST_COOLDOWN`) the
+//!   moment it sees a proposal for a height beyond what it has;
+//!   `handle_block_request`/`handle_block_response` do the actual
+//!   request/reply (capped at `MAX_SYNC_BATCH` blocks per response).
+//!   Every synced block is verified independently of whoever relayed
+//!   it - its content-hash, and a real quorum of precommit signatures
+//!   reconstructed via `Block::committed_at_view` (a new field this
+//!   pass added specifically so a block can be verified by someone
+//!   who wasn't there for the original round) - never trusted merely
+//!   because the response envelope itself was validly signed. See
+//!   `handle_block_response`'s own doc comment for the one disclosed
+//!   edge case this doesn't cover (a signer who's since rotated keys).
 //! - Liveness fallback (`maybe_bump_view` hands off to the next
 //!   proposer after a timeout, with catch-up so a lagging node adopts
 //!   a legitimate later view instead of rejecting it) is now backed by
@@ -143,7 +162,7 @@ use crate::license;
 use crate::metrics::Metrics;
 use crate::net;
 use crate::persistence::{LockRecord, PeerKeyRecord, Store, TrustEntry};
-use crate::protocol::{self, BlockProposalMsg, BlockVoteMsg, KeyRotationMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg};
+use crate::protocol::{self, BlockProposalMsg, BlockRequestMsg, BlockResponseMsg, BlockVoteMsg, KeyRotationMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg};
 use crate::state::NodeState;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::SeedableRng;
@@ -175,6 +194,14 @@ const RELIABILITY_CEIL: f64 = 1.0;
 const EDGE_ALPHA: f64 = 1.0;
 const EDGE_FLOOR: f64 = 0.02;
 const EDGE_CEIL: f64 = 3.0;
+/// Caps how many blocks a single `BlockResponseMsg` ever carries, so
+/// a node that's fallen far behind doesn't trigger one unbounded
+/// reply - a node still missing more than this re-requests from its
+/// new (partially caught-up) height, same as any other request.
+const MAX_SYNC_BATCH: usize = 64;
+/// Minimum time between this node's own chain-sync requests for the
+/// same target height - see `RoundState::last_sync_request`.
+const SYNC_REQUEST_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// `rotation_seq` is 0 for a peer still on its `node.toml`-configured
 /// key; a successful `handle_key_rotation` bumps it and replaces
@@ -266,6 +293,11 @@ struct RoundState {
     /// `maybe_bump_view`. `None` until the first tick sets it.
     waiting_for: Option<(u64, u64)>,
     waiting_since: Option<tokio::time::Instant>,
+    /// The height last requested via chain-sync, and when - see
+    /// `maybe_request_sync`. Debounces repeated requests triggered by
+    /// a burst of proposals/votes for the same height this node is
+    /// still behind on, rather than firing one request per message.
+    last_sync_request: Option<(u64, tokio::time::Instant)>,
 }
 
 /// A synthetic "true" trajectory every node observes noisily -
@@ -418,6 +450,27 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
             }
         });
     }
+}
+
+/// Sends `msg` to exactly one peer by id - the targeted counterpart
+/// to `broadcast`, used for chain-sync's request/response exchange,
+/// which has no reason to involve anyone but the one peer being asked
+/// or answered. Silently drops the send if `target` isn't a currently
+/// known peer (same "can't reach them, nothing to do" posture as a
+/// `broadcast` failure, just logged rather than tracked in peer
+/// health - a sync request/response isn't part of the steady-state
+/// traffic `crate::health` models).
+fn send_direct(ctx: &Ctx, target: usize, msg: &Message) {
+    let Some(peer) = ctx.peers.read().unwrap().get(&target).copied() else { return };
+    let endpoint = ctx.endpoint.clone();
+    let addr = peer.addr;
+    let pubkey = peer.pubkey;
+    let msg = msg.clone();
+    tokio::spawn(async move {
+        if let Err(e) = net::send_message(&endpoint, addr, Some(pubkey), &msg).await {
+            warn(format!("send to {addr} failed: {e}"));
+        }
+    });
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, UTC, built from the same dependency-free
@@ -649,6 +702,10 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
         signatures: vec![],
         sig_weight: 0.0,
         hash: String::new(),
+        // Not yet known - this block hasn't reached a precommit
+        // quorum at any view yet. maybe_commit fills in the real
+        // value right before persisting, once it has one.
+        committed_at_view: 0,
     };
     let identity_canon = protocol::block_canon(&block);
     block.hash = chain::block_hash(&identity_canon);
@@ -700,6 +757,8 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
             }
         }
         Message::KeyRotation(k) => handle_key_rotation(ctx, store, k).await,
+        Message::BlockRequest(req) => handle_block_request(ctx, node, req).await,
+        Message::BlockResponse(resp) => handle_block_response(ctx, node, store, rs, resp).await,
     }
 }
 
@@ -830,8 +889,19 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         }
         return;
     }
+    if p.block.height > head.height + 1 {
+        // This node is genuinely behind - not just seeing a same-
+        // height fork - so there's nothing safe to do with this
+        // specific proposal (it doesn't extend our head), but its
+        // mere existence is real evidence the network has moved
+        // further than we have. Ask its sender for what we're
+        // missing rather than silently dropping it with no recovery
+        // path at all - see this module's doc comment on chain-sync.
+        maybe_request_sync(ctx, node, rs, p.sender).await;
+        return;
+    }
     if p.block.parent != head.hash || p.block.height != head.height + 1 {
-        return; // premature - this node is behind and has no chain-sync capability yet
+        return; // mismatched parent at the next height - not a sync situation
     }
     // Reject only a *stale* view outright (replay of an abandoned
     // view - Hardening 3). A view *ahead* of what this node has
@@ -1134,6 +1204,12 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
 
     block.signatures = precommits;
     block.sig_weight = block.signatures.len() as f64;
+    // Freezes the view whose precommit QC this actually is, so anyone
+    // who didn't participate (a node catching up via chain-sync) can
+    // still reconstruct exactly what `signatures` was supposed to sign
+    // and verify it independently later - see `Block::committed_at_view`'s
+    // doc comment.
+    block.committed_at_view = view;
 
     apply_trust_updates(ctx, node, store, &block, rs).await;
 
@@ -1185,6 +1261,173 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     // height actually committed.
     rs.waiting_for = None;
     rs.waiting_since = None;
+}
+
+/// Chain-sync: asks `target` for every committed block starting at
+/// this node's current `head.height + 1`, debounced
+/// (`SYNC_REQUEST_COOLDOWN`) so a burst of proposals/votes for the
+/// same height this node is behind on fires one request, not one per
+/// message. Closes a real, previously-disclosed gap: a node behind
+/// on a *committed* height (as opposed to merely a view, which
+/// `maybe_bump_view`'s catch-up already handled) used to have no
+/// recovery path at all.
+async fn maybe_request_sync(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, target: usize) {
+    let from_height = node.head().height + 1;
+    let now = tokio::time::Instant::now();
+    if let Some((requested_height, requested_at)) = rs.last_sync_request {
+        if requested_height == from_height && now.duration_since(requested_at) < SYNC_REQUEST_COOLDOWN {
+            return;
+        }
+    }
+    rs.last_sync_request = Some((from_height, now));
+
+    let canon = protocol::block_request_canon(node.node_id, from_height);
+    let sig = crypto::sign_canon(&node.signing_key, &canon);
+    log(format!("requesting chain-sync from peer {target}, starting at height={from_height}"));
+    send_direct(
+        ctx,
+        target,
+        &Message::BlockRequest(BlockRequestMsg { sender: node.node_id, from_height, sig_hex: hex::encode(sig.to_bytes()) }),
+    );
+}
+
+/// Answers a [`BlockRequestMsg`] with every committed block this node
+/// has at or above `req.from_height`, oldest first, capped at
+/// `MAX_SYNC_BATCH` (a node further behind than that re-requests from
+/// its new, partially-caught-up height once it processes this batch -
+/// same debounced path as the first request). Sends nothing if this
+/// node has nothing at or above that height either.
+async fn handle_block_request(ctx: &Ctx, node: &NodeState, req: BlockRequestMsg) {
+    let canon = protocol::block_request_canon(req.sender, req.from_height);
+    if !verify_from_peer(ctx, req.sender, &canon, &req.sig_hex) {
+        warn(format!("rejected block request from {} - unknown sender or invalid signature", req.sender));
+        return;
+    }
+    let blocks: Vec<Block> = node.chain.iter().filter(|b| b.height >= req.from_height).take(MAX_SYNC_BATCH).cloned().collect();
+    if blocks.is_empty() {
+        return;
+    }
+    log(format!("answering chain-sync request from {} with {} block(s) starting at height={}", req.sender, blocks.len(), req.from_height));
+    let response_canon = protocol::block_response_canon(node.node_id, &blocks);
+    let sig = crypto::sign_canon(&node.signing_key, &response_canon);
+    send_direct(ctx, req.sender, &Message::BlockResponse(BlockResponseMsg { sender: node.node_id, blocks, sig_hex: hex::encode(sig.to_bytes()) }));
+}
+
+/// Applies a [`BlockResponseMsg`], verifying every block independently
+/// before trusting it - the envelope signature only proves "a known
+/// peer sent this batch", never "these blocks are genuinely
+/// committed". Each block must: extend this node's current head
+/// exactly (reject anything out of order, rather than risk skipping a
+/// height); have a hash matching its own content
+/// (`protocol::block_canon`); and carry at least a quorum of
+/// signatures that independently verify against
+/// `protocol::precommit_canon(block.committed_at_view, &block)`,
+/// checked against each signer's *currently* known pubkey (same rule
+/// `handle_vote`/`handle_proposal` use) and de-duplicated by signer so
+/// one peer's signature can't be counted twice toward quorum.
+///
+/// Disclosed limitation: "currently known pubkey" means a block whose
+/// signer has since rotated keys (Hardening 8) may fail
+/// re-verification here even though it was genuinely valid when
+/// committed - this module has no historical key-rotation audit
+/// trail to check against instead. Narrower than it sounds in
+/// practice (a block this node itself already had, or already-honest
+/// peers' blocks before any rotation, are unaffected), but real.
+///
+/// Stops applying the batch at the first block that fails any check,
+/// rather than skipping it and continuing - a gap must never be
+/// silently left in the middle of the chain.
+///
+/// Deliberately does not call `apply_trust_updates` for a synced
+/// block: that function's leave-one-out trust recomputation needs
+/// this node's own `latest_observations` from the round the block was
+/// actually proposed in, which a node catching up on history never
+/// had - there's nothing meaningful to recompute from.
+async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, resp: BlockResponseMsg) {
+    let canon = protocol::block_response_canon(resp.sender, &resp.blocks);
+    if !verify_from_peer(ctx, resp.sender, &canon, &resp.sig_hex) {
+        warn(format!("rejected block response from {} - unknown sender or invalid signature", resp.sender));
+        return;
+    }
+    let quorum = quorum_for(ctx.all_ids.len());
+    let mut applied = 0u64;
+
+    for block in resp.blocks {
+        let head = node.head().clone();
+        if block.height != head.height + 1 || block.parent != head.hash {
+            warn(format!(
+                "block-sync: block at height={} from {} doesn't extend this node's current head (height={}) - stopping this batch",
+                block.height, resp.sender, head.height
+            ));
+            break;
+        }
+        let identity_canon = protocol::block_canon(&block);
+        if chain::block_hash(&identity_canon) != block.hash {
+            warn(format!("block-sync: hash mismatch at height={} from {} - stopping this batch", block.height, resp.sender));
+            break;
+        }
+
+        let precommit_canon_str = protocol::precommit_canon(block.committed_at_view, &block);
+        let mut seen_signers = std::collections::HashSet::new();
+        let mut valid = 0usize;
+        for sig_entry in &block.signatures {
+            if !seen_signers.insert(sig_entry.node_id) {
+                continue; // never let one signer count toward quorum twice
+            }
+            let known_pubkey = if sig_entry.node_id == node.node_id {
+                Some(node.verifying_key)
+            } else {
+                ctx.peers.read().unwrap().get(&sig_entry.node_id).map(|p| p.pubkey)
+            };
+            let Some(known_pubkey) = known_pubkey else { continue };
+            let Some(claimed_pubkey) = decode_verifying_key(&sig_entry.pubkey_hex) else { continue };
+            if claimed_pubkey != known_pubkey {
+                continue;
+            }
+            let Some(sig) = decode_signature(&sig_entry.sig_hex) else { continue };
+            if crypto::verify_canon(&known_pubkey, &precommit_canon_str, &sig) {
+                valid += 1;
+            }
+        }
+        if valid < quorum {
+            warn(format!(
+                "block-sync: height={} from {} has only {valid} independently-verifiable signature(s), need {quorum} - stopping this batch",
+                block.height, resp.sender
+            ));
+            break;
+        }
+
+        log(format!("block-sync: catching up height={} hash={} (committed_at_view={})", block.height, block.hash, block.committed_at_view));
+        node.chain.push(block.clone());
+        if let Err(e) = store.put_block(&block) {
+            warn(format!("failed to persist synced block: {e}"));
+        }
+        ctx.metrics.head_height.store(block.height, Ordering::Relaxed);
+        if block.epoch != node.epoch {
+            log(format!("epoch rotated via sync: {} -> {} at height={}", node.epoch, block.epoch, block.height));
+            node.epoch = block.epoch;
+            ctx.metrics.epoch.store(block.epoch, Ordering::Relaxed);
+            if let Err(e) = store.put_epoch(block.epoch) {
+                warn(format!("failed to persist rotated epoch during sync: {e}"));
+            }
+        }
+        applied += 1;
+    }
+
+    if applied == 0 {
+        return;
+    }
+    // Mirrors maybe_commit's own pruning: any round-local state for a
+    // height this sync just leapfrogged past is now stale.
+    let new_head_height = node.head().height;
+    rs.candidates.retain(|_, b| b.height > new_head_height);
+    let surviving: std::collections::HashSet<String> = rs.candidates.keys().cloned().collect();
+    rs.legitimate_rounds.retain(|(h, _)| surviving.contains(h));
+    rs.prevotes.retain(|(h, _), _| surviving.contains(h));
+    rs.precommits.retain(|(h, _), _| surviving.contains(h));
+    rs.view_for_height.retain(|&h, _| h > new_head_height);
+    rs.locked.retain(|&h, _| h > new_head_height);
+    rs.proposed_rounds.retain(|&(h, _)| h > new_head_height);
 }
 
 /// Real leave-one-out Δe: for each peer whose latest observation
@@ -1372,7 +1615,18 @@ mod tests {
 
     #[test]
     fn block_canon_matches_chain_canon_string() {
-        let block = Block { height: 1, parent: "GENESIS".to_string(), state: vec![1.0, 2.0], confidence: 0.9, reconciles: vec![], epoch: 0, signatures: vec![], sig_weight: 0.0, hash: String::new() };
+        let block = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![1.0, 2.0],
+            confidence: 0.9,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 0.0,
+            hash: String::new(),
+            committed_at_view: 0,
+        };
         let expected = chain::canon_string(1, "GENESIS", &chain::hash_vec(&[1.0, 2.0]), 0.9, &chain::hash_list(&[]), 0);
         assert_eq!(protocol::block_canon(&block), expected);
     }
@@ -1673,6 +1927,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 1.0,
             hash: "head1".to_string(),
+            committed_at_view: 0,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -1703,6 +1958,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 0.0,
             hash: String::new(),
+            committed_at_view: 0,
         };
         let identity_canon = protocol::block_canon(&block);
         block.hash = chain::block_hash(&identity_canon);
@@ -1745,6 +2001,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 1.0,
             hash: "head1".to_string(),
+            committed_at_view: 0,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -1773,6 +2030,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 0.0,
             hash: String::new(),
+            committed_at_view: 0,
         };
         let identity_canon = protocol::block_canon(&block);
         block.hash = chain::block_hash(&identity_canon);
@@ -1840,6 +2098,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 0.0,
             hash: String::new(),
+            committed_at_view: 0,
         };
         let identity_canon = protocol::block_canon(&block);
         block.hash = chain::block_hash(&identity_canon);
@@ -1879,6 +2138,203 @@ mod tests {
             pubkey_hex: hex::encode(signer_sk.verifying_key().to_bytes()),
             sig_hex: hex::encode(sig.to_bytes()),
         }
+    }
+
+    /// Builds a fully-formed, genuinely-committed `Block` - real
+    /// precommit signatures from every `(node_id, signing_key)` in
+    /// `signers`, exactly as `maybe_commit` itself would have embedded
+    /// them - for tests that need a historical block to chain-sync,
+    /// not a live round in progress.
+    fn committed_block(height: u64, parent: &str, state: Vec<f64>, view: u64, signers: &[(usize, &ed25519_dalek::SigningKey)]) -> Block {
+        let mut block = Block { height, parent: parent.to_string(), state, confidence: 0.9, ..Block::genesis(0) };
+        block.reconciles = vec![];
+        block.epoch = chain::epoch_for_height(height);
+        let identity_canon = protocol::block_canon(&block);
+        block.hash = chain::block_hash(&identity_canon);
+        block.committed_at_view = view;
+        let canon = protocol::precommit_canon(view, &block);
+        block.signatures = signers
+            .iter()
+            .map(|(id, sk)| {
+                let sig = crypto::sign_canon(sk, &canon);
+                SigEntry { node_id: *id, pubkey_hex: hex::encode(sk.verifying_key().to_bytes()), sig_hex: hex::encode(sig.to_bytes()) }
+            })
+            .collect();
+        block.sig_weight = block.signatures.len() as f64;
+        block
+    }
+
+    /// The real end-to-end claim chain-sync exists to prove: a node
+    /// that's missed several already-committed heights entirely (not
+    /// just a view) has, until now, had no way back in at all. Here
+    /// it starts at genesis while the "network" is already 3 blocks
+    /// ahead, receives one real `BlockResponseMsg` carrying all 3 -
+    /// each with a genuine 2-of-2 precommit quorum, exactly as
+    /// `maybe_commit` would have produced them - and ends up with the
+    /// identical chain it would have had if it had been online the
+    /// whole time.
+    #[tokio::test]
+    async fn a_behind_node_catches_up_from_a_genuine_block_response() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, quorum=2
+        let dir = crate::test_support::TempDir::new("sync_catches_up");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(1)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let b1 = committed_block(1, "GENESIS", vec![1.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
+        let b2 = committed_block(2, &b1.hash, vec![2.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
+        let b3 = committed_block(3, &b2.hash, vec![3.0], 1, &[(0, &self_sk), (1, &peer_sk)]);
+        let blocks = vec![b1.clone(), b2.clone(), b3.clone()];
+        let response_canon = protocol::block_response_canon(1, &blocks);
+        let sig = crypto::sign_canon(&peer_sk, &response_canon);
+        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+
+        handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
+
+        assert_eq!(node.chain.len(), 4, "genesis + 3 synced blocks");
+        assert_eq!(node.head().hash, b3.hash);
+        // Genesis itself is synthesized, not persisted (same as every
+        // other commit path in this module) - only the 3 synced
+        // blocks should actually be written to the store.
+        assert_eq!(store.all_blocks().unwrap().len(), 3, "synced blocks must be persisted, not just held in memory");
+    }
+
+    /// The actual security property, not just "sync works": a block
+    /// whose signatures don't reach quorum must never be applied, even
+    /// though it's wrapped in a genuinely-signed response envelope
+    /// from a real, known peer. The envelope only proves who sent the
+    /// batch, never that its contents are genuinely committed.
+    #[tokio::test]
+    async fn a_block_response_with_insufficient_signatures_is_rejected() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // quorum=2
+        let dir = crate::test_support::TempDir::new("sync_insufficient_sigs");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(1)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // Only 1 of the 2 signatures quorum requires - genuinely
+        // signed, just not enough of them.
+        let under_signed = committed_block(1, "GENESIS", vec![1.0], 0, &[(1, &peer_sk)]);
+        let blocks = vec![under_signed];
+        let response_canon = protocol::block_response_canon(1, &blocks);
+        let sig = crypto::sign_canon(&peer_sk, &response_canon);
+        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+
+        handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
+
+        assert_eq!(node.chain.len(), 1, "an under-signed block must never be applied, regardless of who relayed it");
+    }
+
+    /// A node must never apply a batch out of order or skip a height -
+    /// the first block that doesn't exactly extend the current head
+    /// stops the whole batch, even if a later block in it looks fine
+    /// on its own.
+    #[tokio::test]
+    async fn a_block_response_that_skips_a_height_stops_at_the_gap() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer();
+        let dir = crate::test_support::TempDir::new("sync_skips_height");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(1)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // height=2 first, with no height=1 in the batch at all - does
+        // not extend genesis (head.height + 1 == 1, not 2).
+        let b1 = committed_block(1, "GENESIS", vec![1.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
+        let b2_skipping = committed_block(2, &b1.hash, vec![2.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
+        let blocks = vec![b2_skipping];
+        let response_canon = protocol::block_response_canon(1, &blocks);
+        let sig = crypto::sign_canon(&peer_sk, &response_canon);
+        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+
+        handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
+
+        assert_eq!(node.chain.len(), 1, "a batch that doesn't start by extending the current head must apply nothing");
+    }
+
+    /// Proves the actual trigger a live node relies on: observing a
+    /// proposal for a height well beyond what this node has must
+    /// record a sync request for this node's real next-needed height
+    /// - not silently do nothing, which is what used to happen here.
+    #[tokio::test]
+    async fn a_proposal_far_ahead_of_this_node_records_a_sync_request() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1
+        let dir = crate::test_support::TempDir::new("sync_trigger");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(1)], // this node is only at height 0
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        assert!(rs.last_sync_request.is_none());
+
+        // A proposal for height 5 - far beyond this node's height 0 -
+        // from whichever id is genuinely the expected proposer there.
+        let far_height = 5u64;
+        let far_view = 0u64;
+        let proposer = expected_proposer(&ctx.all_ids, far_height, far_view);
+        let proposer_sk = if proposer == 1 { &peer_sk } else { &self_sk };
+        let far_proposal = signed_proposal(proposer, proposer_sk, far_height, "whatever-parent-hash", far_view, 1.0);
+
+        handle_proposal(&ctx, &mut node, &store, &mut rs, far_proposal).await;
+
+        assert_eq!(rs.last_sync_request.map(|(h, _)| h), Some(1), "should have requested sync starting at this node's real next-needed height");
+        assert_eq!(node.chain.len(), 1, "the far-ahead proposal itself must never be applied directly");
+    }
+
+    /// The debounce: a second trigger for the *same* still-unmet
+    /// height within the cooldown window must not reset the request
+    /// timer - otherwise a burst of gossip for a height this node is
+    /// behind on would re-request on every single message.
+    #[tokio::test]
+    async fn repeated_sync_triggers_for_the_same_height_are_debounced() {
+        let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer();
+        let node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(1)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        maybe_request_sync(&ctx, &node, &mut rs, 1).await;
+        let first_requested_at = rs.last_sync_request.expect("should have recorded a request").1;
+
+        maybe_request_sync(&ctx, &node, &mut rs, 1).await;
+        let second_requested_at = rs.last_sync_request.unwrap().1;
+
+        assert_eq!(first_requested_at, second_requested_at, "a second trigger for the same unmet height inside the cooldown must not reset the timer");
     }
 
     /// A real bug a focused code review caught: `apply_trust_updates`
@@ -2269,6 +2725,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 1.0,
             hash: "real-head-1".to_string(),
+            committed_at_view: 0,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -2294,6 +2751,7 @@ mod tests {
             signatures: vec![SigEntry { node_id: 1, pubkey_hex: "ab".repeat(32), sig_hex: "cd".repeat(64) }],
             sig_weight: 1000.0,
             hash: String::new(),
+            committed_at_view: 0,
         };
         let identity_canon = protocol::block_canon(&forged);
         forged.hash = chain::block_hash(&identity_canon);
@@ -2327,6 +2785,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 1.0,
             hash: "real-head-1".to_string(),
+            committed_at_view: 0,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -2372,6 +2831,7 @@ mod tests {
             signatures: vec![],
             sig_weight: 5.0,
             hash: "real-head-1".to_string(),
+            committed_at_view: 0,
         };
         let mut node = NodeState {
             node_id: 0,

@@ -1,4 +1,4 @@
-//! The seven peer-to-peer message types, wire-serialized as JSON.
+//! The nine peer-to-peer message types, wire-serialized as JSON.
 //!
 //! **Every message type carries an Ed25519 signature.** Earlier this
 //! was true only of [`BlockProposalMsg`]/[`BlockVoteMsg`]; observation
@@ -17,11 +17,23 @@
 //! number, folded into what they sign via [`view_block_canon`] rather
 //! than the block's own [`block_canon`] alone - a signature made for
 //! one view can never be replayed into a different one, even if the
-//! block content is identical. Right now every height only ever has
-//! one view (nothing bumps it yet - that's the liveness/view-change
-//! stage), so this doesn't change observable behavior today; it's the
-//! mechanism that stage relies on for safety, tested on its own before
-//! anything drives it.
+//! block content is identical. [`PrecommitMsg`] signs a third,
+//! further domain-separated string ([`precommit_canon`]) built from
+//! that same `view_block_canon`, so a prevote and a precommit can
+//! never be confused for each other either - see `crate::consensus`'s
+//! module doc comment on quorum-certificate locking for why that
+//! separation is load-bearing for safety, not just tidiness.
+//!
+//! [`BlockRequestMsg`]/[`BlockResponseMsg`] (chain-sync) are the odd
+//! ones out structurally: the real safety property for a synced block
+//! doesn't come from the envelope signature at all, but from each
+//! [`Block`]'s own already-embedded quorum-certificate `signatures` -
+//! independently reconstructible and verifiable by anyone via
+//! `Block::committed_at_view` plus [`precommit_canon`], with no need
+//! to trust whoever happens to be relaying it. The envelope is signed
+//! anyway, consistently with every other message type here, so a
+//! forged request/response is still rejected before its contents are
+//! trusted at all.
 //!
 //! The transport layer ([`crate::net`]) deliberately does not verify
 //! peer TLS certificates either - see that module's doc comment for
@@ -49,6 +61,8 @@ pub enum Message {
     Precommit(PrecommitMsg),
     TrustUpdate(TrustUpdateMsg),
     KeyRotation(KeyRotationMsg),
+    BlockRequest(BlockRequestMsg),
+    BlockResponse(BlockResponseMsg),
 }
 
 /// A raw sensor observation, broadcast before fusion.
@@ -139,6 +153,48 @@ pub fn precommit_canon(view: u64, block: &Block) -> String {
     format!("PRECOMMIT|{}", view_block_canon(view, block))
 }
 
+/// A request to catch up: "send me every committed block you have
+/// starting at `from_height`." Sent when a node observes (via a
+/// proposal for a height it can't yet accept) that the network has
+/// moved further ahead than it has - see `crate::consensus`'s
+/// chain-sync handling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockRequestMsg {
+    pub sender: usize,
+    pub from_height: u64,
+    pub sig_hex: String,
+}
+
+/// The exact string a [`BlockRequestMsg`] signs.
+pub fn block_request_canon(sender: usize, from_height: u64) -> String {
+    format!("blockreq|{sender}|{from_height}")
+}
+
+/// The reply to a [`BlockRequestMsg`]: every committed block the
+/// responder has at or above the requested height, oldest first, up
+/// to `crate::consensus`'s own batch cap (a single response is never
+/// unbounded). Each block carries its own already-formed
+/// quorum-certificate `signatures` - the receiving node verifies
+/// those directly (via `Block::committed_at_view` and
+/// [`precommit_canon`]) rather than trusting this message's own
+/// signature for anything beyond "a known peer really sent this
+/// batch, not a forged one."
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlockResponseMsg {
+    pub sender: usize,
+    pub blocks: Vec<Block>,
+    pub sig_hex: String,
+}
+
+/// The exact string a [`BlockResponseMsg`] signs - over a digest of
+/// the batch's blocks (by their own already-computed, content-derived
+/// `hash` field, cheaper than re-hashing full block content) rather
+/// than the full payload, since a response can be large.
+pub fn block_response_canon(sender: usize, blocks: &[Block]) -> String {
+    let hashes: Vec<String> = blocks.iter().map(|b| b.hash.clone()).collect();
+    format!("blockresp|{sender}|{}", chain::hash_list(&hashes))
+}
+
 /// A gossiped update to how much `sender` trusts `about_peer`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustUpdateMsg {
@@ -196,6 +252,8 @@ mod tests {
             }),
             Message::TrustUpdate(TrustUpdateMsg { sender: 1, about_peer: 2, edge_weight: 1.5, sig_hex: "cc".to_string() }),
             Message::KeyRotation(KeyRotationMsg { sender: 1, new_pubkey_hex: "dd".to_string(), rotation_seq: 1, sig_hex: "ee".to_string() }),
+            Message::BlockRequest(BlockRequestMsg { sender: 1, from_height: 5, sig_hex: "ff".to_string() }),
+            Message::BlockResponse(BlockResponseMsg { sender: 1, blocks: vec![Block::genesis(2)], sig_hex: "gg".to_string() }),
         ];
         for msg in messages {
             let json = serde_json::to_string(&msg).unwrap();
@@ -276,12 +334,35 @@ mod tests {
         let b = state_canon(1, &[2.0], 0.0);
         let c = trust_update_canon(1, 0, 2.0);
         let d = key_rotation_canon(1, "0", 2);
-        assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(b, c);
-        assert_ne!(a, d);
-        assert_ne!(b, d);
-        assert_ne!(c, d);
+        let e = block_request_canon(1, 2);
+        let f = block_response_canon(1, &[Block::genesis(1)]);
+        let all = [&a, &b, &c, &d, &e, &f];
+        for (i, x) in all.iter().enumerate() {
+            for (j, y) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(x, y, "canon strings at indices {i} and {j} must never collide");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_request_canon_is_sensitive_to_every_field() {
+        assert_eq!(block_request_canon(1, 5), block_request_canon(1, 5));
+        assert_ne!(block_request_canon(1, 5), block_request_canon(2, 5));
+        assert_ne!(block_request_canon(1, 5), block_request_canon(1, 6));
+    }
+
+    #[test]
+    fn block_response_canon_is_sensitive_to_sender_and_block_content() {
+        let mut b = Block::genesis(2);
+        b.height = 3;
+        let identity_canon = block_canon(&b);
+        b.hash = chain::block_hash(&identity_canon);
+        assert_eq!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(1, &[Block::genesis(2)]));
+        assert_ne!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(2, &[Block::genesis(2)]));
+        assert_ne!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(1, &[b]));
+        assert_ne!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(1, &[]));
     }
 
     #[test]

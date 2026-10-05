@@ -65,6 +65,26 @@ pub struct Block {
     pub signatures: Vec<SigEntry>,
     pub sig_weight: f64,
     pub hash: String,
+    /// The view whose quorum-certificate `signatures` actually is -
+    /// filled in independently at commit time (like `signatures`/
+    /// `sig_weight`, and likewise excluded from `canon_string`/
+    /// `block_hash`: it's a fact *about* the block, not part of its
+    /// identity). What lets anyone who did *not* participate in
+    /// committing a block still independently verify it later purely
+    /// from its persisted form - chain-sync's whole premise - by
+    /// reconstructing exactly what each signature in `signatures` was
+    /// supposed to sign.
+    ///
+    /// `#[serde(default)]`: a block persisted before this field
+    /// existed deserializes with `0`, which is only actually correct
+    /// if it really did commit at view 0. A node resuming from
+    /// pre-existing data recorded before this field shipped can't
+    /// retroactively recover the true value, so such a block may fail
+    /// re-verification by a node syncing it fresh later - a disclosed,
+    /// one-time migration edge case, not a live concern for any block
+    /// committed after this field was added.
+    #[serde(default)]
+    pub committed_at_view: u64,
 }
 
 impl Block {
@@ -80,6 +100,7 @@ impl Block {
             signatures: vec![],
             sig_weight: 999.0,
             hash: "GENESIS".to_string(),
+            committed_at_view: 0,
         }
     }
 }
