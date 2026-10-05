@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "tri_sync_node_probe"
 path = "src/bin/probe.rs"
 
+[[bin]]
+name = "tri_sync_node_license_tool"
+path = "src/bin/sign_license.rs"
+
 [dependencies]
 tri_sync_core = { path = "../tri_sync_core" }
 serde = { version = "1", features = ["derive"] }

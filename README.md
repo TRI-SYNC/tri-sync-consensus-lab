@@ -354,10 +354,11 @@ What it actually is:
 
 ```bash
 # One-time per node: generate node.toml (see tri_sync_node/src/config.rs
-# for every field) and a license.toml (tri_sync_node/license.example.toml
-# is a real, working fixture signed with a development-only key - replace
-# LICENSE_PUBLIC_KEY_HEX in src/license.rs with a production key before
-# issuing real licenses).
+# for every field) and a license.toml. tri_sync_node/license.example.toml
+# is a real, working fixture signed with a development-only key - issue
+# real licenses with tri_sync_node_license_tool instead (see below), and
+# replace LICENSE_PUBLIC_KEY_HEX in src/license.rs with the resulting
+# production public key before issuing any to a paying customer.
 cargo run --bin tri_sync_node -- node.toml --show-identity   # prints this node's pubkey, then exits
 cargo run --bin tri_sync_node -- node.toml                   # starts the QUIC server + consensus loop, runs until killed
 cargo run --bin tri_sync_node -- node.toml --duration 60      # same, but exits cleanly after 60s (for scripted runs)
@@ -373,6 +374,33 @@ precommit quorum-certificate under the network's actual current
 membership, exactly like any other block - see `tri_sync_node::
 consensus`'s module doc comment on dynamic membership for the full
 mechanism.
+
+### Issuing licenses
+
+```bash
+cargo run --bin tri_sync_node_license_tool -- generate-key
+# public_key_hex  = ...
+# private_key_hex = ...   (shown once; move it into your own secret
+#                           storage immediately - this tool never
+#                           persists it anywhere)
+
+cargo run --bin tri_sync_node_license_tool -- sign \
+  --private-key <hex> --org "Acme Corp" --max-nodes 5 \
+  --expiry 2027-01-01 --features "chain_crypto,http_api" \
+  --out acme-license.toml
+```
+
+`generate-key` never runs as a side effect of anything else in this
+repository - the private key it prints is the actual secret that will
+let anyone sign a license as you, so it's produced only when you ask
+for it, shown exactly once, and never written to disk by this tool.
+Run it yourself, on a machine you trust, and set
+`LICENSE_PUBLIC_KEY_HEX` in `tri_sync_node/src/license.rs` to the
+`public_key_hex` it prints before relying on it for a real customer.
+`sign` rejects a malformed private key or an expiry date that doesn't
+exist on the calendar, and verifies its own output against the
+signing key's public half before ever printing or writing it - a
+license this tool can't verify is never handed back.
 
 ### Testing
 

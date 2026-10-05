@@ -13,15 +13,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Ed25519 public key that every license signature is checked against.
 ///
-/// This is a development key generated for this repository so the
-/// verification path can be tested end-to-end for real (see
+/// This is a development key generated for this repository (via
+/// `cargo run --bin tri_sync_node_license_tool -- generate-key`) so
+/// the verification path can be tested end-to-end for real (see
 /// `tri_sync_node/license.example.toml`, signed with its matching
-/// private key). It must be replaced with a real production keypair
-/// before any license is issued to a paying customer, and the private
-/// half must never be committed to this repository - it stays with
-/// whoever issues licenses (see `LICENSE.md`, contact tri@trisync.dev).
+/// private key using `tri_sync_node_license_tool sign`). It must be
+/// replaced with a real production keypair, generated independently
+/// by whoever actually issues licenses (never by this repository or
+/// anything that produced this commit), before any license is issued
+/// to a paying customer - the matching private half must never be
+/// committed here, and stays in that issuer's own secret storage (see
+/// `LICENSE.md`, contact tri@trisync.dev).
 pub const LICENSE_PUBLIC_KEY_HEX: &str =
-    "e82126f49e38641692abc6166bf172033267195bfdf12d7c9396089548b8bdbf";
+    "5d3ef57447c37fe7d94ebaec340d5e87ae60ad6e0b5250579a5e1e48ba247dff";
 
 #[derive(Debug, Clone, Deserialize)]
 struct LicenseFile {
@@ -174,8 +178,11 @@ fn parse_iso_date(s: &str) -> Option<(i64, u32, u32)> {
 
 /// Parses a `YYYY-MM-DD` string into days-since-1970-01-01, rejecting
 /// any string that doesn't round-trip through the calendar math (e.g.
-/// `2023-02-30`) rather than silently normalizing it.
-fn civil_days_from_iso(s: &str) -> Option<i64> {
+/// `2023-02-30`) rather than silently normalizing it. `pub` (not just
+/// used internally by `parse_and_verify`) so `sign_license`'s CLI can
+/// reject a typo'd expiry date before ever signing a license carrying
+/// it, using the identical check a node will later verify against.
+pub fn civil_days_from_iso(s: &str) -> Option<i64> {
     let (y, m, d) = parse_iso_date(s)?;
     if !(1..=12).contains(&m) {
         return None;
@@ -344,11 +351,13 @@ mod tests {
     }
 
     /// The end-to-end real path: a license file signed with the actual
-    /// private key matching `LICENSE_PUBLIC_KEY_HEX` (kept out of this
-    /// repository), verified against the real embedded constant - not a
-    /// synthetic ad hoc keypair like the tests above.
+    /// private key matching `LICENSE_PUBLIC_KEY_HEX` (a development
+    /// key - see that constant's own doc comment - discarded from this
+    /// machine after signing, never committed here), verified against
+    /// the real embedded constant - not a synthetic ad hoc keypair
+    /// like the tests above.
     #[test]
-    fn the_real_example_license_verifies_against_the_embedded_production_key() {
+    fn the_real_example_license_verifies_against_the_embedded_dev_key() {
         let toml = include_str!("../license.example.toml");
         let license = parse_and_verify(toml, LICENSE_PUBLIC_KEY_HEX).expect("example license should verify");
         assert_eq!(license.org, "TriSync Example Org");
