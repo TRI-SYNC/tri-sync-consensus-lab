@@ -11,8 +11,9 @@ use rand::rngs::OsRng;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tri_sync_core::chain::MembershipChange;
 use tri_sync_core::crypto;
-use tri_sync_node::protocol::{self, KeyRotationMsg, Message};
+use tri_sync_node::protocol::{self, KeyRotationMsg, MembershipProposalMsg, Message};
 use tri_sync_node::{config, consensus, license, metrics, net, persistence, state};
 
 #[tokio::main]
@@ -56,14 +57,57 @@ async fn main() -> ExitCode {
     // up on its own. Stopping first removes the race entirely: there's
     // no old-keyed process left to send anything peers now correctly
     // reject, so there's nothing to recover from in the first place.
+    //
+    // `--propose-add-peer <id> <addr> <pubkey_hex>` / `--propose-remove-peer
+    // <id>`: sign a [`MembershipChange`] with this node's own key and
+    // broadcast it to every peer in *this* node's `node.toml` as a
+    // [`MembershipProposalMsg`] - see `consensus`'s module doc comment
+    // on dynamic membership for the full mechanism. Exits immediately
+    // like `--rotate-key`/`--show-identity`, rather than continuing
+    // into a normal run.
+    //
+    // This is a liveness convenience only, never the safety mechanism
+    // itself: broadcasting a proposal doesn't change anything by
+    // itself - it only asks whichever of *those* peers next becomes
+    // proposer to attach the change to its own next block, which still
+    // has to earn a real precommit quorum under the actual current
+    // membership before it takes effect, exactly like any other block.
+    // Disclosed limitation, honestly narrow rather than hidden: this
+    // only reaches peers in this node's own `node.toml`, which may not
+    // be every current member if membership has already diverged (a
+    // peer added since this file was last edited, say) - a real gap
+    // in how promptly a change gets proposed, but not a safety one,
+    // since the quorum requirement above holds regardless of who
+    // proposed the change or how they heard about it.
     let mut duration_secs: Option<u64> = None;
     let mut show_identity_only = false;
     let mut rotate_key_only = false;
+    let mut propose_add_peer: Option<(usize, String, String)> = None;
+    let mut propose_remove_peer: Option<usize> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--duration" => duration_secs = args.next().and_then(|s| s.parse().ok()),
             "--show-identity" => show_identity_only = true,
             "--rotate-key" => rotate_key_only = true,
+            "--propose-add-peer" => {
+                let id = args.next().and_then(|s| s.parse().ok());
+                let addr = args.next();
+                let pubkey_hex = args.next();
+                match (id, addr, pubkey_hex) {
+                    (Some(id), Some(addr), Some(pubkey_hex)) => propose_add_peer = Some((id, addr, pubkey_hex)),
+                    _ => {
+                        eprintln!("tri_sync_node: --propose-add-peer requires <id> <addr> <pubkey_hex>");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--propose-remove-peer" => {
+                let Some(id) = args.next().and_then(|s| s.parse().ok()) else {
+                    eprintln!("tri_sync_node: --propose-remove-peer requires <id>");
+                    return ExitCode::FAILURE;
+                };
+                propose_remove_peer = Some(id);
+            }
             _ => {}
         }
     }
@@ -151,6 +195,13 @@ async fn main() -> ExitCode {
 
     if rotate_key_only {
         return rotate_key(&config, &store, &node_state.signing_key).await;
+    }
+
+    if let Some((id, addr, pubkey_hex)) = propose_add_peer {
+        return propose_membership_change(&config, &node_state.signing_key, MembershipChange::Add { node_id: id, addr, pubkey_hex }).await;
+    }
+    if let Some(id) = propose_remove_peer {
+        return propose_membership_change(&config, &node_state.signing_key, MembershipChange::Remove { node_id: id }).await;
     }
 
     let listen_addr: std::net::SocketAddr = match config.listen_addr.parse() {
@@ -280,6 +331,56 @@ async fn rotate_key(config: &config::NodeConfig, store: &persistence::Store, old
     println!("tri_sync_node: key rotation complete - restart this node normally to use the new identity");
     if any_failed {
         eprintln!("tri_sync_node: at least one peer was not notified - see the disclosed limitation in this binary's --rotate-key handling");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Signs `change` with this node's own key and broadcasts it to every
+/// peer in this node's `node.toml` as a [`MembershipProposalMsg`] -
+/// see the `--propose-add-peer`/`--propose-remove-peer` usage note
+/// above the `main` flag parser for what this does and doesn't
+/// guarantee. Broadcasting itself changes nothing: it only asks
+/// whichever of these peers next becomes proposer to attach `change`
+/// to its own next block (`consensus::handle_membership_proposal`),
+/// which still has to earn a real precommit quorum under the actual
+/// current membership before anything takes effect.
+async fn propose_membership_change(config: &config::NodeConfig, signing_key: &SigningKey, change: MembershipChange) -> ExitCode {
+    let canon = protocol::membership_proposal_canon(config.node_id, &change);
+    let sig = crypto::sign_canon(signing_key, &canon);
+    let msg = Message::MembershipProposal(MembershipProposalMsg { sender: config.node_id, change: change.clone(), sig_hex: hex::encode(sig.to_bytes()) });
+    println!("tri_sync_node: proposing membership change {change:?}");
+
+    let endpoint = match net::make_client_endpoint() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("tri_sync_node: cannot open a client endpoint to propose this change: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut any_failed = false;
+    for peer in &config.peers {
+        let addr: std::net::SocketAddr = peer.addr.parse().expect("validated at config load");
+        let peer_pubkey = hex::decode(&peer.pubkey_hex).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|a| VerifyingKey::from_bytes(&a).ok());
+        match net::send_message(&endpoint, addr, peer_pubkey, &msg).await {
+            Ok(()) => println!("tri_sync_node: sent proposal to peer {} at {addr}", peer.id),
+            Err(e) => {
+                eprintln!("tri_sync_node: failed to send proposal to peer {} at {addr}: {e}", peer.id);
+                any_failed = true;
+            }
+        }
+    }
+
+    println!(
+        "tri_sync_node: proposal sent - it takes effect only once whichever peer proposes next attaches it to a block that reaches real quorum"
+    );
+    if any_failed {
+        eprintln!(
+            "tri_sync_node: at least one configured peer was not reached - this is a liveness gap only (see this binary's usage note); \
+             the change may still get proposed by a peer that did receive it"
+        );
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS

@@ -1,4 +1,4 @@
-//! The nine peer-to-peer message types, wire-serialized as JSON.
+//! The ten peer-to-peer message types, wire-serialized as JSON.
 //!
 //! **Every message type carries an Ed25519 signature.** Earlier this
 //! was true only of [`BlockProposalMsg`]/[`BlockVoteMsg`]; observation
@@ -63,6 +63,7 @@ pub enum Message {
     KeyRotation(KeyRotationMsg),
     BlockRequest(BlockRequestMsg),
     BlockResponse(BlockResponseMsg),
+    MembershipProposal(MembershipProposalMsg),
 }
 
 /// A raw sensor observation, broadcast before fusion.
@@ -119,7 +120,8 @@ pub struct BlockVoteMsg {
 pub fn block_canon(block: &Block) -> String {
     let state_hash = chain::hash_vec(&block.state);
     let reconciles_hash = chain::hash_list(&block.reconciles);
-    chain::canon_string(block.height, &block.parent, &state_hash, block.confidence, &reconciles_hash, block.epoch)
+    let membership_hash = chain::hash_membership_change(&block.membership_change);
+    chain::canon_string(block.height, &block.parent, &state_hash, block.confidence, &reconciles_hash, block.epoch, &membership_hash)
 }
 
 /// The exact string a [`BlockProposalMsg`]/[`BlockVoteMsg`] signs: the
@@ -195,6 +197,27 @@ pub fn block_response_canon(sender: usize, blocks: &[Block]) -> String {
     format!("blockresp|{sender}|{}", chain::hash_list(&hashes))
 }
 
+/// `sender` (which must be a *current* member - checked on receipt,
+/// never by this type itself) proposing a change to who counts toward
+/// quorum. Accepting this only ever means "I'll attach this to the
+/// next block I propose" - see `crate::consensus`'s module doc
+/// comment on dynamic membership for why that's enough: the change
+/// itself still only takes effect if that specific block goes on to
+/// reach a real precommit quorum under the *current* membership, so
+/// a proposal alone, from however many senders, can never itself
+/// change who counts toward anything.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MembershipProposalMsg {
+    pub sender: usize,
+    pub change: chain::MembershipChange,
+    pub sig_hex: String,
+}
+
+/// The exact string a [`MembershipProposalMsg`] signs.
+pub fn membership_proposal_canon(sender: usize, change: &chain::MembershipChange) -> String {
+    format!("memberprop|{sender}|{}", chain::hash_membership_change(&Some(change.clone())))
+}
+
 /// A gossiped update to how much `sender` trusts `about_peer`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustUpdateMsg {
@@ -254,6 +277,11 @@ mod tests {
             Message::KeyRotation(KeyRotationMsg { sender: 1, new_pubkey_hex: "dd".to_string(), rotation_seq: 1, sig_hex: "ee".to_string() }),
             Message::BlockRequest(BlockRequestMsg { sender: 1, from_height: 5, sig_hex: "ff".to_string() }),
             Message::BlockResponse(BlockResponseMsg { sender: 1, blocks: vec![Block::genesis(2)], sig_hex: "gg".to_string() }),
+            Message::MembershipProposal(MembershipProposalMsg {
+                sender: 1,
+                change: chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:2".to_string(), pubkey_hex: "ab".repeat(32) },
+                sig_hex: "hh".to_string(),
+            }),
         ];
         for msg in messages {
             let json = serde_json::to_string(&msg).unwrap();
@@ -336,7 +364,8 @@ mod tests {
         let d = key_rotation_canon(1, "0", 2);
         let e = block_request_canon(1, 2);
         let f = block_response_canon(1, &[Block::genesis(1)]);
-        let all = [&a, &b, &c, &d, &e, &f];
+        let g = membership_proposal_canon(1, &chain::MembershipChange::Remove { node_id: 2 });
+        let all = [&a, &b, &c, &d, &e, &f, &g];
         for (i, x) in all.iter().enumerate() {
             for (j, y) in all.iter().enumerate() {
                 if i != j {

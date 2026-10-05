@@ -1,8 +1,9 @@
 //! LMDB-backed persistence (via `heed`) for blocks, trust, this node's
 //! keypair, epoch metadata, (Hardening 8) rotated peer keys plus this
-//! node's own key-rotation counter, and this node's current
-//! quorum-certificate lock (`LockRecord`, see `crate::consensus`'s
-//! module doc comment).
+//! node's own key-rotation counter, this node's current
+//! quorum-certificate lock (`LockRecord`), and the current dynamic
+//! membership set (`MemberRecord`) - see `crate::consensus`'s module
+//! doc comment for both.
 //!
 //! `heed` was chosen over RocksDB specifically because its LMDB source
 //! is small and compiles in seconds in a sandboxed build, confirmed by
@@ -55,6 +56,21 @@ pub struct LockRecord {
     pub block_hash: String,
 }
 
+const MEMBERSHIP_INITIALIZED_KEY: &str = "membership_initialized";
+
+/// A currently-recognized peer's address and key, keyed by node id in
+/// the `members` database - the durable record of dynamic membership
+/// (see `crate::consensus`'s module doc comment). Once
+/// `mark_membership_initialized` has been called (the first time this
+/// node ever starts), this - not `node.toml` - is the source of truth
+/// for who's in the network: `node.toml`'s `[[peers]]` entries are
+/// only ever a bootstrap seed for a brand-new data_dir.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberRecord {
+    pub addr: String,
+    pub pubkey_hex: String,
+}
+
 #[derive(Debug)]
 pub struct PersistError(String);
 
@@ -80,11 +96,12 @@ pub struct Store {
     meta: Database<Str, U64<BigEndian>>,
     peer_keys: Database<U64<BigEndian>, SerdeJson<PeerKeyRecord>>,
     locks: Database<Str, SerdeJson<LockRecord>>,
+    members: Database<U64<BigEndian>, SerdeJson<MemberRecord>>,
 }
 
 impl Store {
     /// Opens (creating if necessary) an LMDB environment at `dir` with
-    /// the six databases this node needs.
+    /// the seven databases this node needs.
     pub fn open(dir: &Path) -> Result<Store, PersistError> {
         std::fs::create_dir_all(dir).map_err(|e| PersistError(format!("creating {}: {e}", dir.display())))?;
         // SAFETY: heed's `open` is unsafe because opening the same LMDB
@@ -92,7 +109,7 @@ impl Store {
         // mismatched configuration (map size, max_dbs) is undefined
         // behavior. This node is the only process expected to open its
         // own data_dir, with a fixed max_dbs below.
-        let env = unsafe { EnvOpenOptions::new().max_dbs(6).open(dir) }
+        let env = unsafe { EnvOpenOptions::new().max_dbs(7).open(dir) }
             .map_err(|e| PersistError(format!("opening LMDB env at {}: {e}", dir.display())))?;
 
         let mut wtxn = env.write_txn()?;
@@ -102,9 +119,10 @@ impl Store {
         let meta = env.create_database(&mut wtxn, Some("meta"))?;
         let peer_keys = env.create_database(&mut wtxn, Some("peer_keys"))?;
         let locks = env.create_database(&mut wtxn, Some("locks"))?;
+        let members = env.create_database(&mut wtxn, Some("members"))?;
         wtxn.commit()?;
 
-        Ok(Store { env, blocks, trust, keys, meta, peer_keys, locks })
+        Ok(Store { env, blocks, trust, keys, meta, peer_keys, locks, members })
     }
 
     pub fn put_block(&self, block: &Block) -> Result<(), PersistError> {
@@ -223,6 +241,51 @@ impl Store {
         let rtxn = self.env.read_txn()?;
         Ok(self.locks.get(&rtxn, LOCK_KEY)?)
     }
+
+    /// Records (or updates) a currently-recognized peer.
+    pub fn put_member(&self, node_id: usize, record: &MemberRecord) -> Result<(), PersistError> {
+        let mut wtxn = self.env.write_txn()?;
+        self.members.put(&mut wtxn, &(node_id as u64), record)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Removes a peer that a committed `MembershipChange::Remove` took
+    /// out of the network. A no-op, not an error, if it's already gone.
+    pub fn remove_member(&self, node_id: usize) -> Result<(), PersistError> {
+        let mut wtxn = self.env.write_txn()?;
+        self.members.delete(&mut wtxn, &(node_id as u64))?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Every currently-recognized peer (this node excluded, same as
+    /// `node.toml`'s `[[peers]]` list and `Ctx::peers` never include
+    /// self either).
+    pub fn all_members(&self) -> Result<Vec<(usize, MemberRecord)>, PersistError> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for entry in self.members.iter(&rtxn)? {
+            let (id, record) = entry?;
+            out.push((id as usize, record));
+        }
+        Ok(out)
+    }
+
+    /// Marks that this node's membership set has been seeded at least
+    /// once - see [`MemberRecord`]'s doc comment for why that flips
+    /// which source (`node.toml` vs this store) `run` trusts.
+    pub fn mark_membership_initialized(&self) -> Result<(), PersistError> {
+        let mut wtxn = self.env.write_txn()?;
+        self.meta.put(&mut wtxn, MEMBERSHIP_INITIALIZED_KEY, &1)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn is_membership_initialized(&self) -> Result<bool, PersistError> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.meta.get(&rtxn, MEMBERSHIP_INITIALIZED_KEY)?.unwrap_or(0) == 1)
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +397,33 @@ mod tests {
         let second = LockRecord { height: 1, view: 1, block_hash: "bbb".to_string() };
         store.put_lock(&second).unwrap();
         assert_eq!(store.get_lock().unwrap(), Some(second), "only one height is ever in flight - a new lock replaces, not appends");
+    }
+
+    #[test]
+    fn members_round_trip_and_removal_actually_removes() {
+        let dir = TempDir::new("members");
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.all_members().unwrap(), vec![]);
+        assert!(!store.is_membership_initialized().unwrap());
+
+        store.put_member(1, &MemberRecord { addr: "127.0.0.1:1".to_string(), pubkey_hex: "aa".repeat(32) }).unwrap();
+        store.put_member(2, &MemberRecord { addr: "127.0.0.1:2".to_string(), pubkey_hex: "bb".repeat(32) }).unwrap();
+        store.mark_membership_initialized().unwrap();
+
+        let mut members = store.all_members().unwrap();
+        members.sort_by_key(|(id, _)| *id);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].0, 1);
+        assert_eq!(members[1].0, 2);
+        assert!(store.is_membership_initialized().unwrap());
+
+        store.remove_member(1).unwrap();
+        let members = store.all_members().unwrap();
+        assert_eq!(members.len(), 1, "a removed member must actually be gone, not just marked");
+        assert_eq!(members[0].0, 2);
+
+        // Removing something already gone is a no-op, not an error.
+        store.remove_member(1).unwrap();
     }
 
     #[test]

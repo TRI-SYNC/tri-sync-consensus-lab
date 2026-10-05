@@ -41,11 +41,9 @@
 //!   management: this only ever updates the key of an *existing*,
 //!   already-configured peer id - it doesn't add, remove, or discover
 //!   peers, doesn't retry a rotation a peer missed while offline, and
-//!   doesn't touch `all_ids`/quorum/`network_size`, all of which stay
-//!   exactly as `node.toml` originally described. Real dynamic
-//!   membership change is a much harder, separate problem (safely
-//!   changing who counts toward quorum needs its own agreement
-//!   protocol) and staying out of that is deliberate, not an oversight.
+//!   by itself doesn't touch `all_ids`/quorum/`network_size`. Actually
+//!   adding or removing a peer is a separate mechanism - see "Dynamic
+//!   membership" below.
 //!   A real bug surfaced by an actual two-process rotation test (not a
 //!   unit test - the in-process ones all passed first try): rotating
 //!   while the rotating node's own old process was still running let
@@ -155,14 +153,68 @@
 //!   vote tally can still reach quorum normally. The cap is sized to
 //!   absorb several honest view-changes' worth of legitimate
 //!   candidates, not just one.
+//! - **Dynamic membership**: who counts toward quorum used to be
+//!   fixed for the life of the process, taken once from `node.toml`
+//!   and never revisited - a real, disclosed gap (safely changing
+//!   quorum membership generally needs its own agreement protocol),
+//!   now closed by piggybacking the change onto the ordinary
+//!   block-commit path instead of building a separate one. A
+//!   [`chain::MembershipChange`] (`Add`/`Remove`) is an optional field
+//!   on `Block` itself, folded into the block's real identity hash
+//!   (unlike `signatures`/`sig_weight`/`committed_at_view`), so a
+//!   change can only ever be the one every signer actually signed
+//!   over. `apply_membership_change` is the single place that ever
+//!   touches `ctx.peers`/`ctx.all_ids` for this: it's called from
+//!   exactly two places, `maybe_commit` and `handle_block_response`,
+//!   both only *after* the carrying block has already independently
+//!   satisfied a real precommit quorum-certificate (or, for sync, a
+//!   quorum of independently-verified signatures) - never before, and
+//!   never from a bare, unconfirmed proposal. That ordering is the
+//!   whole safety argument: a change takes effect only once a quorum
+//!   of the membership *as it stood before the change* actually
+//!   signed off on the block carrying it, so no node, however many
+//!   proposals it floods, can unilaterally grow or shrink its own
+//!   voting power - and since it rides the same block-commit path
+//!   everything else already goes through, it inherits
+//!   quorum-certificate locking and chain-sync for free rather than
+//!   needing its own copy of either. `ctx.all_ids` is a
+//!   `std::sync::RwLock<Vec<usize>>` rather than a plain `Vec` for
+//!   exactly this reason - it's mutable for the life of the process
+//!   now, snapshotted under a brief read lock (`all_ids_snapshot`)
+//!   everywhere it feeds a computation (`expected_proposer`,
+//!   `quorum_for`), never held across an `.await`.
+//!
+//!   Getting a change proposed in the first place is a liveness
+//!   convenience layered on top, not part of the safety argument
+//!   above: a [`MembershipProposalMsg`], signed by any *current*
+//!   member (`handle_membership_proposal`), stages the change on the
+//!   receiving node's own `RoundState::pending_membership_change` so
+//!   the next block *that node* proposes carries it
+//!   (`propose_block`). A non-member's signature is rejected outright
+//!   regardless of how well-formed the message otherwise is. If the
+//!   node a proposal reached never becomes proposer, or membership
+//!   has already diverged from what the proposer's own `node.toml`
+//!   described, the change simply doesn't get proposed promptly - a
+//!   narrow liveness gap, not a safety one, since whatever block
+//!   eventually does carry a change still has to earn a real quorum
+//!   under the actual current membership regardless of who proposed
+//!   it or how they heard about it.
+//!
+//!   Persistence mirrors Hardening 8's established pattern: `node.toml`
+//!   seeds the `members` LMDB table only once, on a node's first run
+//!   with a fresh `data_dir` (`store.is_membership_initialized`); every
+//!   run after that loads membership from the store, which
+//!   `apply_membership_change` keeps current, so `node.toml` is never
+//!   consulted again for this node's lifetime of that `data_dir` - the
+//!   store, not the config file, is what a restart trusts.
 
 use crate::config::NodeConfig;
 use crate::health;
 use crate::license;
 use crate::metrics::Metrics;
 use crate::net;
-use crate::persistence::{LockRecord, PeerKeyRecord, Store, TrustEntry};
-use crate::protocol::{self, BlockProposalMsg, BlockRequestMsg, BlockResponseMsg, BlockVoteMsg, KeyRotationMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg};
+use crate::persistence::{LockRecord, MemberRecord, PeerKeyRecord, Store, TrustEntry};
+use crate::protocol::{self, BlockProposalMsg, BlockRequestMsg, BlockResponseMsg, BlockVoteMsg, KeyRotationMsg, MembershipProposalMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg};
 use crate::state::NodeState;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::SeedableRng;
@@ -216,13 +268,21 @@ struct PeerInfo {
 
 struct Ctx {
     config: NodeConfig,
-    /// Mutable at runtime (Hardening 8's key rotation), unlike every
-    /// other `Ctx` field - a `std::sync::RwLock`, not `tokio::sync`,
-    /// since every access here is a quick read-or-write with no `.await`
-    /// held across the lock (see `broadcast`'s snapshot-then-drop
-    /// pattern for why that matters to keep true).
+    /// Mutable at runtime (Hardening 8's key rotation, and now dynamic
+    /// membership), unlike `config`/`endpoint`/`metrics` - a
+    /// `std::sync::RwLock`, not `tokio::sync`, since every access here
+    /// is a quick read-or-write with no `.await` held across the lock
+    /// (see `broadcast`'s snapshot-then-drop pattern for why that
+    /// matters to keep true).
     peers: std::sync::RwLock<HashMap<usize, PeerInfo>>,
-    all_ids: Vec<usize>,
+    /// Every node id in the network, including this one - sorted,
+    /// since `expected_proposer`'s round-robin depends on a stable
+    /// order. Mutable for the same reason `peers` is: a committed
+    /// `MembershipChange` (see this module's doc comment on dynamic
+    /// membership) adds or removes an entry here, atomically with the
+    /// matching `peers` update, the moment that change's own block
+    /// reaches a real quorum-certificate under the *old* membership.
+    all_ids: std::sync::RwLock<Vec<usize>>,
     endpoint: quinn::Endpoint,
     metrics: Arc<Metrics>,
 }
@@ -298,6 +358,15 @@ struct RoundState {
     /// a burst of proposals/votes for the same height this node is
     /// still behind on, rather than firing one request per message.
     last_sync_request: Option<(u64, tokio::time::Instant)>,
+    /// A membership change this node has accepted (from a validly
+    /// signed `MembershipProposalMsg` by a *current* member) and will
+    /// attach to the next block it proposes - see `propose_block` and
+    /// this module's doc comment on dynamic membership. Taken (not
+    /// cloned) the moment it's attached, so at most one proposal is
+    /// ever in flight at a time; a node whose proposal doesn't get
+    /// attached before being superseded by a newer one simply needs
+    /// to be re-proposed by the operator.
+    pending_membership_change: Option<chain::MembershipChange>,
 }
 
 /// A synthetic "true" trajectory every node observes noisily -
@@ -321,6 +390,17 @@ fn expected_proposer(all_ids: &[usize], height: u64, view: u64) -> usize {
 
 fn quorum_for(network_size: usize) -> usize {
     network_size / 2 + 1
+}
+
+/// A cheap, consistent snapshot of `ctx.all_ids` - mutable at runtime
+/// since a committed `MembershipChange` can grow or shrink it (see
+/// this module's doc comment on dynamic membership), unlike every
+/// other input `expected_proposer`/`quorum_for` take. Cloning a small
+/// `Vec<usize>` is simpler, and just as correct, as threading a lock
+/// guard through every caller - the same tradeoff `broadcast` already
+/// makes for `ctx.peers`.
+fn all_ids_snapshot(ctx: &Ctx) -> Vec<usize> {
+    ctx.all_ids.read().unwrap().clone()
 }
 
 fn decode_verifying_key(hex_str: &str) -> Option<VerifyingKey> {
@@ -522,24 +602,66 @@ pub async fn run(
     // - that's the whole point of persisting it in handle_key_rotation:
     // an operator never has to manually edit every peer's config file
     // again after the first time a rotation is learned.
-    let peers: HashMap<usize, PeerInfo> = config
-        .peers
+    // Dynamic membership (see this module's doc comment): once this
+    // node has ever started before, the `members` store - not
+    // `node.toml` - is the authoritative membership list, since a
+    // committed MembershipChange since the last run may have added or
+    // removed a peer node.toml was never updated to reflect. A brand
+    // new data_dir seeds `members` from node.toml once, here, and
+    // marks itself initialized so every future start trusts the store
+    // instead.
+    let bootstrap_peers: Vec<(usize, String, String)> = match store.is_membership_initialized() {
+        Ok(true) => match store.all_members() {
+            Ok(members) => {
+                log(format!("loaded dynamic membership from the store: {} peer(s)", members.len()));
+                members.into_iter().map(|(id, m)| (id, m.addr, m.pubkey_hex)).collect()
+            }
+            Err(e) => {
+                warn(format!("failed to read persisted membership: {e} - falling back to node.toml for this run"));
+                config.peers.iter().map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone())).collect()
+            }
+        },
+        Ok(false) => {
+            log("seeding dynamic membership from node.toml (first run with this data_dir)".to_string());
+            for p in &config.peers {
+                if let Err(e) = store.put_member(p.id, &MemberRecord { addr: p.addr.clone(), pubkey_hex: p.pubkey_hex.clone() }) {
+                    warn(format!("failed to seed membership for peer {}: {e}", p.id));
+                }
+            }
+            if let Err(e) = store.mark_membership_initialized() {
+                warn(format!("failed to mark membership initialized: {e}"));
+            }
+            config.peers.iter().map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone())).collect()
+        }
+        Err(e) => {
+            warn(format!("failed to check membership initialization: {e} - falling back to node.toml for this run"));
+            config.peers.iter().map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone())).collect()
+        }
+    };
+
+    // A persisted PeerKeyRecord (a rotation this node already accepted
+    // in some earlier run) always wins over whichever of the above
+    // supplied this peer's baseline key - that's the whole point of
+    // persisting it in handle_key_rotation: an operator never has to
+    // manually edit every peer's config file again after the first
+    // time a rotation is learned.
+    let peers: HashMap<usize, PeerInfo> = bootstrap_peers
         .iter()
-        .map(|p| {
-            let addr = p.addr.parse().expect("validated at config load");
-            match store.get_peer_key(p.id) {
+        .map(|(id, addr, pubkey_hex)| {
+            let addr = addr.parse().expect("validated at config load or by a committed MembershipChange");
+            match store.get_peer_key(*id) {
                 Ok(Some(record)) => match decode_verifying_key(&record.pubkey_hex) {
                     Some(pubkey) => {
-                        log(format!("peer {} loaded with its rotated key (rotation_seq={})", p.id, record.rotation_seq));
-                        return (p.id, PeerInfo { addr, pubkey, rotation_seq: record.rotation_seq });
+                        log(format!("peer {id} loaded with its rotated key (rotation_seq={})", record.rotation_seq));
+                        return (*id, PeerInfo { addr, pubkey, rotation_seq: record.rotation_seq });
                     }
-                    None => warn(format!("persisted key for peer {} is corrupt, falling back to node.toml", p.id)),
+                    None => warn(format!("persisted key for peer {id} is corrupt, falling back to its baseline key")),
                 },
                 Ok(None) => {}
-                Err(e) => warn(format!("failed to read persisted key for peer {}: {e} - falling back to node.toml", p.id)),
+                Err(e) => warn(format!("failed to read persisted key for peer {id}: {e} - falling back to its baseline key")),
             }
-            let pubkey = decode_verifying_key(&p.pubkey_hex).expect("validated at config load");
-            (p.id, PeerInfo { addr, pubkey, rotation_seq: 0 })
+            let pubkey = decode_verifying_key(pubkey_hex).expect("validated at config load or by a committed MembershipChange");
+            (*id, PeerInfo { addr, pubkey, rotation_seq: 0 })
         })
         .collect();
     let mut all_ids: Vec<usize> = peers.keys().cloned().chain(std::iter::once(node.node_id)).collect();
@@ -549,7 +671,7 @@ pub async fn run(
     reconcile_epoch_with_chain(&mut node, &store);
     metrics.epoch.store(node.epoch, Ordering::Relaxed);
 
-    let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids, endpoint, metrics };
+    let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(all_ids), endpoint, metrics };
     let mut rs = RoundState::default();
     // Restore this node's quorum-certificate lock across a restart -
     // forgetting it would let this node re-prevote for a conflicting
@@ -629,14 +751,15 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
     let head = node.head().clone();
     let next_height = head.height + 1;
 
+    let all_ids = all_ids_snapshot(ctx);
     let view_timeout = Duration::from_secs(ctx.config.round_interval_secs.saturating_mul(3).max(1));
     if maybe_bump_view(rs, next_height, view_timeout) {
         let new_view = current_view(rs, next_height);
         ctx.metrics.view_changes_total.fetch_add(1, Ordering::Relaxed);
         log(format!(
             "view-change: height={next_height} timed out waiting on proposer {}, advancing to view={new_view} (new proposer {})",
-            expected_proposer(&ctx.all_ids, next_height, new_view - 1),
-            expected_proposer(&ctx.all_ids, next_height, new_view)
+            expected_proposer(&all_ids, next_height, new_view - 1),
+            expected_proposer(&all_ids, next_height, new_view)
         ));
     }
 
@@ -647,7 +770,7 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
     broadcast(ctx, &Message::Observation(ObservationMsg { sender: node.node_id, values: obs, sig_hex: hex::encode(obs_sig.to_bytes()) }));
 
     let view = current_view(rs, next_height);
-    let proposer = expected_proposer(&ctx.all_ids, next_height, view);
+    let proposer = expected_proposer(&all_ids, next_height, view);
     if proposer == node.node_id && !rs.proposed_rounds.contains(&(next_height, view)) {
         propose_block(ctx, node, store, rs, &head, view).await;
     }
@@ -687,6 +810,19 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     let spread = values.iter().map(|v| fusion::l2_distance(v, &fused)).sum::<f64>() / values.len() as f64;
     let confidence = (1.0 / (1.0 + spread)).clamp(0.0, 1.0);
 
+    // Piggybacks any accepted-but-not-yet-proposed membership change
+    // onto this block (see this module's doc comment on dynamic
+    // membership) - it takes effect only if *this* block goes on to
+    // reach a real precommit quorum under the membership as it stands
+    // right now, before the change. Safe to attach even though this
+    // node couldn't propose at all while locked (the branch above
+    // already returned): a block is only ever built fresh here when
+    // this node isn't locked on anything for this height.
+    let membership_change = rs.pending_membership_change.take();
+    if let Some(mc) = &membership_change {
+        log(format!("height={next_height}: attaching pending membership change {mc:?} to this proposal"));
+    }
+
     let mut block = Block {
         height: next_height,
         parent: head.hash.clone(),
@@ -706,6 +842,7 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
         // quorum at any view yet. maybe_commit fills in the real
         // value right before persisting, once it has one.
         committed_at_view: 0,
+        membership_change,
     };
     let identity_canon = protocol::block_canon(&block);
     block.hash = chain::block_hash(&identity_canon);
@@ -759,17 +896,98 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
         Message::KeyRotation(k) => handle_key_rotation(ctx, store, k).await,
         Message::BlockRequest(req) => handle_block_request(ctx, node, req).await,
         Message::BlockResponse(resp) => handle_block_response(ctx, node, store, rs, resp).await,
+        Message::MembershipProposal(m) => handle_membership_proposal(ctx, node, rs, m),
     }
 }
 
-/// Accepts a peer's self-announced key rotation if (a) the sender is
-/// already a known peer, (b) `rotation_seq` is strictly ahead of the
-/// last one accepted from them (replay/rollback protection - see
-/// `crate::protocol::KeyRotationMsg`'s doc comment), and (c) the
-/// signature verifies against the sender's *currently* trusted key,
-/// proving continuity from the old identity to the new one. On
-/// success, updates the live `ctx.peers` entry immediately and
-/// persists it so a future restart doesn't need to relearn it.
+/// Applies a `MembershipChange` that has already reached a real
+/// precommit quorum under the *old* membership (the only thing
+/// `maybe_commit`/`handle_block_response` ever call this for - see
+/// this module's doc comment on dynamic membership). Updates
+/// `ctx.peers`/`ctx.all_ids` atomically with each other and persists
+/// the change, so neither a concurrent reader nor a future restart
+/// can ever observe one updated without the other.
+fn apply_membership_change(ctx: &Ctx, store: &Store, mc: &chain::MembershipChange) {
+    match mc {
+        chain::MembershipChange::Add { node_id, addr, pubkey_hex } => {
+            let Some(pubkey) = decode_verifying_key(pubkey_hex) else {
+                warn(format!("committed membership change adds peer {node_id} with an unparseable pubkey - this should never happen for a block that reached quorum; refusing to apply it"));
+                return;
+            };
+            let Ok(parsed_addr) = addr.parse() else {
+                warn(format!("committed membership change adds peer {node_id} with an unparseable address '{addr}' - refusing to apply it"));
+                return;
+            };
+            {
+                let mut peers = ctx.peers.write().unwrap();
+                peers.insert(*node_id, PeerInfo { addr: parsed_addr, pubkey, rotation_seq: 0 });
+            }
+            {
+                let mut all_ids = ctx.all_ids.write().unwrap();
+                if !all_ids.contains(node_id) {
+                    all_ids.push(*node_id);
+                    all_ids.sort_unstable();
+                }
+            }
+            if let Err(e) = store.put_member(*node_id, &MemberRecord { addr: addr.clone(), pubkey_hex: pubkey_hex.clone() }) {
+                warn(format!("failed to persist added member {node_id}: {e}"));
+            }
+            log(format!("membership: added peer {node_id} ({addr}) - network size and quorum now reflect it"));
+        }
+        chain::MembershipChange::Remove { node_id } => {
+            {
+                let mut peers = ctx.peers.write().unwrap();
+                peers.remove(node_id);
+            }
+            {
+                let mut all_ids = ctx.all_ids.write().unwrap();
+                all_ids.retain(|id| id != node_id);
+            }
+            if let Err(e) = store.remove_member(*node_id) {
+                warn(format!("failed to persist removal of member {node_id}: {e}"));
+            }
+            log(format!("membership: removed peer {node_id} - network size and quorum now reflect it"));
+        }
+    }
+}
+
+/// Accepts a `MembershipProposalMsg` if it is validly signed by a
+/// *current* member (including this node proposing its own change) -
+/// a non-member's signature, however otherwise well-formed, is
+/// rejected outright, since a change's legitimacy can only ever come
+/// from someone who already counts toward quorum. Acceptance here
+/// does not itself change anything: it only stages the change on this
+/// node's own `RoundState` so the next block *this node* proposes
+/// carries it (see `propose_block`), and that block still has to reach
+/// a real precommit quorum - under the unchanged, pre-change
+/// membership - like any other block, via `apply_membership_change`.
+/// A proposal this node doesn't happen to be the proposer for simply
+/// expires unused; the peer-to-peer membership-proposal path is a
+/// liveness convenience for getting a change proposed promptly, never
+/// a second way to make one take effect.
+fn handle_membership_proposal(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, msg: MembershipProposalMsg) {
+    let known_pubkey = if msg.sender == node.node_id {
+        Some(node.verifying_key)
+    } else {
+        ctx.peers.read().unwrap().get(&msg.sender).map(|p| p.pubkey)
+    };
+    let Some(known_pubkey) = known_pubkey else {
+        warn(format!("ignoring membership proposal from unknown sender {}", msg.sender));
+        return;
+    };
+    let canon = protocol::membership_proposal_canon(msg.sender, &msg.change);
+    let Some(sig) = decode_signature(&msg.sig_hex) else {
+        warn(format!("membership proposal from {} has an unparseable signature", msg.sender));
+        return;
+    };
+    if !crypto::verify_canon(&known_pubkey, &canon, &sig) {
+        warn(format!("invalid membership-proposal signature from {}", msg.sender));
+        return;
+    }
+    log(format!("accepted membership proposal from {}: {:?} - will attach to the next block this node proposes", msg.sender, msg.change));
+    rs.pending_membership_change = Some(msg.change);
+}
+
 async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
     let KeyRotationMsg { sender, new_pubkey_hex, rotation_seq, sig_hex } = msg;
 
@@ -919,7 +1137,7 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         );
         return;
     }
-    let expected = expected_proposer(&ctx.all_ids, p.block.height, p.view);
+    let expected = expected_proposer(&all_ids_snapshot(ctx), p.block.height, p.view);
     if p.sender != expected {
         warn(format!("ignoring proposal from {} - expected proposer for view {} is {}", p.sender, p.view, expected));
         return;
@@ -1051,7 +1269,7 @@ fn maybe_cast_own_prevote(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, heig
     if let Some((_, locked_hash)) = rs.locked.get(&height) {
         if locked_hash != block_hash {
             let tally_len = rs.prevotes.get(&key).map(|t| t.len()).unwrap_or(0);
-            if tally_len < quorum_for(ctx.all_ids.len()) {
+            if tally_len < quorum_for(ctx.all_ids.read().unwrap().len()) {
                 return; // still locked elsewhere - no polka yet for this candidate
             }
             log(format!(
@@ -1087,7 +1305,7 @@ async fn maybe_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     let Some(block) = rs.candidates.get(block_hash).cloned() else { return };
     let key = (block_hash.to_string(), view);
     let Some(tally) = rs.prevotes.get(&key) else { return };
-    if tally.len() < quorum_for(ctx.all_ids.len()) {
+    if tally.len() < quorum_for(ctx.all_ids.read().unwrap().len()) {
         return;
     }
     if let Some((locked_view, locked_hash)) = rs.locked.get(&block.height) {
@@ -1198,7 +1416,7 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     // candidates at the same height both have a real chance to reach
     // quorum in an adversarial/partitioned network.
     let Some(precommits) = rs.precommits.get(&(block_hash.to_string(), view)).cloned() else { return };
-    if precommits.len() < quorum_for(ctx.all_ids.len()) {
+    if precommits.len() < quorum_for(ctx.all_ids.read().unwrap().len()) {
         return;
     }
 
@@ -1237,6 +1455,10 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
         if let Err(e) = store.put_epoch(block.epoch) {
             warn(format!("failed to persist rotated epoch: {e}"));
         }
+    }
+
+    if let Some(mc) = &block.membership_change {
+        apply_membership_change(ctx, store, mc);
     }
 
     rs.candidates.retain(|_, b| b.height > block.height);
@@ -1349,7 +1571,6 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
         warn(format!("rejected block response from {} - unknown sender or invalid signature", resp.sender));
         return;
     }
-    let quorum = quorum_for(ctx.all_ids.len());
     let mut applied = 0u64;
 
     for block in resp.blocks {
@@ -1367,6 +1588,17 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
             break;
         }
 
+        // Recomputed fresh for every block in the batch, never hoisted
+        // above the loop: a membership change applied partway through
+        // (see below) changes the network size, and each block's own
+        // signatures must be checked against quorum as it genuinely
+        // stood immediately before that block - exactly the membership
+        // this loop's own state reflects at this point, since every
+        // earlier block's change has already been applied. Hoisting
+        // this would let a membership-growing batch under-verify every
+        // block after the change, accepting fewer signatures than the
+        // new membership actually requires.
+        let quorum = quorum_for(ctx.all_ids.read().unwrap().len());
         let precommit_canon_str = protocol::precommit_canon(block.committed_at_view, &block);
         let mut seen_signers = std::collections::HashSet::new();
         let mut valid = 0usize;
@@ -1410,6 +1642,13 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
             if let Err(e) = store.put_epoch(block.epoch) {
                 warn(format!("failed to persist rotated epoch during sync: {e}"));
             }
+        }
+        // A synced historical block can carry a membership change
+        // too - replaying it is what lets a catching-up node end up
+        // with the exact same membership set it would have reached by
+        // having been online the whole time, not just the same chain.
+        if let Some(mc) = &block.membership_change {
+            apply_membership_change(ctx, store, mc);
         }
         applied += 1;
     }
@@ -1626,8 +1865,10 @@ mod tests {
             sig_weight: 0.0,
             hash: String::new(),
             committed_at_view: 0,
+            membership_change: None,
         };
-        let expected = chain::canon_string(1, "GENESIS", &chain::hash_vec(&[1.0, 2.0]), 0.9, &chain::hash_list(&[]), 0);
+        let expected =
+            chain::canon_string(1, "GENESIS", &chain::hash_vec(&[1.0, 2.0]), 0.9, &chain::hash_list(&[]), 0, &chain::hash_membership_change(&None));
         assert_eq!(protocol::block_canon(&block), expected);
     }
 
@@ -1660,7 +1901,7 @@ mod tests {
         };
         let peers = HashMap::from([(1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key(), rotation_seq: 0 })]);
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: vec![0, 1], endpoint, metrics: Arc::new(Metrics::new(&[1])) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(vec![0, 1]), endpoint, metrics: Arc::new(Metrics::new(&[1])) };
         (ctx, self_sk, peer_sk)
     }
 
@@ -1766,7 +2007,7 @@ mod tests {
 
         // height=1, view=0: expected_proposer([0,1], 1, 0) == 1, so
         // peer 1 is the legitimate proposer here.
-        assert_eq!(expected_proposer(&ctx.all_ids, 1, 0), 1);
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 0), 1);
         let proposal = signed_proposal(1, &new_sk, 1, "GENESIS", 0, 1.0);
 
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal.clone()).await;
@@ -1928,6 +2169,7 @@ mod tests {
             sig_weight: 1.0,
             hash: "head1".to_string(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -1959,6 +2201,7 @@ mod tests {
             sig_weight: 0.0,
             hash: String::new(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let identity_canon = protocol::block_canon(&block);
         block.hash = chain::block_hash(&identity_canon);
@@ -2002,6 +2245,7 @@ mod tests {
             sig_weight: 1.0,
             hash: "head1".to_string(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -2018,7 +2262,7 @@ mod tests {
         // Peer 1 is the real expected proposer for (height=2, view=1):
         // expected_proposer([0,1], 2, 1) == all_ids[(2+1)%2] == 1.
         let ahead_view = 1u64;
-        assert_eq!(expected_proposer(&ctx.all_ids, 2, ahead_view), 1);
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 2, ahead_view), 1);
 
         let mut block = Block {
             height: 2,
@@ -2031,6 +2275,7 @@ mod tests {
             sig_weight: 0.0,
             hash: String::new(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let identity_canon = protocol::block_canon(&block);
         block.hash = chain::block_hash(&identity_canon);
@@ -2099,6 +2344,46 @@ mod tests {
             sig_weight: 0.0,
             hash: String::new(),
             committed_at_view: 0,
+            membership_change: None,
+        };
+        let identity_canon = protocol::block_canon(&block);
+        block.hash = chain::block_hash(&identity_canon);
+        let signing_canon = protocol::view_block_canon(view, &block);
+        let sig = crypto::sign_canon(signer_sk, &signing_canon);
+        block.signatures = vec![SigEntry {
+            node_id: sender,
+            pubkey_hex: hex::encode(signer_sk.verifying_key().to_bytes()),
+            sig_hex: hex::encode(sig.to_bytes()),
+        }];
+        block.sig_weight = sig_weight;
+        BlockProposalMsg { sender, view, block }
+    }
+
+    /// Same as `signed_proposal`, but carrying a `MembershipChange` -
+    /// set *before* computing the identity hash, since
+    /// `membership_change` is folded into `block_canon` and must be
+    /// part of exactly what's signed, like any other real content.
+    fn signed_proposal_with_membership_change(
+        sender: usize,
+        signer_sk: &ed25519_dalek::SigningKey,
+        height: u64,
+        parent: &str,
+        view: u64,
+        sig_weight: f64,
+        change: chain::MembershipChange,
+    ) -> BlockProposalMsg {
+        let mut block = Block {
+            height,
+            parent: parent.to_string(),
+            state: vec![height as f64, height as f64],
+            confidence: 0.9,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 0.0,
+            hash: String::new(),
+            committed_at_view: 0,
+            membership_change: Some(change),
         };
         let identity_canon = protocol::block_canon(&block);
         block.hash = chain::block_hash(&identity_canon);
@@ -2147,6 +2432,37 @@ mod tests {
     /// not a live round in progress.
     fn committed_block(height: u64, parent: &str, state: Vec<f64>, view: u64, signers: &[(usize, &ed25519_dalek::SigningKey)]) -> Block {
         let mut block = Block { height, parent: parent.to_string(), state, confidence: 0.9, ..Block::genesis(0) };
+        block.reconciles = vec![];
+        block.epoch = chain::epoch_for_height(height);
+        let identity_canon = protocol::block_canon(&block);
+        block.hash = chain::block_hash(&identity_canon);
+        block.committed_at_view = view;
+        let canon = protocol::precommit_canon(view, &block);
+        block.signatures = signers
+            .iter()
+            .map(|(id, sk)| {
+                let sig = crypto::sign_canon(sk, &canon);
+                SigEntry { node_id: *id, pubkey_hex: hex::encode(sk.verifying_key().to_bytes()), sig_hex: hex::encode(sig.to_bytes()) }
+            })
+            .collect();
+        block.sig_weight = block.signatures.len() as f64;
+        block
+    }
+
+    /// Same as `committed_block`, but carrying a `MembershipChange` -
+    /// set before computing the identity hash, same reasoning as
+    /// `signed_proposal_with_membership_change`. For tests proving a
+    /// node that syncs in a *historical* membership-change block
+    /// (rather than seeing it live) still applies it.
+    fn committed_block_with_membership_change(
+        height: u64,
+        parent: &str,
+        state: Vec<f64>,
+        view: u64,
+        signers: &[(usize, &ed25519_dalek::SigningKey)],
+        change: chain::MembershipChange,
+    ) -> Block {
+        let mut block = Block { height, parent: parent.to_string(), state, confidence: 0.9, membership_change: Some(change), ..Block::genesis(0) };
         block.reconciles = vec![];
         block.epoch = chain::epoch_for_height(height);
         let identity_canon = protocol::block_canon(&block);
@@ -2300,7 +2616,7 @@ mod tests {
         // from whichever id is genuinely the expected proposer there.
         let far_height = 5u64;
         let far_view = 0u64;
-        let proposer = expected_proposer(&ctx.all_ids, far_height, far_view);
+        let proposer = expected_proposer(&ctx.all_ids.read().unwrap(), far_height, far_view);
         let proposer_sk = if proposer == 1 { &peer_sk } else { &self_sk };
         let far_proposal = signed_proposal(proposer, proposer_sk, far_height, "whatever-parent-hash", far_view, 1.0);
 
@@ -2529,7 +2845,7 @@ mod tests {
             (id, PeerInfo { addr: format!("127.0.0.1:{id}").parse().unwrap(), pubkey: peer_sks[id - 1].verifying_key(), rotation_seq: 0 })
         }));
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: vec![0, 1, 2, 3], endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(vec![0, 1, 2, 3]), endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
         let dir = crate::test_support::TempDir::new("locking_prevents_split_commit");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -2544,8 +2860,8 @@ mod tests {
         let mut rs = RoundState::default();
 
         // expected_proposer([0,1,2,3], 1, 0) == 1; expected_proposer(..., 1, 1) == 2.
-        assert_eq!(expected_proposer(&ctx.all_ids, 1, 0), 1);
-        assert_eq!(expected_proposer(&ctx.all_ids, 1, 1), 2);
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 0), 1);
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 1), 2);
 
         // --- View 0: block A is legitimately proposed and reaches a real prevote quorum. ---
         let a = signed_proposal_with_state(1, &peer_sks[0], 1, "GENESIS", 0, 1.0, vec![1.0, 1.0]);
@@ -2690,7 +3006,7 @@ mod tests {
         // back to peer 1 only on even views, and it must still be
         // peer 1 - not this node itself - proposing, for "a real
         // peer's legitimate proposal" to mean anything here.
-        assert_eq!(expected_proposer(&ctx.all_ids, 1, 2), 1);
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 2), 1);
         let b = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 2, 1.0, vec![2.0, 2.0]);
         handle_proposal(&ctx, &mut node, &store, &mut rs_after_restart, b.clone()).await;
 
@@ -2726,6 +3042,7 @@ mod tests {
             sig_weight: 1.0,
             hash: "real-head-1".to_string(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -2752,6 +3069,7 @@ mod tests {
             sig_weight: 1000.0,
             hash: String::new(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let identity_canon = protocol::block_canon(&forged);
         forged.hash = chain::block_hash(&identity_canon);
@@ -2786,6 +3104,7 @@ mod tests {
             sig_weight: 1.0,
             hash: "real-head-1".to_string(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -2832,6 +3151,7 @@ mod tests {
             sig_weight: 5.0,
             hash: "real-head-1".to_string(),
             committed_at_view: 0,
+            membership_change: None,
         };
         let mut node = NodeState {
             node_id: 0,
@@ -2898,7 +3218,7 @@ mod tests {
             (3, PeerInfo { addr: "127.0.0.1:3".parse().unwrap(), pubkey: other_sks[1].verifying_key(), rotation_seq: 0 }),
         ]);
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: vec![0, 1, 2, 3], endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(vec![0, 1, 2, 3]), endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
         let dir = crate::test_support::TempDir::new("candidate_flood_cap");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -2974,7 +3294,7 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: std::sync::RwLock::new(vec![0]), endpoint, metrics: Arc::new(Metrics::default()) };
         let dir = crate::test_support::TempDir::new("no_local_double_commit");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3028,7 +3348,7 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: std::sync::RwLock::new(vec![0]), endpoint, metrics: Arc::new(Metrics::default()) };
         let dir = crate::test_support::TempDir::new("prune_view_for_height");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3073,7 +3393,7 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: vec![0], endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: std::sync::RwLock::new(vec![0]), endpoint, metrics: Arc::new(Metrics::default()) };
         let dir = crate::test_support::TempDir::new("epoch_rotation_boundary");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3263,5 +3583,370 @@ mod tests {
         assert_eq!(metrics_b.head_height.load(Ordering::Relaxed), last_b.height);
         assert!(metrics_a.mean_trust_weight() > 0.0, "trust toward the peer should have grown from real observations");
         assert!(metrics_b.mean_trust_weight() > 0.0);
+    }
+
+    /// Same shape as `test_ctx_with_one_peer`, generalized to an
+    /// arbitrary peer-id list - built for the dynamic-membership tests
+    /// below, which need more than one peer to show a quorum actually
+    /// changing.
+    fn test_ctx_with_peers(peer_ids: &[usize]) -> (Ctx, ed25519_dalek::SigningKey, Vec<ed25519_dalek::SigningKey>) {
+        use crate::config::PeerConfig;
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let peer_sks: Vec<ed25519_dalek::SigningKey> = peer_ids.iter().map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)).collect();
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: peer_ids
+                .iter()
+                .zip(&peer_sks)
+                .map(|(&id, sk)| PeerConfig { id, addr: format!("127.0.0.1:{id}"), pubkey_hex: hex::encode(sk.verifying_key().to_bytes()) })
+                .collect(),
+        };
+        let peers = HashMap::from_iter(
+            peer_ids
+                .iter()
+                .zip(&peer_sks)
+                .map(|(&id, sk)| (id, PeerInfo { addr: format!("127.0.0.1:{id}").parse().unwrap(), pubkey: sk.verifying_key(), rotation_seq: 0 })),
+        );
+        let endpoint = net::make_client_endpoint().unwrap();
+        let mut all_ids = vec![0];
+        all_ids.extend(peer_ids.iter().copied());
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(peers),
+            all_ids: std::sync::RwLock::new(all_ids),
+            endpoint,
+            metrics: Arc::new(Metrics::new(peer_ids)),
+        };
+        (ctx, self_sk, peer_sks)
+    }
+
+    #[tokio::test]
+    async fn a_membership_proposal_from_a_non_member_is_rejected() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1
+        let node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        let change = chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:7".to_string(), pubkey_hex: "ab".repeat(32) };
+
+        // Sender 99 isn't configured as a peer at all.
+        let unrelated_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let canon = protocol::membership_proposal_canon(99, &change);
+        let sig = crypto::sign_canon(&unrelated_sk, &canon);
+        handle_membership_proposal(
+            &ctx,
+            &node,
+            &mut rs,
+            MembershipProposalMsg { sender: 99, change: change.clone(), sig_hex: hex::encode(sig.to_bytes()) },
+        );
+        assert_eq!(rs.pending_membership_change, None, "an unknown sender must never get its proposal staged");
+
+        // Sender 1 is a real, current member, but this signature is
+        // forged - signed by this node's own key, not peer 1's.
+        let canon = protocol::membership_proposal_canon(1, &change);
+        let forged_sig = crypto::sign_canon(&self_sk, &canon);
+        handle_membership_proposal(
+            &ctx,
+            &node,
+            &mut rs,
+            MembershipProposalMsg { sender: 1, change: change.clone(), sig_hex: hex::encode(forged_sig.to_bytes()) },
+        );
+        assert_eq!(rs.pending_membership_change, None, "a forged signature from a real member's id must still be rejected");
+
+        // Sanity: the identical message, genuinely signed by peer 1's
+        // real key, is accepted - proving the two rejections above
+        // were really about sender/signature, not some other mismatch.
+        let genuine_sig = crypto::sign_canon(&peer_sk, &canon);
+        handle_membership_proposal(
+            &ctx,
+            &node,
+            &mut rs,
+            MembershipProposalMsg { sender: 1, change: change.clone(), sig_hex: hex::encode(genuine_sig.to_bytes()) },
+        );
+        assert_eq!(rs.pending_membership_change, Some(change));
+    }
+
+    /// The liveness convenience half of dynamic membership: a proposal
+    /// genuinely signed by a current member just stages the change on
+    /// this node's own `RoundState`, and the very next block *this
+    /// node* proposes carries it - proven by driving a real
+    /// `propose_block` call afterward and inspecting what it actually
+    /// built, not just the staged field in isolation.
+    #[tokio::test]
+    async fn an_accepted_membership_proposal_is_attached_to_this_nodes_next_proposal() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1
+        let dir = crate::test_support::TempDir::new("membership_proposal_attached");
+        let store = Store::open(dir.path()).unwrap();
+        let head = Block {
+            height: 1,
+            parent: "GENESIS".to_string(),
+            state: vec![0.0, 0.0],
+            confidence: 1.0,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 1.0,
+            hash: "head1".to_string(),
+            committed_at_view: 0,
+            membership_change: None,
+        };
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2), head.clone()],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+        rs.latest_observations.insert(0, vec![1.0, 1.0]);
+        rs.latest_observations.insert(1, vec![1.0, 1.0]);
+
+        let change = chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:7".to_string(), pubkey_hex: "ab".repeat(32) };
+        let canon = protocol::membership_proposal_canon(1, &change);
+        let sig = crypto::sign_canon(&peer_sk, &canon);
+        handle_membership_proposal(&ctx, &node, &mut rs, MembershipProposalMsg { sender: 1, change: change.clone(), sig_hex: hex::encode(sig.to_bytes()) });
+        assert_eq!(rs.pending_membership_change, Some(change.clone()));
+
+        // height=2, view=0: expected_proposer([0,1], 2, 0) == 0, so
+        // this node really is the proposer for this round.
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 2, 0), 0);
+        propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
+
+        assert_eq!(rs.pending_membership_change, None, "the staged change must be taken, not merely copied, so it's never attached twice");
+        let proposed = rs.candidates.values().find(|b| b.height == 2).expect("this node should have proposed height 2");
+        assert_eq!(proposed.membership_change, Some(change), "the proposal this node actually built must carry the staged change");
+    }
+
+    /// The core safety property of dynamic membership, stated
+    /// precisely: a `MembershipChange` must never take effect until
+    /// its own carrying block has independently earned a real
+    /// precommit quorum-certificate. Here the block only ever gets
+    /// this node's own lone precommit - never enough for 2-of-2 - so
+    /// nothing about this node's live membership or persisted state
+    /// may change, regardless of what the uncommitted block claims.
+    #[tokio::test]
+    async fn a_membership_change_never_takes_effect_unless_its_own_block_reaches_a_real_precommit_quorum() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, quorum=2
+        let dir = crate::test_support::TempDir::new("membership_gated_by_quorum");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let change = chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:7".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) };
+        let proposal = signed_proposal_with_membership_change(1, &peer_sk, 1, "GENESIS", 0, 1.0, change);
+        let block_hash = proposal.block.hash.clone();
+        rs.candidates.insert(block_hash.clone(), proposal.block.clone());
+        rs.legitimate_rounds.insert((block_hash.clone(), 0));
+        let my_sig = crypto::sign_canon(&self_sk, &protocol::precommit_canon(0, &proposal.block));
+        rs.precommits.insert(
+            (block_hash.clone(), 0),
+            vec![SigEntry { node_id: 0, pubkey_hex: hex::encode(self_sk.verifying_key().to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) }],
+        );
+
+        maybe_commit(&ctx, &mut node, &store, &mut rs, &block_hash, 0).await;
+
+        assert_eq!(node.chain.len(), 1, "a lone precommit must never reach this network's real 2-of-2 quorum");
+        assert!(!ctx.peers.read().unwrap().contains_key(&2), "an uncommitted block's membership change must never take effect");
+        assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1], "network size must stay exactly as configured until a real quorum confirms otherwise");
+        assert!(store.all_members().unwrap().is_empty(), "nothing should ever be persisted for an unconfirmed change");
+    }
+
+    /// The real end-to-end claim: once a block carrying `Add` reaches
+    /// a genuine precommit quorum under the *old* membership, the new
+    /// peer immediately counts toward quorum for every later height -
+    /// proven here by showing the exact signature count that would
+    /// have committed height 2 under the old 3-node quorum (2 of 3)
+    /// no longer suffices once the network has grown to 4, and that a
+    /// real quorum of 3 is what it actually takes.
+    #[tokio::test]
+    async fn adding_a_peer_via_a_committed_change_raises_the_quorum_enforced_for_the_next_height() {
+        let (ctx, self_sk, peer_sks) = test_ctx_with_peers(&[1, 2]); // self=0, quorum=2 over {0,1,2}
+        let dir = crate::test_support::TempDir::new("membership_add_raises_quorum");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let new_peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let change =
+            chain::MembershipChange::Add { node_id: 3, addr: "127.0.0.1:4".to_string(), pubkey_hex: hex::encode(new_peer_sk.verifying_key().to_bytes()) };
+
+        // height=1, view=0: expected_proposer([0,1,2], 1, 0) == 1.
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 0), 1);
+        let proposal = signed_proposal_with_membership_change(1, &peer_sks[0], 1, "GENESIS", 0, 1.0, change.clone());
+        let block_hash = proposal.block.hash.clone();
+        let block_snapshot = proposal.block.clone();
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
+        assert_eq!(node.chain.len(), 1, "2-of-3 prevotes locks and self-precommits, but that alone is still short of the 2-of-3 precommit quorum");
+
+        let peer2_precommit = signed_precommit(2, &peer_sks[1], &block_hash, 0, &block_snapshot);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer2_precommit).await;
+
+        let committed = node.chain.last().expect("height 1 should have reached a genuine 2-of-3 precommit quorum");
+        assert_eq!(committed.height, 1);
+        assert_eq!(committed.membership_change, Some(change));
+        assert!(ctx.peers.read().unwrap().contains_key(&3), "the committed Add must take effect immediately");
+        assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1, 2, 3]);
+        assert!(store.all_members().unwrap().iter().any(|(id, _)| *id == 3), "the new member must be persisted too");
+
+        // Network is now 4 nodes, quorum_for(4) == 3 - strictly more
+        // than the 2 that just sufficed for height 1.
+        let head = committed.clone();
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 2, 0), 2);
+        let proposal2 = signed_proposal(2, &peer_sks[1], 2, &head.hash, 0, 1.0);
+        let block2_hash = proposal2.block.hash.clone();
+        let block2_snapshot = proposal2.block.clone();
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal2).await;
+        assert_eq!(
+            node.chain.len(),
+            2,
+            "only 2 of 4 have prevoted so far (proposer + self) - no longer enough to even lock, now that quorum is 3"
+        );
+
+        // A third, genuine prevote from the newly-added peer 3 is what
+        // the new quorum actually requires to form a polka at all.
+        let peer3_vote = signed_vote(3, &new_peer_sk, &block2_hash, 0, &block2_snapshot);
+        handle_vote(&ctx, &mut node, &store, &mut rs, peer3_vote).await;
+        assert_eq!(node.chain.len(), 2, "locking now (3-of-4 prevotes) casts this node's own precommit, but that alone is still only 1 of the 3 needed");
+
+        let peer2_precommit2 = signed_precommit(2, &peer_sks[1], &block2_hash, 0, &block2_snapshot);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer2_precommit2).await;
+        assert_eq!(node.chain.len(), 2, "2 of the 3 required precommits still isn't quorum under the grown network");
+
+        let peer3_precommit = signed_precommit(3, &new_peer_sk, &block2_hash, 0, &block2_snapshot);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer3_precommit).await;
+        let committed2 = node.chain.last().expect("the 3rd precommit should complete the new 3-of-4 quorum");
+        assert_eq!(committed2.hash, block2_hash, "height 2 should have committed only once the grown network's real quorum was actually met");
+    }
+
+    /// The mirror image: removing a peer shrinks the quorum enforced
+    /// for later heights. 4 nodes start at quorum 3; after a committed
+    /// `Remove` drops the network to 3, a block for the next height
+    /// commits on exactly 2 precommits - which would never have been
+    /// enough before the removal.
+    #[tokio::test]
+    async fn removing_a_peer_via_a_committed_change_lowers_the_quorum_enforced_for_the_next_height() {
+        let (ctx, self_sk, peer_sks) = test_ctx_with_peers(&[1, 2, 3]); // self=0, quorum=3 over {0,1,2,3}
+        let dir = crate::test_support::TempDir::new("membership_remove_lowers_quorum");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let change = chain::MembershipChange::Remove { node_id: 3 };
+        // height=1, view=0: expected_proposer([0,1,2,3], 1, 0) == 1.
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 0), 1);
+        let proposal = signed_proposal_with_membership_change(1, &peer_sks[0], 1, "GENESIS", 0, 1.0, change.clone());
+        let block_hash = proposal.block.hash.clone();
+        let block_snapshot = proposal.block.clone();
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
+        assert_eq!(node.chain.len(), 1, "2-of-4 prevotes (proposer + self) isn't enough to even lock under this network's real quorum of 3");
+
+        let peer2_vote = signed_vote(2, &peer_sks[1], &block_hash, 0, &block_snapshot);
+        handle_vote(&ctx, &mut node, &store, &mut rs, peer2_vote).await;
+        assert_eq!(node.chain.len(), 1, "locking now (3-of-4 prevotes) casts this node's own precommit, but that's still only 1 of 3 needed");
+
+        let peer2_precommit = signed_precommit(2, &peer_sks[1], &block_hash, 0, &block_snapshot);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer2_precommit).await;
+        assert_eq!(node.chain.len(), 1, "2 of the 3 required precommits still isn't quorum");
+
+        let peer3_precommit = signed_precommit(3, &peer_sks[2], &block_hash, 0, &block_snapshot);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer3_precommit).await;
+        let committed = node.chain.last().expect("the 3rd precommit should complete the real 3-of-4 quorum");
+        assert_eq!(committed.membership_change, Some(change));
+        assert!(!ctx.peers.read().unwrap().contains_key(&3), "the committed Remove must take effect immediately");
+        assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1, 2]);
+        assert!(!store.all_members().unwrap().iter().any(|(id, _)| *id == 3), "the removal must be persisted too");
+
+        // Network is now 3 nodes, quorum_for(3) == 2 - strictly less
+        // than the 3 that height 1 just needed.
+        let head = committed.clone();
+        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 2, 0), 2);
+        let proposal2 = signed_proposal(2, &peer_sks[1], 2, &head.hash, 0, 1.0);
+        let block2_hash = proposal2.block.hash.clone();
+        let block2_snapshot = proposal2.block.clone();
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal2).await;
+        assert_eq!(node.chain.len(), 2, "2-of-3 prevotes (proposer + self) now meets the shrunk quorum and locks immediately");
+
+        let peer1_precommit = signed_precommit(1, &peer_sks[0], &block2_hash, 0, &block2_snapshot);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer1_precommit).await;
+        let committed2 = node.chain.last().expect("2 precommits should now be enough under the shrunk network's real quorum of 2");
+        assert_eq!(committed2.hash, block2_hash, "height 2 should commit on exactly the quorum the shrunk membership actually requires");
+    }
+
+    /// Chain-sync's own replay path must apply a historical
+    /// membership change exactly like a live commit would have - a
+    /// node catching up after missing the change entirely still ends
+    /// up with the same membership it would have reached by being
+    /// online the whole time, not just the same chain content.
+    #[tokio::test]
+    async fn syncing_a_historical_block_replays_its_membership_change_exactly_like_a_live_commit() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, quorum=2
+        let dir = crate::test_support::TempDir::new("sync_replays_membership_change");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(1)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let new_peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let change =
+            chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:9".to_string(), pubkey_hex: hex::encode(new_peer_sk.verifying_key().to_bytes()) };
+        let b1 = committed_block_with_membership_change(1, "GENESIS", vec![1.0], 0, &[(0, &self_sk), (1, &peer_sk)], change.clone());
+        let b2 = committed_block(2, &b1.hash, vec![2.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
+        let blocks = vec![b1.clone(), b2.clone()];
+        let response_canon = protocol::block_response_canon(1, &blocks);
+        let sig = crypto::sign_canon(&peer_sk, &response_canon);
+        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+
+        handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
+
+        assert_eq!(node.chain.len(), 3, "genesis + 2 synced blocks");
+        assert_eq!(node.head().hash, b2.hash, "sync must still apply every block, not stop at the one carrying the membership change");
+        assert!(ctx.peers.read().unwrap().contains_key(&2), "replaying a synced membership-change block must apply it exactly like a live commit");
+        assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1, 2]);
+        assert!(store.all_members().unwrap().iter().any(|(id, _)| *id == 2), "the replayed change must be persisted too");
     }
 }

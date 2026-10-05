@@ -37,8 +37,41 @@ pub fn hash_list(xs: &[String]) -> String {
     hex16(&hasher.finalize())
 }
 
-pub fn canon_string(height: u64, parent: &str, state_hash: &str, confidence: f64, reconciles_hash: &str, epoch: u64) -> String {
-    format!("{height}|{parent}|{state_hash}|{confidence:.8}|{reconciles_hash}|{epoch}")
+pub fn canon_string(
+    height: u64,
+    parent: &str,
+    state_hash: &str,
+    confidence: f64,
+    reconciles_hash: &str,
+    epoch: u64,
+    membership_hash: &str,
+) -> String {
+    format!("{height}|{parent}|{state_hash}|{confidence:.8}|{reconciles_hash}|{epoch}|{membership_hash}")
+}
+
+/// A proposed change to who counts toward quorum - see `Block::
+/// membership_change`'s doc comment for how one takes effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum MembershipChange {
+    Add { node_id: usize, addr: String, pubkey_hex: String },
+    Remove { node_id: usize },
+}
+
+/// A fixed-size digest of `mc`, folded into `canon_string` the same
+/// way `hash_vec`/`hash_list` are - a `None` change hashes to a fixed
+/// sentinel distinct from any real change. Nothing needs to recover
+/// the original value from this hash, only to notice if it changes,
+/// so a plain delimited encoding is enough - no need for a full
+/// serialization dependency just for this.
+pub fn hash_membership_change(mc: &Option<MembershipChange>) -> String {
+    let encoded = match mc {
+        None => "none".to_string(),
+        Some(MembershipChange::Add { node_id, addr, pubkey_hex }) => format!("add|{node_id}|{addr}|{pubkey_hex}"),
+        Some(MembershipChange::Remove { node_id }) => format!("remove|{node_id}"),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(encoded.as_bytes());
+    hex16(&hasher.finalize())
 }
 
 pub fn block_hash(canon: &str) -> String {
@@ -85,6 +118,20 @@ pub struct Block {
     /// committed after this field was added.
     #[serde(default)]
     pub committed_at_view: u64,
+    /// A change to who counts toward quorum, carried by this block
+    /// and taking effect the instant this block itself reaches a real
+    /// quorum-certificate under the membership as it stood *before*
+    /// this block - see `crate::consensus`'s module doc comment on
+    /// dynamic membership for the full mechanism, and why piggybacking
+    /// on the existing block-commit path (rather than a separate
+    /// membership protocol) is what makes this safe with no new
+    /// agreement machinery. Part of this block's real identity (folded
+    /// into `canon_string` via `hash_membership_change`), unlike
+    /// `signatures`/`sig_weight`/`committed_at_view`: changing it
+    /// changes what this block actually *is*, not just what's known
+    /// about it after the fact.
+    #[serde(default)]
+    pub membership_change: Option<MembershipChange>,
 }
 
 impl Block {
@@ -101,6 +148,7 @@ impl Block {
             sig_weight: 999.0,
             hash: "GENESIS".to_string(),
             committed_at_view: 0,
+            membership_change: None,
         }
     }
 }

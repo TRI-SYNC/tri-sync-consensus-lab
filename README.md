@@ -342,10 +342,13 @@ What it actually is:
   prevote quorum, and a block commits only once a precommit quorum is
   reached), a liveness fallback that bumps the view and hands off to
   the next proposer after a timeout, chain-sync for a node that's
-  fallen behind on a committed height, and fork detection/logging - see
-  `tri_sync_node::consensus`'s module doc comment for the full, precise
-  account of what is and isn't covered (it is the authoritative
-  source; this README summarizes it).
+  fallen behind on a committed height, fork detection/logging, and
+  dynamic peer membership (an `Add`/`Remove` change rides the ordinary
+  block-commit path, so it only ever takes effect once its own block
+  earns a real quorum-certificate under the membership as it stood
+  *before* the change) - see `tri_sync_node::consensus`'s module doc
+  comment for the full, precise account of what is and isn't covered
+  (it is the authoritative source; this README summarizes it).
 
 ### Running
 
@@ -359,7 +362,17 @@ cargo run --bin tri_sync_node -- node.toml --show-identity   # prints this node'
 cargo run --bin tri_sync_node -- node.toml                   # starts the QUIC server + consensus loop, runs until killed
 cargo run --bin tri_sync_node -- node.toml --duration 60      # same, but exits cleanly after 60s (for scripted runs)
 cargo run --bin tri_sync_node -- node.toml --rotate-key       # rotates this node's signing key and announces it to its configured peers; stop the node first (see the flag's own doc comment in main.rs for why)
+cargo run --bin tri_sync_node -- node.toml --propose-add-peer <id> <addr> <pubkey_hex>   # signs and broadcasts a membership-change proposal to add a peer
+cargo run --bin tri_sync_node -- node.toml --propose-remove-peer <id>                     # same, to remove one
 ```
+
+The last two only ever *propose* a change - broadcasting one changes
+nothing by itself. It takes effect only once whichever peer becomes
+proposer next attaches it to a block that goes on to earn a real
+precommit quorum-certificate under the network's actual current
+membership, exactly like any other block - see `tri_sync_node::
+consensus`'s module doc comment on dynamic membership for the full
+mechanism.
 
 ### Testing
 
@@ -368,7 +381,7 @@ cargo test --workspace     # includes tri_sync_core and tri_sync_node
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`tri_sync_node`'s own test suite (132 tests at time of writing) covers
+`tri_sync_node`'s own test suite (139 tests at time of writing) covers
 each message handler directly with real Ed25519 keys and real
 `view_block_canon`/`block_canon` signing - not mocks - including a
 dedicated adversarial-input test for every bug this project's own
@@ -382,20 +395,10 @@ the same committed chain.
 
 Disclosed plainly, not glossed over - the authoritative, always-current
 version of this list is `tri_sync_node::consensus`'s own module doc
-comment. As of this commit there is exactly one remaining item large
-enough to call out at the README level rather than fix as a quick patch:
-
-1. **No dynamic peer membership.** `--rotate-key` only ever updates the
-   *key* of an already-configured peer id; it cannot add, remove, or
-   discover peers, and never touches `all_ids`/quorum/`network_size`,
-   which stay exactly as `node.toml` originally described. Safely
-   changing who counts toward quorum at runtime needs its own agreement
-   protocol over the membership set itself - tracked as the next item
-   in this same push, not a fast follow left for later.
-
-Four items in the same family *were* closed, as a demonstration that
-"disclosed" items get revisited and actually fixed once genuinely
-scoped, rather than forgotten:
+comment. Five items in this family have been identified and closed, as
+a demonstration that "disclosed" items get revisited and actually
+fixed once genuinely scoped, rather than forgotten or left as a
+permanent asterisk:
 
 - **BFT locking / quorum certificates.** The liveness fallback
   (view-change) used to let a node advance past a stalled proposer
@@ -431,8 +434,27 @@ scoped, rather than forgotten:
   capped (`MAX_CANDIDATES_PER_HEIGHT`) against a legitimate-but-malicious
   expected proposer signing unboundedly many distinct blocks for the
   same (height, view).
+- **Dynamic peer membership.** `--rotate-key` only ever updates the
+  *key* of an already-configured peer id; by itself it never touched
+  `all_ids`/quorum/`network_size`, which used to stay exactly as
+  `node.toml` originally described for the life of the process. Closed
+  by piggybacking an `Add`/`Remove` change onto the ordinary
+  block-commit path instead of building a separate agreement protocol
+  for it: the change is part of the block's own signed identity, and
+  `apply_membership_change` only ever runs *after* that block has
+  independently earned a real precommit quorum-certificate under the
+  membership as it stood before the change - so no node can unilaterally
+  grow or shrink its own voting power, and the mechanism inherits
+  quorum-certificate locking and chain-sync for free rather than
+  needing its own copy of either. `--propose-add-peer`/
+  `--propose-remove-peer` give an operator a way to get a change
+  proposed promptly; a dedicated test proves the actual safety property
+  (a change never takes effect without a real quorum) as well as the
+  live effect (the quorum enforced for the *next* height genuinely
+  rises or falls once a change commits, and chain-sync replays a
+  historical change exactly like a live commit would).
 
-Each of the four above has a dedicated test proving the actual
+Each of the five above has a dedicated test proving the actual
 property closed, not just that the new code runs.
 
 ## License
