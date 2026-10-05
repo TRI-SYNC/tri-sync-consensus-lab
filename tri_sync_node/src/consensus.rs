@@ -60,25 +60,57 @@
 //!   the operator to stop the old process before rotating, which a
 //!   live rerun of the same two-process scenario confirmed resolves
 //!   it completely - see `main`'s `--rotate-key` doc comment.
-//! - Liveness fallback exists (`maybe_bump_view` hands off to the next
+//! - Liveness fallback (`maybe_bump_view` hands off to the next
 //!   proposer after a timeout, with catch-up so a lagging node adopts
-//!   a legitimate later view instead of rejecting it), but it isn't a
-//!   complete BFT view-change protocol: a node only *locks* its vote
-//!   implicitly, by however far `expected_proposer`/signature checks
-//!   let it advance, not via a quorum-certificate/"precommit" proof
-//!   that an earlier view genuinely failed. In an adversarial or
-//!   badly-partitioned network this leaves a real (if narrow) window
-//!   where votes could split across two views' candidates for the same
-//!   height. What *is* covered: a single node can never commit two
-//!   blocks at the same height (`handle_proposal`'s parent-hash check
-//!   is re-evaluated against the live head on every call, so a second
-//!   candidate for an already-committed height is rejected outright,
-//!   confirmed by a dedicated test); a proposal for an already-committed
-//!   height that `tri_sync_core::chain::prefer` ranks above what was
-//!   actually committed is detected and logged loudly as a safety
-//!   violation, not silently auto-reorged onto unverified evidence.
-//!   Closing the remaining window needs real locking/quorum
-//!   certificates, which is out of scope for this pass.
+//!   a legitimate later view instead of rejecting it) is now backed by
+//!   a real two-phase quorum-certificate lock, closing what used to be
+//!   a disclosed safety gap rather than just documenting it. The old
+//!   design let a single-phase vote's mere existence nudge a node
+//!   toward a view it hadn't independently verified was genuinely
+//!   supported, which in an adversarial or badly-partitioned network
+//!   left a real window where votes could split across two views'
+//!   candidates for the same height. The fix: a **prevote** (what used
+//!   to be called a "vote" - `handle_vote`/`BlockVoteMsg`, unchanged on
+//!   the wire) never commits anything by itself. Only once a node's
+//!   own prevote tally for a (block_hash, view) pair reaches quorum -
+//!   a genuine "polka", proof the network actually supports it, not
+//!   just a claim - does that node **lock** onto it
+//!   (`RoundState::locked`, persisted via `persistence::LockRecord` so
+//!   a restart can't forget) and cast a **precommit**
+//!   (`handle_precommit`/`PrecommitMsg`), signed over a
+//!   domain-separated string (`protocol::precommit_canon`) that a
+//!   prevote signature can never be replayed into. A block only
+//!   commits once its *precommit* tally - not its prevote tally -
+//!   reaches quorum (`maybe_commit`). Once locked on a height, a node
+//!   refuses to prevote for a different candidate there unless it
+//!   independently observes a prevote QC for that different candidate
+//!   first (`maybe_cast_own_prevote`) - it can be outvoted, but never
+//!   talked into switching by a bare, unverified claim. Prevote/
+//!   precommit tallies are kept per (hash, view) pair, never merged
+//!   across views for the same content, so a signature made for one
+//!   view can never be counted toward a different view's quorum even
+//!   when the block content is byte-identical (`RoundState::prevotes`/
+//!   `precommits`'s doc comments); `legitimate_rounds` closes the
+//!   generalization of the single-tally escalating-fake-vote bug an
+//!   earlier adversarial-review pass fixed, across this new per-view
+//!   keying. What this closes, concretely, and what a dedicated test
+//!   (`locking_prevents_two_conflicting_blocks_from_both_reaching_a_precommit_quorum_certificate`)
+//!   proves rather than just asserts: two disjoint candidates for the
+//!   same height can no longer both reach a precommit QC, even when a
+//!   node that already locked on one later receives a fully-valid,
+//!   correctly-signed proposal for the other at a higher view - it
+//!   caches and tallies that proposal (so the network *can* still
+//!   reach quorum on it, preserving liveness) but withholds its own
+//!   prevote until that tally itself proves a real polka. One
+//!   deliberately bounded, honestly-narrower liveness tradeoff this
+//!   makes (never a safety one): a node that's locked on a height,
+//!   should it become that height's next proposer after a view-change
+//!   timeout, does not self-re-propose its locked content - it simply
+//!   defers proposing that round (`propose_block`'s early return) and
+//!   waits for its lock to resolve via normal quorum-certificate
+//!   gossip, or to be unlocked by a genuine polka for something else.
+//!   Never fuses and proposes a *fresh* candidate while locked, which
+//!   is the one thing that would be unsafe.
 //! - Per-peer health (`crate::health`) is tracked and exposed via
 //!   `/metrics`, but purely observationally: it never changes who
 //!   gets proposed to, voted for, or sent messages. Deliberately not
@@ -93,10 +125,10 @@
 //!   debugging session (Hardening 8's live rotation test) where
 //!   correlating two unstamped node logs by eye was slow enough to
 //!   nearly obscure the actual bug.
-//! - `RoundState`'s `candidates`/`votes` maps are now capped
-//!   (`MAX_CANDIDATES_PER_HEIGHT`, in `handle_proposal`): a
+//! - `RoundState`'s `candidates`/`prevotes`/`precommits` maps are now
+//!   capped (`MAX_CANDIDATES_PER_HEIGHT`, in `handle_proposal`): a
 //!   legitimate-but-malicious expected proposer flooding many distinct
-//!   signed proposals for one (height, view) used to grow both maps
+//!   signed proposals for one (height, view) used to grow those maps
 //!   without bound, since nothing prunes them until the height
 //!   actually commits. A new hash is dropped once the current height
 //!   already has `MAX_CANDIDATES_PER_HEIGHT` distinct candidates
@@ -110,8 +142,8 @@ use crate::health;
 use crate::license;
 use crate::metrics::Metrics;
 use crate::net;
-use crate::persistence::{PeerKeyRecord, Store, TrustEntry};
-use crate::protocol::{self, BlockProposalMsg, BlockVoteMsg, KeyRotationMsg, Message, ObservationMsg, TrustUpdateMsg};
+use crate::persistence::{LockRecord, PeerKeyRecord, Store, TrustEntry};
+use crate::protocol::{self, BlockProposalMsg, BlockVoteMsg, KeyRotationMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg};
 use crate::state::NodeState;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::SeedableRng;
@@ -176,15 +208,57 @@ struct RoundState {
     /// just means fusion falls back to slightly stale data instead of
     /// blocking.
     latest_observations: HashMap<usize, Vec<f64>>,
-    /// Candidate blocks by hash, paired with the view that produced
-    /// them, kept until superseded by a committed block at the same or
-    /// greater height. The view is tracked alongside the block (not
-    /// on `Block` itself, which knows nothing about view-change) so a
-    /// candidate from an abandoned view can be told apart from a fresh
-    /// one at the same height.
-    candidates: HashMap<String, (u64, Block)>,
-    /// Collected signatures by block hash.
-    votes: HashMap<String, Vec<SigEntry>>,
+    /// Cached block content by hash - content only, not paired with a
+    /// single view. Deliberately so: the *same* block content can be
+    /// legitimately proposed/prevoted for at more than one view over
+    /// its lifetime (e.g. a locked node re-proposing nothing new, or a
+    /// slow network re-delivering an earlier proposal) - see
+    /// `legitimate_rounds` for how a specific (hash, view) pairing is
+    /// told apart from an arbitrary one. Kept until superseded by a
+    /// committed block at the same or greater height.
+    candidates: HashMap<String, Block>,
+    /// The (block_hash, view) pairs this node has seen a genuinely
+    /// legitimate proposal for - i.e. correctly signed by that view's
+    /// `expected_proposer`, over `view_block_canon(view, block)`.
+    /// A prevote or precommit for a pair *not* in this set is dropped
+    /// outright, regardless of whether `block_hash` is separately
+    /// cached in `candidates`: nothing has established that a real
+    /// round at that specific view ever happened, so counting it
+    /// would let a single signer manufacture quorum evidence out of
+    /// nothing - generalizes, across views, the same fix an earlier
+    /// adversarial-review pass made for the single-tally design (see
+    /// `handle_vote`'s history).
+    legitimate_rounds: std::collections::HashSet<(String, u64)>,
+    /// Prevote tally per (block_hash, view) - signatures over
+    /// `protocol::view_block_canon(view, block)`. Kept separate per
+    /// view (not merged into one tally per hash) so a signature made
+    /// for one view can never be counted toward another's quorum,
+    /// even for byte-identical block content.
+    prevotes: HashMap<(String, u64), Vec<SigEntry>>,
+    /// Precommit tally per (block_hash, view) - signatures over
+    /// `protocol::precommit_canon(view, block)`, a domain-separated
+    /// string distinct from what a prevote signs, so a prevote
+    /// signature can never be replayed as a precommit. A block only
+    /// ever commits once ITS precommit tally (not its prevote tally)
+    /// reaches quorum - see `maybe_precommit`/`maybe_commit` and this
+    /// module's doc comment on quorum-certificate locking.
+    precommits: HashMap<(String, u64), Vec<SigEntry>>,
+    /// The (view, block_hash) this node is currently locked on, per
+    /// height - set only once this node has itself verified a real
+    /// prevote *quorum certificate* ("polka") for it, in
+    /// `maybe_precommit`. Once locked, this node will not prevote for
+    /// a different candidate at this height without independently
+    /// observing a prevote QC for that different candidate first -
+    /// see `maybe_cast_own_prevote`. This is the mechanism that closes
+    /// the safety gap this module used to disclose: a vote's mere
+    /// existence is no longer ever enough, on its own, to nudge a
+    /// node toward a view it hasn't independently verified is
+    /// genuinely supported by quorum.
+    locked: HashMap<u64, (u64, String)>,
+    /// The (height, view) pairs this node has itself proposed at -
+    /// prevents `on_tick` from re-proposing (and re-broadcasting) at
+    /// the same round on every tick until the view actually advances.
+    proposed_rounds: std::collections::HashSet<(u64, u64)>,
     /// The accepted view number per height - see `current_view`.
     view_for_height: HashMap<u64, u64>,
     /// The (height, view) this node is currently timing a proposer
@@ -418,6 +492,25 @@ pub async fn run(
 
     let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids, endpoint, metrics };
     let mut rs = RoundState::default();
+    // Restore this node's quorum-certificate lock across a restart -
+    // forgetting it would let this node re-prevote for a conflicting
+    // block at the same height, reopening exactly the safety gap
+    // locking exists to close. A record for a height this node has
+    // already committed past (or that simply doesn't match the
+    // in-flight height) is stale and ignored - see
+    // `persistence::LockRecord`'s doc comment for why only one height
+    // is ever in flight at a time.
+    match store.get_lock() {
+        Ok(Some(record)) if record.height == node.head().height + 1 => {
+            log(format!(
+                "restored lock on height={} view={} hash={} from a previous run",
+                record.height, record.view, record.block_hash
+            ));
+            rs.locked.insert(record.height, (record.view, record.block_hash));
+        }
+        Ok(_) => {}
+        Err(e) => warn(format!("failed to read persisted lock: {e} - starting unlocked")),
+    }
     let mut rng = rand::rngs::StdRng::from_entropy();
 
     let mut ticker = tokio::time::interval(Duration::from_secs(ctx.config.round_interval_secs));
@@ -496,13 +589,36 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
 
     let view = current_view(rs, next_height);
     let proposer = expected_proposer(&ctx.all_ids, next_height, view);
-    let already_proposed_here = rs.candidates.values().any(|(v, b)| b.parent == head.hash && b.height == next_height && *v == view);
-    if proposer == node.node_id && !already_proposed_here {
+    if proposer == node.node_id && !rs.proposed_rounds.contains(&(next_height, view)) {
         propose_block(ctx, node, store, rs, &head, view).await;
     }
 }
 
 async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, head: &Block, view: u64) {
+    let next_height = head.height + 1;
+
+    // A node that's locked on this height (a real prevote quorum
+    // certificate was observed for some candidate here - see
+    // `maybe_precommit`) must never fuse and propose a *fresh*
+    // candidate while locked: that could never reach a prevote QC
+    // past every other locked node's own refusal to prevote for a
+    // conflicting value without first seeing one (`maybe_cast_own_prevote`),
+    // so it would just waste a slot in the `MAX_CANDIDATES_PER_HEIGHT`
+    // cap. Re-proposing the exact locked content would be safe, but
+    // is deliberately not attempted here either - a narrower, honestly
+    // bounded liveness tradeoff (never a safety one) documented in
+    // this module's doc comment. Simplest correct behavior: defer
+    // proposing this round and let the lock resolve via normal
+    // quorum-certificate gossip, or be unlocked by a genuine polka for
+    // something else.
+    if let Some((locked_view, locked_hash)) = rs.locked.get(&next_height) {
+        log(format!(
+            "height={next_height}: this node is locked on {locked_hash} (view={locked_view}) - deferring this proposer turn (view={view}) rather than proposing a fresh candidate while locked"
+        ));
+        rs.proposed_rounds.insert((next_height, view));
+        return;
+    }
+
     let ids: Vec<usize> = rs.latest_observations.keys().cloned().collect();
     let values: Vec<Vec<f64>> = ids.iter().map(|id| rs.latest_observations[id].clone()).collect();
     let weights: Vec<f64> =
@@ -512,7 +628,6 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     let spread = values.iter().map(|v| fusion::l2_distance(v, &fused)).sum::<f64>() / values.len() as f64;
     let confidence = (1.0 / (1.0 + spread)).clamp(0.0, 1.0);
 
-    let next_height = head.height + 1;
     let mut block = Block {
         height: next_height,
         parent: head.hash.clone(),
@@ -539,11 +654,13 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
 
     log(format!("proposing height={} view={view} hash={} state={:?}", block.height, block.hash, block.state));
 
-    rs.candidates.insert(block.hash.clone(), (view, block.clone()));
-    rs.votes.entry(block.hash.clone()).or_default().push(my_entry);
+    rs.candidates.insert(block.hash.clone(), block.clone());
+    rs.legitimate_rounds.insert((block.hash.clone(), view));
+    rs.prevotes.entry((block.hash.clone(), view)).or_default().push(my_entry);
+    rs.proposed_rounds.insert((next_height, view));
 
     broadcast(ctx, &Message::BlockProposal(BlockProposalMsg { sender: node.node_id, view, block: block.clone() }));
-    maybe_commit(ctx, node, store, rs, &block.hash).await;
+    maybe_precommit(ctx, node, store, rs, &block.hash, view).await;
 }
 
 async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, msg: Message) {
@@ -558,6 +675,7 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
         }
         Message::BlockProposal(p) => handle_proposal(ctx, node, store, rs, p).await,
         Message::BlockVote(v) => handle_vote(ctx, node, store, rs, v).await,
+        Message::Precommit(pc) => handle_precommit(ctx, node, store, rs, pc).await,
         Message::TrustUpdate(t) => {
             let canon = protocol::trust_update_canon(t.sender, t.about_peer, t.edge_weight);
             if verify_from_peer(ctx, t.sender, &canon, &t.sig_hex) {
@@ -738,8 +856,8 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         rs.waiting_since = Some(tokio::time::Instant::now());
     }
 
-    let is_new_fork = !rs.candidates.contains_key(&block_hash)
-        && rs.candidates.values().any(|(_, b)| b.height == p.block.height && b.hash != block_hash);
+    let is_new_fork =
+        !rs.candidates.contains_key(&block_hash) && rs.candidates.values().any(|b| b.height == p.block.height && b.hash != block_hash);
     if is_new_fork {
         ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
         log(format!("fork observed at height={}: competing candidate {block_hash}", p.block.height));
@@ -749,12 +867,13 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     // many *distinct* blocks for the same (height, view) - nothing
     // above this point depends on content, only on who's allowed to
     // propose - and each distinct hash would otherwise grow
-    // `candidates`/`votes` forever, since neither is pruned until the
-    // height actually commits (see `maybe_commit`). Only a brand-new
-    // hash is capped; a repeat of one already cached still proceeds
-    // below so its vote tally can keep growing toward quorum.
+    // `candidates`/`prevotes`/`precommits` forever, since none of them
+    // are pruned until the height actually commits (see
+    // `maybe_commit`). Only a brand-new hash is capped; a repeat of
+    // one already cached still proceeds below so its tallies can keep
+    // growing toward quorum.
     if !rs.candidates.contains_key(&block_hash) {
-        let distinct_at_height = rs.candidates.values().filter(|(_, b)| b.height == p.block.height).count();
+        let distinct_at_height = rs.candidates.values().filter(|b| b.height == p.block.height).count();
         if distinct_at_height >= MAX_CANDIDATES_PER_HEIGHT {
             warn(format!(
                 "dropping proposal from {} for height {} - already tracking {MAX_CANDIDATES_PER_HEIGHT} distinct \
@@ -764,32 +883,20 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
             return;
         }
     }
-    rs.candidates.entry(block_hash.clone()).or_insert_with(|| (p.view, p.block.clone()));
-    let tally = rs.votes.entry(block_hash.clone()).or_default();
+    rs.candidates.entry(block_hash.clone()).or_insert_with(|| p.block.clone());
+    // This (hash, view) pair is now legitimate: a correctly-signed
+    // proposal from this view's real expected proposer established it
+    // - see `RoundState::legitimate_rounds`'s doc comment for why a
+    // prevote/precommit for a pair that never passed through here is
+    // dropped outright, regardless of whether the hash alone is known.
+    rs.legitimate_rounds.insert((block_hash.clone(), p.view));
+    let tally = rs.prevotes.entry((block_hash.clone(), p.view)).or_default();
     if !tally.iter().any(|e| e.node_id == p.sender) {
         tally.push(their_sig_entry.clone());
     }
 
-    let already_voted = rs.votes[&block_hash].iter().any(|e| e.node_id == node.node_id);
-    if !already_voted {
-        let my_sig = crypto::sign_canon(&node.signing_key, &signing_canon);
-        let my_entry =
-            SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
-        rs.votes.get_mut(&block_hash).unwrap().push(my_entry.clone());
-        log(format!("voting for height={} view={} hash={block_hash}", p.block.height, p.view));
-        broadcast(
-            ctx,
-            &Message::BlockVote(BlockVoteMsg {
-                sender: node.node_id,
-                view: p.view,
-                block_hash: block_hash.clone(),
-                pubkey_hex: my_entry.pubkey_hex,
-                sig_hex: my_entry.sig_hex,
-            }),
-        );
-    }
-
-    maybe_commit(ctx, node, store, rs, &block_hash).await;
+    maybe_cast_own_prevote(ctx, node, rs, p.block.height, p.view, &block_hash, &signing_canon);
+    maybe_precommit(ctx, node, store, rs, &block_hash, p.view).await;
 }
 
 async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, v: BlockVoteMsg) {
@@ -802,7 +909,7 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
         return;
     }
 
-    let Some((stored_view, block)) = rs.candidates.get(&v.block_hash).cloned() else {
+    let Some(block) = rs.candidates.get(&v.block_hash).cloned() else {
         return; // vote arrived before the proposal - dropped; no retry in this stage
     };
     // A real bug, found by a focused adversarial review (not a test):
@@ -817,19 +924,18 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     // escalating "votes" that kept resetting every honest node's
     // view-change timeout, so quorum could never form.
     //
-    // The fix: a vote's view must match `stored_view` *exactly* - the
-    // view this candidate was actually cached under, which only ever
-    // happens via handle_proposal's own `p.sender == expected_proposer`
-    // check. A vote can never advance the view on its own; it can only
-    // ever agree with a view a legitimate proposal already established.
-    // (current_view(rs, height) is always >= stored_view by the time a
-    // candidate is cached - handle_proposal updates one right before
-    // the other - so this one equality check also covers the old
-    // stale-vote rejection; nothing can slip through at < stored_view
-    // either, since that's < current_view too.)
-    if v.view != stored_view {
+    // The fix (now generalized across views - a candidate's content
+    // can legitimately be prevoted-for at more than one view over its
+    // lifetime, see `RoundState::legitimate_rounds`'s doc comment):
+    // a vote's (block_hash, view) pair must itself be one
+    // `handle_proposal` already marked legitimate, which only ever
+    // happens via a real proposal correctly signed by that view's
+    // `expected_proposer`. A vote can never establish a view's
+    // legitimacy on its own; it can only ever agree with one a
+    // legitimate proposal already did.
+    if !rs.legitimate_rounds.contains(&(v.block_hash.clone(), v.view)) {
         warn(format!(
-            "ignoring vote from {} claiming view {} for height {} - the cached candidate is at view {stored_view}",
+            "ignoring vote from {} claiming view {} for height {} - no legitimate proposal was ever seen for that (hash, view) pair",
             v.sender, v.view, block.height
         ));
         return;
@@ -842,12 +948,142 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     }
     ctx.metrics.record_peer_seen(v.sender); // no-op if v.sender is this node's own id
 
-    let tally = rs.votes.entry(v.block_hash.clone()).or_default();
+    let tally = rs.prevotes.entry((v.block_hash.clone(), v.view)).or_default();
     if !tally.iter().any(|e| e.node_id == v.sender) {
         tally.push(SigEntry { node_id: v.sender, pubkey_hex: v.pubkey_hex, sig_hex: v.sig_hex });
     }
 
-    maybe_commit(ctx, node, store, rs, &v.block_hash).await;
+    maybe_cast_own_prevote(ctx, node, rs, block.height, v.view, &v.block_hash, &signing_canon);
+    maybe_precommit(ctx, node, store, rs, &v.block_hash, v.view).await;
+}
+
+/// Casts this node's own prevote for (`block_hash`, `view`) - already
+/// established as a legitimate pair by the caller - and broadcasts
+/// it, unless this node has already prevoted for this exact pair, or
+/// is locked on a *different* block at `height` and the prevote tally
+/// for this pair hasn't itself reached quorum yet. That second
+/// condition is the only thing ever allowed to override an existing
+/// lock: a real, independently-observed prevote quorum certificate
+/// ("polka") for the new candidate - never a bare claim. See this
+/// module's doc comment on quorum-certificate locking.
+fn maybe_cast_own_prevote(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, height: u64, view: u64, block_hash: &str, signing_canon: &str) {
+    let key = (block_hash.to_string(), view);
+    let already_voted = rs.prevotes.get(&key).map(|t| t.iter().any(|e| e.node_id == node.node_id)).unwrap_or(false);
+    if already_voted {
+        return;
+    }
+    if let Some((_, locked_hash)) = rs.locked.get(&height) {
+        if locked_hash != block_hash {
+            let tally_len = rs.prevotes.get(&key).map(|t| t.len()).unwrap_or(0);
+            if tally_len < quorum_for(ctx.all_ids.len()) {
+                return; // still locked elsewhere - no polka yet for this candidate
+            }
+            log(format!(
+                "height={height}: observed a prevote quorum for {block_hash} at view={view} - overriding this node's existing lock on a different candidate (unlocking)"
+            ));
+        }
+    }
+    let my_sig = crypto::sign_canon(&node.signing_key, signing_canon);
+    let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
+    rs.prevotes.entry(key).or_default().push(my_entry.clone());
+    log(format!("prevoting for height={height} view={view} hash={block_hash}"));
+    broadcast(
+        ctx,
+        &Message::BlockVote(BlockVoteMsg {
+            sender: node.node_id,
+            view,
+            block_hash: block_hash.to_string(),
+            pubkey_hex: my_entry.pubkey_hex,
+            sig_hex: my_entry.sig_hex,
+        }),
+    );
+}
+
+/// Once this node's own prevote tally for (`block_hash`, `view`)
+/// reaches quorum - a genuine polka, proof the network actually
+/// supports it, not just a signer's claim - this locks the node onto
+/// it (persisted via `persistence::LockRecord` so a restart can't
+/// forget and later re-prevote for a conflicting block), casts this
+/// node's own precommit (signed over `protocol::precommit_canon`, a
+/// string a prevote signature can never be replayed into), and checks
+/// whether the *precommit* tally has itself reached quorum.
+async fn maybe_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str, view: u64) {
+    let Some(block) = rs.candidates.get(block_hash).cloned() else { return };
+    let key = (block_hash.to_string(), view);
+    let Some(tally) = rs.prevotes.get(&key) else { return };
+    if tally.len() < quorum_for(ctx.all_ids.len()) {
+        return;
+    }
+    if let Some((locked_view, locked_hash)) = rs.locked.get(&block.height) {
+        if *locked_view == view && locked_hash == block_hash {
+            return; // already locked + precommitted here - nothing new to do
+        }
+    }
+
+    rs.locked.insert(block.height, (view, block_hash.to_string()));
+    if let Err(e) = store.put_lock(&LockRecord { height: block.height, view, block_hash: block_hash.to_string() }) {
+        warn(format!("failed to persist lock for height={}: {e}", block.height));
+    }
+
+    let precommit_canon_str = protocol::precommit_canon(view, &block);
+    let my_sig = crypto::sign_canon(&node.signing_key, &precommit_canon_str);
+    let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
+    let ptally = rs.precommits.entry(key.clone()).or_default();
+    if !ptally.iter().any(|e| e.node_id == node.node_id) {
+        ptally.push(my_entry.clone());
+    }
+    log(format!("precommitting (locked) for height={} view={view} hash={block_hash}", block.height));
+    broadcast(
+        ctx,
+        &Message::Precommit(PrecommitMsg {
+            sender: node.node_id,
+            view,
+            block_hash: block_hash.to_string(),
+            pubkey_hex: my_entry.pubkey_hex,
+            sig_hex: my_entry.sig_hex,
+        }),
+    );
+
+    maybe_commit(ctx, node, store, rs, block_hash, view).await;
+}
+
+/// Verifies and tallies an incoming precommit - the second-phase,
+/// domain-separated signature that's the only thing `maybe_commit`
+/// ever actually counts toward finalizing a block. See this module's
+/// doc comment on quorum-certificate locking.
+async fn handle_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, pc: PrecommitMsg) {
+    let known_pubkey =
+        if pc.sender == node.node_id { Some(node.verifying_key) } else { ctx.peers.read().unwrap().get(&pc.sender).map(|p| p.pubkey) };
+    let Some(known_pubkey) = known_pubkey else { return };
+    let Some(claimed_pubkey) = decode_verifying_key(&pc.pubkey_hex) else { return };
+    if claimed_pubkey != known_pubkey {
+        warn(format!("precommit from {} claims an unexpected pubkey", pc.sender));
+        return;
+    }
+    let Some(block) = rs.candidates.get(&pc.block_hash).cloned() else {
+        return; // precommit for a candidate we haven't cached - dropped; no retry in this stage
+    };
+    if !rs.legitimate_rounds.contains(&(pc.block_hash.clone(), pc.view)) {
+        warn(format!(
+            "ignoring precommit from {} claiming view {} for height {} - no legitimate proposal was ever seen for that (hash, view) pair",
+            pc.sender, pc.view, block.height
+        ));
+        return;
+    }
+    let Some(sig) = decode_signature(&pc.sig_hex) else { return };
+    let canon = protocol::precommit_canon(pc.view, &block);
+    if !crypto::verify_canon(&known_pubkey, &canon, &sig) {
+        warn(format!("invalid precommit signature from {}", pc.sender));
+        return;
+    }
+    ctx.metrics.record_peer_seen(pc.sender);
+
+    let tally = rs.precommits.entry((pc.block_hash.clone(), pc.view)).or_default();
+    if !tally.iter().any(|e| e.node_id == pc.sender) {
+        tally.push(SigEntry { node_id: pc.sender, pubkey_hex: pc.pubkey_hex, sig_hex: pc.sig_hex });
+    }
+
+    maybe_commit(ctx, node, store, rs, &pc.block_hash, pc.view).await;
 }
 
 /// Corrects `node.epoch` to match what `chain::epoch_for_height` says
@@ -871,18 +1107,26 @@ fn reconcile_epoch_with_chain(node: &mut NodeState, store: &Store) {
     }
 }
 
-async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str) {
+async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str, view: u64) {
     let head = node.head().clone();
-    let Some((_, mut block)) = rs.candidates.get(block_hash).cloned() else { return };
+    let Some(mut block) = rs.candidates.get(block_hash).cloned() else { return };
     if block.parent != head.hash {
         return; // superseded by a different committed block already
     }
-    let Some(votes) = rs.votes.get(block_hash).cloned() else { return };
-    if votes.len() < quorum_for(ctx.all_ids.len()) {
+    // Gated on the *precommit* tally, never the prevote one - a block
+    // only ever finalizes once a real quorum of nodes independently
+    // locked onto it (see `maybe_precommit`), not merely prevoted for
+    // it. This is the core of what closes this module's disclosed
+    // safety gap: committing used to only ever require one round of
+    // signatures, which is what let votes for two different views'
+    // candidates at the same height both have a real chance to reach
+    // quorum in an adversarial/partitioned network.
+    let Some(precommits) = rs.precommits.get(&(block_hash.to_string(), view)).cloned() else { return };
+    if precommits.len() < quorum_for(ctx.all_ids.len()) {
         return;
     }
 
-    block.signatures = votes;
+    block.signatures = precommits;
     block.sig_weight = block.signatures.len() as f64;
 
     apply_trust_updates(ctx, node, store, &block, rs).await;
@@ -913,16 +1157,22 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
         }
     }
 
-    rs.candidates.retain(|_, (_, b)| b.height > block.height);
+    rs.candidates.retain(|_, b| b.height > block.height);
     let surviving: std::collections::HashSet<String> = rs.candidates.keys().cloned().collect();
-    rs.votes.retain(|h, _| surviving.contains(h));
+    rs.legitimate_rounds.retain(|(h, _)| surviving.contains(h));
+    rs.prevotes.retain(|(h, _), _| surviving.contains(h));
+    rs.precommits.retain(|(h, _), _| surviving.contains(h));
     // A real gap a focused code review caught: this used to prune
     // candidates/votes down to heights still in play but never
     // view_for_height, so any height that ever needed a view-change
     // (common in practice, not rare) left a permanent entry behind for
     // the life of the process - unbounded growth on a long-running
-    // node. Mirrors the retain pattern above.
+    // node. Mirrors the retain pattern above - now also covering
+    // `locked`/`proposed_rounds`, the two maps the quorum-certificate
+    // locking pass added.
     rs.view_for_height.retain(|&h, _| h > block.height);
+    rs.locked.retain(|&h, _| h > block.height);
+    rs.proposed_rounds.retain(|&(h, _)| h > block.height);
     // Not strictly required (the next tick's height/view mismatch in
     // maybe_bump_view would reset this anyway), but explicit here:
     // whatever this node was timing out on is resolved now that the
@@ -1261,12 +1511,20 @@ mod tests {
 
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal.clone()).await;
 
-        // With a 2-node network (quorum 2), a verified proposal from
-        // the correct proposer plus this node's own vote reaches
-        // quorum immediately and commits - maybe_commit then prunes
-        // the now-committed candidate, so checking the real chain
-        // (not rs.candidates) is the correct success signal here.
-        let committed = node.chain.last().expect("the proposal should have verified, been voted on, and committed");
+        // With a 2-node network (quorum 2): the proposer's embedded
+        // signature plus this node's own prevote reach a prevote
+        // quorum, which locks this node and casts its own precommit -
+        // but that's still only 1 of the 2 precommits needed. The
+        // peer's own precommit (on a real node, driven by it
+        // independently reaching the same prevote quorum) is what
+        // actually finalizes it here.
+        let peer_precommit = signed_precommit(1, &new_sk, &proposal.block.hash, 0, &proposal.block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer_precommit).await;
+
+        // maybe_commit prunes the now-committed candidate, so checking
+        // the real chain (not rs.candidates) is the correct success
+        // signal here.
+        let committed = node.chain.last().expect("the proposal should have verified, prevoted, precommitted, and committed");
         assert_eq!(committed.hash, proposal.block.hash, "the committed block must be the one signed with the newly-rotated key");
     }
 
@@ -1524,18 +1782,23 @@ mod tests {
         handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: ahead_view, block: block.clone() }).await;
 
         // With only two participants, the proposer's own signature plus
-        // this node's vote already meets quorum (2), so catch-up here
-        // goes all the way to a real commit in this same call - not
-        // just passive caching - which is the actually-correct
-        // end-to-end outcome. (Checking current_view(&rs, 2) here
-        // would no longer prove anything either way: maybe_commit now
-        // prunes view_for_height for a height the instant it commits,
-        // so its absence just means "committed", not "never caught
-        // up" - the commit itself, signed at ahead_view, is the real
-        // proof the catch-up happened.)
+        // this node's prevote already meets prevote quorum (2), so
+        // catch-up reaches a real lock + this node's own precommit in
+        // this same call. The peer's own precommit (driven, on a real
+        // node, by it independently reaching the same prevote quorum)
+        // is what actually finalizes it.
+        let peer_precommit = signed_precommit(1, &peer_sk, &block.hash, ahead_view, &block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer_precommit).await;
+
+        // (Checking current_view(&rs, 2) here would no longer prove
+        // anything either way: maybe_commit now prunes view_for_height
+        // for a height the instant it commits, so its absence just
+        // means "committed", not "never caught up" - the commit
+        // itself, signed at ahead_view, is the real proof the catch-up
+        // happened.)
         let committed = node.chain.last().expect("chain should have advanced");
         assert_eq!(committed.hash, block.hash, "the block from the higher view should be the one that committed");
-        assert_eq!(committed.sig_weight, 2.0, "proposer's signature plus this node's vote");
+        assert_eq!(committed.sig_weight, 2.0, "proposer's precommit plus this node's own precommit");
         assert!(!rs.view_for_height.contains_key(&2), "the now-committed height's view bookkeeping should be pruned");
     }
 
@@ -1589,6 +1852,21 @@ mod tests {
         let signing_canon = protocol::view_block_canon(view, block);
         let sig = crypto::sign_canon(signer_sk, &signing_canon);
         BlockVoteMsg {
+            sender,
+            view,
+            block_hash: block_hash.to_string(),
+            pubkey_hex: hex::encode(signer_sk.verifying_key().to_bytes()),
+            sig_hex: hex::encode(sig.to_bytes()),
+        }
+    }
+
+    /// Builds a genuine second-phase precommit - see
+    /// `protocol::precommit_canon`'s doc comment for why this signs a
+    /// different string than `signed_vote`'s prevote.
+    fn signed_precommit(sender: usize, signer_sk: &ed25519_dalek::SigningKey, block_hash: &str, view: u64, block: &Block) -> PrecommitMsg {
+        let canon = protocol::precommit_canon(view, block);
+        let sig = crypto::sign_canon(signer_sk, &canon);
+        PrecommitMsg {
             sender,
             view,
             block_hash: block_hash.to_string(),
@@ -1682,20 +1960,24 @@ mod tests {
         // (view, block) state matters for this test).
         let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
         let block_hash = proposal.block.hash.clone();
-        rs.candidates.insert(block_hash.clone(), (0, proposal.block.clone()));
-        rs.votes.insert(block_hash.clone(), proposal.block.signatures.clone());
+        rs.candidates.insert(block_hash.clone(), proposal.block.clone());
+        rs.legitimate_rounds.insert((block_hash.clone(), 0));
+        rs.prevotes.insert((block_hash.clone(), 0), proposal.block.signatures.clone());
         assert_eq!(current_view(&rs, 1), 0);
 
         // The attack: peer 1 (a real, correctly-configured peer) signs
         // a "vote" for that same block claiming view 99 - perfectly
         // valid cryptographically, since they hold the real key and
-        // can sign any view_block_canon they like.
+        // can sign any view_block_canon they like. No proposal was
+        // ever legitimately seen for (block_hash, 99), so it must be
+        // rejected regardless of whose signature it carries.
         let fake_escalation = signed_vote(1, &peer_sk, &block_hash, 99, &proposal.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, fake_escalation).await;
 
         assert_eq!(current_view(&rs, 1), 0, "a vote alone must never be able to advance the view");
         assert!(rs.waiting_for.is_none(), "no legitimate view-change timeout should have been touched");
-        assert_eq!(rs.votes.get(&block_hash).unwrap().len(), 1, "the fabricated vote must not be tallied");
+        assert_eq!(rs.prevotes.get(&(block_hash.clone(), 0)).unwrap().len(), 1, "the fabricated vote must not be tallied");
+        assert!(!rs.prevotes.contains_key(&(block_hash, 99)), "an illegitimate (hash, view) pair must never even get a tally bucket");
         assert_eq!(node.chain.len(), 1, "nothing should have committed off a rejected vote");
     }
 
@@ -1721,17 +2003,240 @@ mod tests {
 
         let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
         let block_hash = proposal.block.hash.clone();
-        rs.candidates.insert(block_hash.clone(), (0, proposal.block.clone()));
-        rs.votes.insert(block_hash.clone(), proposal.block.signatures.clone());
+        rs.candidates.insert(block_hash.clone(), proposal.block.clone());
+        rs.legitimate_rounds.insert((block_hash.clone(), 0));
+        rs.prevotes.insert((block_hash.clone(), 0), proposal.block.signatures.clone());
 
         // Node 0's own vote, matching the candidate's real view - the
-        // second signature needed to reach the 2-of-2 quorum.
+        // second prevote needed to reach the 2-of-2 prevote quorum,
+        // which locks this node and casts its own precommit.
         let my_vote = signed_vote(0, &self_sk, &block_hash, 0, &proposal.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, my_vote).await;
+        assert!(node.chain.last().unwrap().hash != block_hash, "a prevote quorum alone must not commit - only a precommit quorum can");
+
+        // The peer's own precommit - driven, on a real node, by it
+        // independently reaching the same prevote quorum - is what
+        // actually finalizes it.
+        let peer_precommit = signed_precommit(1, &peer_sk, &block_hash, 0, &proposal.block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, peer_precommit).await;
 
         let committed = node.chain.last().expect("a genuine matching-view vote should have let this commit");
         assert_eq!(committed.hash, block_hash);
         assert_eq!(committed.sig_weight, 2.0);
+    }
+
+    /// The capstone proof for this module's quorum-certificate locking:
+    /// two disjoint candidates for the same height can never both
+    /// reach a precommit QC, even when a node locks on one and later
+    /// receives a fully legitimate, correctly-signed proposal for the
+    /// other at a higher view - exactly the adversarial/partitioned
+    /// scenario this module's doc comment used to disclose as an open
+    /// safety gap. 4 participants (quorum 3): block A is legitimately
+    /// proposed at view 0 and reaches a genuine prevote quorum, which
+    /// locks node 0 onto it - but its precommit tally stops at 1 and
+    /// can never grow again, because nothing in this test ever gives
+    /// it another precommit. Block B is then legitimately proposed at
+    /// view 1 (by the real expected proposer for that view); node 0
+    /// refuses to prevote for it while locked on A, *even though* B's
+    /// proposal and every incoming vote for it are all genuinely
+    /// signed - until B's own prevote tally independently reaches
+    /// quorum (a real polka), at which point node 0 unlocks, switches,
+    /// and B - not A - goes on to reach a precommit QC and commit.
+    #[tokio::test]
+    async fn locking_prevents_two_conflicting_blocks_from_both_reaching_a_precommit_quorum_certificate() {
+        use crate::config::PeerConfig;
+        let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let peer_sks: Vec<ed25519_dalek::SigningKey> = (0..3).map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)).collect();
+        let config = NodeConfig {
+            node_id: 0,
+            dim: 2,
+            listen_addr: "127.0.0.1:0".to_string(),
+            license_path: String::new(),
+            data_dir: String::new(),
+            round_interval_secs: 1,
+            metrics_addr: None,
+            peers: (1..=3)
+                .map(|id| PeerConfig {
+                    id,
+                    addr: format!("127.0.0.1:{id}"),
+                    pubkey_hex: hex::encode(peer_sks[id - 1].verifying_key().to_bytes()),
+                })
+                .collect(),
+        };
+        let peers = HashMap::from_iter((1..=3).map(|id| {
+            (id, PeerInfo { addr: format!("127.0.0.1:{id}").parse().unwrap(), pubkey: peer_sks[id - 1].verifying_key(), rotation_seq: 0 })
+        }));
+        let endpoint = net::make_client_endpoint().unwrap();
+        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: vec![0, 1, 2, 3], endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
+        let dir = crate::test_support::TempDir::new("locking_prevents_split_commit");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        // expected_proposer([0,1,2,3], 1, 0) == 1; expected_proposer(..., 1, 1) == 2.
+        assert_eq!(expected_proposer(&ctx.all_ids, 1, 0), 1);
+        assert_eq!(expected_proposer(&ctx.all_ids, 1, 1), 2);
+
+        // --- View 0: block A is legitimately proposed and reaches a real prevote quorum. ---
+        let a = signed_proposal_with_state(1, &peer_sks[0], 1, "GENESIS", 0, 1.0, vec![1.0, 1.0]);
+        handle_proposal(&ctx, &mut node, &store, &mut rs, a.clone()).await; // prevotes[(A,0)]: peer1 + self = 2
+        let vote_a_from_2 = signed_vote(2, &peer_sks[1], &a.block.hash, 0, &a.block);
+        handle_vote(&ctx, &mut node, &store, &mut rs, vote_a_from_2).await; // prevotes[(A,0)] = 3 = quorum -> locks on A
+
+        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())), "a genuine prevote quorum must lock this node onto A");
+        assert_eq!(node.chain.len(), 1, "A's precommit tally is only 1 (this node's own) - nowhere near quorum 3, so nothing has committed");
+
+        // --- View 1: block B is a different, equally legitimate proposal - but node 0 is locked on A. ---
+        let b = signed_proposal_with_state(2, &peer_sks[1], 1, "GENESIS", 1, 1.0, vec![2.0, 2.0]);
+        assert_ne!(a.block.hash, b.block.hash, "A and B must be genuinely different candidates for this test to mean anything");
+        handle_proposal(&ctx, &mut node, &store, &mut rs, b.clone()).await; // prevotes[(B,1)]: peer2 only = 1
+
+        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())), "a merely-legitimate competing proposal must not break an existing lock");
+        assert!(
+            rs.prevotes.get(&(b.block.hash.clone(), 1)).unwrap().iter().all(|e| e.node_id != 0),
+            "node 0 must not prevote for B while locked on A, with no polka for B yet"
+        );
+
+        // A second, genuine vote for B - still short of quorum (2 of 3).
+        let vote_b_from_1 = signed_vote(1, &peer_sks[0], &b.block.hash, 1, &b.block);
+        handle_vote(&ctx, &mut node, &store, &mut rs, vote_b_from_1).await;
+        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())), "still short of a real polka for B - the lock on A must hold");
+
+        // --- The polka: a THIRD genuine vote for B reaches prevote quorum - real evidence, not a claim. ---
+        let vote_b_from_3 = signed_vote(3, &peer_sks[2], &b.block.hash, 1, &b.block);
+        handle_vote(&ctx, &mut node, &store, &mut rs, vote_b_from_3).await;
+
+        assert_eq!(rs.locked.get(&1), Some(&(1, b.block.hash.clone())), "a genuine prevote QC for B must unlock A and lock onto B instead");
+        assert_eq!(
+            rs.precommits.get(&(a.block.hash.clone(), 0)).unwrap().len(),
+            1,
+            "A's precommit tally must be frozen forever at 1 - nothing in this scenario ever gives it a second"
+        );
+        assert_eq!(node.chain.len(), 1, "B has only this node's own precommit so far - not yet quorum");
+
+        // The other two participants' precommits for B finalize it.
+        let precommit_b_from_1 = signed_precommit(1, &peer_sks[0], &b.block.hash, 1, &b.block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_b_from_1).await;
+        let precommit_b_from_2 = signed_precommit(2, &peer_sks[1], &b.block.hash, 1, &b.block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_b_from_2).await;
+
+        let committed = node.chain.last().expect("B should have reached a real precommit quorum and committed");
+        assert_eq!(committed.hash, b.block.hash, "B, never A, must be the one that actually committed");
+    }
+
+    /// Domain separation end-to-end, not just at the `protocol::*_canon`
+    /// string level: a peer's perfectly genuine *prevote* signature
+    /// (over `view_block_canon`) must be rejected by `handle_precommit`
+    /// when replayed as a claimed precommit, because it doesn't verify
+    /// against `precommit_canon`. If this ever passed, the two-phase
+    /// design would be theater - a single signature could satisfy
+    /// both phases at once.
+    #[tokio::test]
+    async fn a_prevote_signature_cannot_be_replayed_as_a_precommit() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1
+        let dir = crate::test_support::TempDir::new("no_prevote_precommit_replay");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
+        handle_proposal(&ctx, &mut node, &store, &mut rs, proposal.clone()).await;
+        // With a 2-node network, the proposer's embedded sig + this
+        // node's own auto-prevote already reach prevote quorum, so
+        // this node has already locked and cast its own *genuine*
+        // precommit by this point - the real baseline to compare
+        // against below, not an empty tally.
+        let genuine_precommits_so_far = rs.precommits.get(&(proposal.block.hash.clone(), 0)).cloned().unwrap_or_default();
+        assert_eq!(genuine_precommits_so_far.len(), 1, "sanity: this node's own real precommit, from reaching prevote quorum above");
+
+        // A real prevote from peer 1, genuinely signed over
+        // view_block_canon - valid as a prevote, never as a precommit.
+        let genuine_prevote = signed_vote(1, &peer_sk, &proposal.block.hash, 0, &proposal.block);
+        let replayed_as_precommit = PrecommitMsg {
+            sender: genuine_prevote.sender,
+            view: genuine_prevote.view,
+            block_hash: genuine_prevote.block_hash.clone(),
+            pubkey_hex: genuine_prevote.pubkey_hex.clone(),
+            sig_hex: genuine_prevote.sig_hex.clone(),
+        };
+        handle_precommit(&ctx, &mut node, &store, &mut rs, replayed_as_precommit).await;
+
+        assert_eq!(
+            rs.precommits.get(&(proposal.block.hash.clone(), 0)).cloned().unwrap_or_default(),
+            genuine_precommits_so_far,
+            "a replayed prevote signature must never be accepted as a precommit - the tally must be untouched by it"
+        );
+        assert_eq!(node.chain.len(), 1, "nothing should have committed off a forged precommit (still only 1 of 2 needed precommits)");
+    }
+
+    /// Proves the lock survives a restart - not just asserted from
+    /// reading `run`'s loading code, but by actually driving a fresh
+    /// `RoundState` through the same `store.get_lock()` path `run`
+    /// uses, then confirming a conflicting prevote is still rejected
+    /// afterward exactly as it would have been pre-restart. Forgetting
+    /// the lock across a restart would reopen the same safety gap
+    /// quorum-certificate locking exists to close.
+    #[tokio::test]
+    async fn a_lock_survives_a_simulated_restart_and_still_blocks_a_conflicting_prevote() {
+        let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, quorum=2
+        let dir = crate::test_support::TempDir::new("lock_survives_restart");
+        let store = Store::open(dir.path()).unwrap();
+        let mut node = NodeState {
+            node_id: 0,
+            chain: vec![Block::genesis(2)],
+            signing_key: self_sk.clone(),
+            verifying_key: self_sk.verifying_key(),
+            epoch: 0,
+            edge_weight: HashMap::new(),
+            reliability: HashMap::new(),
+        };
+        let mut rs = RoundState::default();
+
+        let a = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![1.0, 1.0]);
+        handle_proposal(&ctx, &mut node, &store, &mut rs, a.clone()).await; // prevotes[(A,0)] = peer1 + self = 2 = quorum -> locks on A
+        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())));
+        assert_eq!(store.get_lock().unwrap(), Some(LockRecord { height: 1, view: 0, block_hash: a.block.hash.clone() }), "the lock must be persisted, not just in memory");
+
+        // Simulate a restart: a brand-new, empty RoundState (as a real
+        // process restart would start with), restoring only what
+        // `run` itself restores from the store.
+        let mut rs_after_restart = RoundState::default();
+        let record = store.get_lock().unwrap().expect("the lock must still be on disk");
+        assert_eq!(record.height, node.head().height + 1, "sanity: this is the in-flight height, not a stale record");
+        rs_after_restart.locked.insert(record.height, (record.view, record.block_hash));
+
+        // A different, equally legitimate proposal B at a higher view
+        // - without the restored lock, this node would have nothing
+        // stopping it from prevoting for B. View 2 (not 1): with only
+        // two participants, expected_proposer(height=1, view) cycles
+        // back to peer 1 only on even views, and it must still be
+        // peer 1 - not this node itself - proposing, for "a real
+        // peer's legitimate proposal" to mean anything here.
+        assert_eq!(expected_proposer(&ctx.all_ids, 1, 2), 1);
+        let b = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 2, 1.0, vec![2.0, 2.0]);
+        handle_proposal(&ctx, &mut node, &store, &mut rs_after_restart, b.clone()).await;
+
+        assert!(
+            rs_after_restart.prevotes.get(&(b.block.hash.clone(), 2)).unwrap().iter().all(|e| e.node_id != 0),
+            "the restored lock must still block this node's own prevote for a different candidate, with no polka observed yet"
+        );
+        assert_eq!(rs_after_restart.locked.get(&1), Some(&(0, a.block.hash)), "the restored lock must be untouched by a merely-legitimate competing proposal");
     }
 
     /// The bug this stage's own code review caught before any test
@@ -1946,21 +2451,38 @@ mod tests {
             handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
         }
 
-        let distinct_at_height_1 = rs.candidates.values().filter(|(_, b)| b.height == 1).count();
+        let distinct_at_height_1 = rs.candidates.values().filter(|b| b.height == 1).count();
         assert_eq!(distinct_at_height_1, MAX_CANDIDATES_PER_HEIGHT, "the cap must hold even though every flood message was genuinely signed");
-        assert_eq!(rs.votes.len(), MAX_CANDIDATES_PER_HEIGHT, "votes is only ever populated alongside candidates, so it must be bounded the same way");
+        assert_eq!(
+            rs.prevotes.len(),
+            MAX_CANDIDATES_PER_HEIGHT,
+            "prevotes is only ever populated alongside candidates (one (hash, view) bucket per flooded hash, all at view 0), so it must be bounded the same way"
+        );
 
         // The flip side: the very first candidate (cached before the
-        // cap was ever hit, and already carrying 2 of the 3 signatures
+        // cap was ever hit, and already carrying 2 of the 3 prevotes
         // it needs - peer 1's embedded proposal plus node 0's own
-        // automatic vote from inside `handle_proposal`) must still be
-        // perfectly usable - the cap rejects brand-new hashes once
+        // automatic prevote from inside `handle_proposal`) must still
+        // be perfectly usable - the cap rejects brand-new hashes once
         // full, it does not evict or disturb anything already cached.
         let first = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![0.0, 0.0]);
         assert!(rs.candidates.contains_key(&first.block.hash), "a candidate cached before the cap filled up must not have been evicted");
-        assert_eq!(rs.votes.get(&first.block.hash).unwrap().len(), 2, "proposer + this node's own auto-vote, from the flood loop above");
+        assert_eq!(
+            rs.prevotes.get(&(first.block.hash.clone(), 0)).unwrap().len(),
+            2,
+            "proposer + this node's own auto-prevote, from the flood loop above"
+        );
         let third_vote = signed_vote(2, &other_sks[0], &first.block.hash, 0, &first.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, third_vote).await;
+        assert_ne!(node.chain.last().unwrap().hash, first.block.hash, "a prevote quorum alone must not commit - only a precommit quorum can");
+
+        // The other two participants' own precommits - driven, on a
+        // real node, by each of them independently reaching the same
+        // prevote quorum - are what actually finalizes it.
+        let precommit_from_2 = signed_precommit(2, &other_sks[0], &first.block.hash, 0, &first.block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_from_2).await;
+        let precommit_from_3 = signed_precommit(3, &other_sks[1], &first.block.hash, 0, &first.block);
+        handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_from_3).await;
         assert_eq!(node.chain.last().unwrap().hash, first.block.hash, "quorum must still be reachable for an already-cached candidate despite the flood");
     }
 

@@ -1,4 +1,4 @@
-//! The six peer-to-peer message types, wire-serialized as JSON.
+//! The seven peer-to-peer message types, wire-serialized as JSON.
 //!
 //! **Every message type carries an Ed25519 signature.** Earlier this
 //! was true only of [`BlockProposalMsg`]/[`BlockVoteMsg`]; observation
@@ -46,6 +46,7 @@ pub enum Message {
     State(StateMsg),
     BlockProposal(BlockProposalMsg),
     BlockVote(BlockVoteMsg),
+    Precommit(PrecommitMsg),
     TrustUpdate(TrustUpdateMsg),
     KeyRotation(KeyRotationMsg),
 }
@@ -113,6 +114,31 @@ pub fn view_block_canon(view: u64, block: &Block) -> String {
     format!("view|{view}|{}", block_canon(block))
 }
 
+/// A precommit (second-phase signature) on a block that has already
+/// reached a *prevote* quorum certificate at `view` - the signer is
+/// locking onto it. See `crate::consensus`'s module doc comment on
+/// quorum-certificate locking for why this needs its own message type
+/// rather than reusing [`BlockVoteMsg`]: a precommit must sign a
+/// string ([`precommit_canon`]) that a prevote signature can never be
+/// replayed into, or the two phases wouldn't actually be separate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrecommitMsg {
+    pub sender: usize,
+    pub view: u64,
+    pub block_hash: String,
+    pub pubkey_hex: String,
+    pub sig_hex: String,
+}
+
+/// The exact string a [`PrecommitMsg`] signs - domain-separated from
+/// [`view_block_canon`] (what a proposal/prevote signs for the same
+/// `view`/`block`) by the `PRECOMMIT|` prefix, so a signature made for
+/// one phase can never be verified as valid for the other, even over
+/// the identical view and block.
+pub fn precommit_canon(view: u64, block: &Block) -> String {
+    format!("PRECOMMIT|{}", view_block_canon(view, block))
+}
+
 /// A gossiped update to how much `sender` trusts `about_peer`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustUpdateMsg {
@@ -160,6 +186,13 @@ mod tests {
                 block_hash: "abc".to_string(),
                 pubkey_hex: "def".to_string(),
                 sig_hex: "ghi".to_string(),
+            }),
+            Message::Precommit(PrecommitMsg {
+                sender: 1,
+                view: 0,
+                block_hash: "abc".to_string(),
+                pubkey_hex: "def".to_string(),
+                sig_hex: "jkl".to_string(),
             }),
             Message::TrustUpdate(TrustUpdateMsg { sender: 1, about_peer: 2, edge_weight: 1.5, sig_hex: "cc".to_string() }),
             Message::KeyRotation(KeyRotationMsg { sender: 1, new_pubkey_hex: "dd".to_string(), rotation_seq: 1, sig_hex: "ee".to_string() }),
@@ -211,6 +244,28 @@ mod tests {
         let mut b = Block::genesis(2);
         b.height = 5;
         assert_ne!(view_block_canon(0, &a), view_block_canon(0, &b));
+    }
+
+    /// The whole point of a separate precommit phase (see
+    /// `crate::consensus`'s module doc comment on quorum-certificate
+    /// locking) depends on this: a signature made over what a
+    /// prevote/proposal signs must never also verify as a valid
+    /// precommit for the identical view and block, or the two phases
+    /// wouldn't actually be cryptographically separate.
+    #[test]
+    fn precommit_canon_never_collides_with_view_block_canon() {
+        let block = Block::genesis(2);
+        assert_ne!(precommit_canon(0, &block), view_block_canon(0, &block));
+    }
+
+    #[test]
+    fn precommit_canon_is_sensitive_to_view_and_block() {
+        let a = Block::genesis(2);
+        let mut b = Block::genesis(2);
+        b.height = 5;
+        assert_eq!(precommit_canon(0, &a), precommit_canon(0, &a));
+        assert_ne!(precommit_canon(0, &a), precommit_canon(1, &a));
+        assert_ne!(precommit_canon(0, &a), precommit_canon(0, &b));
     }
 
     #[test]

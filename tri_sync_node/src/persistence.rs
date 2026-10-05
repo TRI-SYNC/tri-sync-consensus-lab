@@ -1,6 +1,8 @@
 //! LMDB-backed persistence (via `heed`) for blocks, trust, this node's
-//! keypair, epoch metadata, and (Hardening 8) rotated peer keys plus
-//! this node's own key-rotation counter.
+//! keypair, epoch metadata, (Hardening 8) rotated peer keys plus this
+//! node's own key-rotation counter, and this node's current
+//! quorum-certificate lock (`LockRecord`, see `crate::consensus`'s
+//! module doc comment).
 //!
 //! `heed` was chosen over RocksDB specifically because its LMDB source
 //! is small and compiles in seconds in a sandboxed build, confirmed by
@@ -35,6 +37,23 @@ pub struct PeerKeyRecord {
 const SIGNING_KEY_KEY: &str = "signing_key";
 const EPOCH_KEY: &str = "epoch";
 const OWN_ROTATION_SEQ_KEY: &str = "own_rotation_seq";
+const LOCK_KEY: &str = "lock";
+
+/// This node's quorum-certificate lock (see `crate::consensus`'s
+/// module doc comment) for whichever height is currently in flight -
+/// persisted so a restart can't forget it and re-prevote for a
+/// conflicting block, which would reopen exactly the safety gap
+/// locking exists to close. At most one height is ever in flight at a
+/// time (the same invariant `RoundState` relies on elsewhere), so a
+/// single slot is enough; `run` ignores a loaded record whose height
+/// is not exactly `head.height + 1` (already committed past, or
+/// stale) rather than trusting it blindly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LockRecord {
+    pub height: u64,
+    pub view: u64,
+    pub block_hash: String,
+}
 
 #[derive(Debug)]
 pub struct PersistError(String);
@@ -60,11 +79,12 @@ pub struct Store {
     keys: Database<Str, Bytes>,
     meta: Database<Str, U64<BigEndian>>,
     peer_keys: Database<U64<BigEndian>, SerdeJson<PeerKeyRecord>>,
+    locks: Database<Str, SerdeJson<LockRecord>>,
 }
 
 impl Store {
     /// Opens (creating if necessary) an LMDB environment at `dir` with
-    /// the five databases this node needs.
+    /// the six databases this node needs.
     pub fn open(dir: &Path) -> Result<Store, PersistError> {
         std::fs::create_dir_all(dir).map_err(|e| PersistError(format!("creating {}: {e}", dir.display())))?;
         // SAFETY: heed's `open` is unsafe because opening the same LMDB
@@ -72,7 +92,7 @@ impl Store {
         // mismatched configuration (map size, max_dbs) is undefined
         // behavior. This node is the only process expected to open its
         // own data_dir, with a fixed max_dbs below.
-        let env = unsafe { EnvOpenOptions::new().max_dbs(5).open(dir) }
+        let env = unsafe { EnvOpenOptions::new().max_dbs(6).open(dir) }
             .map_err(|e| PersistError(format!("opening LMDB env at {}: {e}", dir.display())))?;
 
         let mut wtxn = env.write_txn()?;
@@ -81,9 +101,10 @@ impl Store {
         let keys = env.create_database(&mut wtxn, Some("keys"))?;
         let meta = env.create_database(&mut wtxn, Some("meta"))?;
         let peer_keys = env.create_database(&mut wtxn, Some("peer_keys"))?;
+        let locks = env.create_database(&mut wtxn, Some("locks"))?;
         wtxn.commit()?;
 
-        Ok(Store { env, blocks, trust, keys, meta, peer_keys })
+        Ok(Store { env, blocks, trust, keys, meta, peer_keys, locks })
     }
 
     pub fn put_block(&self, block: &Block) -> Result<(), PersistError> {
@@ -182,6 +203,26 @@ impl Store {
         let rtxn = self.env.read_txn()?;
         Ok(self.meta.get(&rtxn, OWN_ROTATION_SEQ_KEY)?)
     }
+
+    /// Persists this node's current quorum-certificate lock (see
+    /// [`LockRecord`]). Overwrites any previous record - there is
+    /// only ever one height in flight at a time.
+    pub fn put_lock(&self, record: &LockRecord) -> Result<(), PersistError> {
+        let mut wtxn = self.env.write_txn()?;
+        self.locks.put(&mut wtxn, LOCK_KEY, record)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// This node's persisted lock, if any. `None` means either this
+    /// node has never locked, or its one in-flight height already
+    /// committed (callers should ignore a record whose `height` is no
+    /// longer `head.height + 1` rather than treating `None` as the
+    /// only "nothing to restore" case).
+    pub fn get_lock(&self) -> Result<Option<LockRecord>, PersistError> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.locks.get(&rtxn, LOCK_KEY)?)
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +319,21 @@ mod tests {
 
         // A different peer's record is independent.
         assert_eq!(store.get_peer_key(2).unwrap(), None);
+    }
+
+    #[test]
+    fn lock_round_trips_and_a_later_write_overwrites_the_earlier_one() {
+        let dir = TempDir::new("lock");
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get_lock().unwrap(), None);
+
+        let first = LockRecord { height: 1, view: 0, block_hash: "aaa".to_string() };
+        store.put_lock(&first).unwrap();
+        assert_eq!(store.get_lock().unwrap(), Some(first));
+
+        let second = LockRecord { height: 1, view: 1, block_hash: "bbb".to_string() };
+        store.put_lock(&second).unwrap();
+        assert_eq!(store.get_lock().unwrap(), Some(second), "only one height is ever in flight - a new lock replaces, not appends");
     }
 
     #[test]
