@@ -6,7 +6,7 @@
 //! [`tri_sync_node::consensus`] for what that loop actually does and
 //! what's simplified about it.
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::io::Write;
 use std::path::PathBuf;
@@ -162,7 +162,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    let server_endpoint = match net::make_server_endpoint(listen_addr) {
+    let server_endpoint = match net::make_server_endpoint(listen_addr, &node_state.signing_key) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("tri_sync_node: cannot start QUIC server on {listen_addr}: {e}");
@@ -265,7 +265,11 @@ async fn rotate_key(config: &config::NodeConfig, store: &persistence::Store, old
     let mut any_failed = false;
     for peer in &config.peers {
         let addr: std::net::SocketAddr = peer.addr.parse().expect("validated at config load");
-        match net::send_message(&endpoint, addr, &msg).await {
+        // config::load_from_str already validated pubkey_hex at config
+        // load time, so this can only fail if that validation and this
+        // decode somehow disagree - never expected in practice.
+        let peer_pubkey = hex::decode(&peer.pubkey_hex).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|a| VerifyingKey::from_bytes(&a).ok());
+        match net::send_message(&endpoint, addr, peer_pubkey, &msg).await {
             Ok(()) => println!("tri_sync_node: notified peer {} at {addr}", peer.id),
             Err(e) => {
                 eprintln!("tri_sync_node: failed to notify peer {} at {addr}: {e}", peer.id);

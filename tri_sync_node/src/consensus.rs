@@ -383,10 +383,16 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
     for (id, peer) in snapshot {
         let endpoint = ctx.endpoint.clone();
         let addr = peer.addr;
+        let pubkey = peer.pubkey;
         let msg = msg.clone();
         let metrics = ctx.metrics.clone();
         tokio::spawn(async move {
-            let ok = match net::send_message(&endpoint, addr, &msg).await {
+            // Pinned to this peer's currently-known identity (its
+            // node.toml pubkey, or whatever a later key rotation
+            // superseded it with - see crate::net's doc comment) -
+            // never the unpinned opt-out, on the one path real traffic
+            // actually takes.
+            let ok = match net::send_message(&endpoint, addr, Some(pubkey), &msg).await {
                 Ok(()) => true,
                 Err(e) => {
                     warn(format!("send to {addr} failed: {e}"));
@@ -2714,8 +2720,8 @@ mod tests {
         let sk_b = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
 
         let loopback = |port: u16| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let server_a = net::make_server_endpoint(loopback(0)).unwrap();
-        let server_b = net::make_server_endpoint(loopback(0)).unwrap();
+        let server_a = net::make_server_endpoint(loopback(0), &sk_a).unwrap();
+        let server_b = net::make_server_endpoint(loopback(0), &sk_b).unwrap();
         let addr_a = server_a.local_addr().unwrap();
         let addr_b = server_b.local_addr().unwrap();
 
