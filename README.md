@@ -332,10 +332,15 @@ What it actually is:
 - **Real operational surface.** A Prometheus `/metrics` endpoint,
   per-peer health tracking, clean SIGTERM/SIGINT shutdown, timestamped
   logs, an offline Ed25519-signed license file
-  (`license.toml`/`LICENSE_PUBLIC_KEY_HEX`) gating node count and
-  feature flags, and an in-band key-rotation flow
-  (`--rotate-key`) for rotating a node's identity without taking the
-  whole network down.
+  (`license.toml`/`LICENSE_PUBLIC_KEY_HEX`) gating node count, and an
+  in-band key-rotation flow (`--rotate-key`) for rotating a node's
+  identity without taking the whole network down. Honest note: a
+  license's `features` list round-trips through parsing, signing, and
+  verification, and `tri_sync_node_license_tool` will happily sign any
+  list you give it - but nothing in this binary gates behavior on a
+  specific feature name yet (see `License::has_feature`'s doc comment
+  in `tri_sync_node::license`). Only `max_nodes` is actually enforced
+  today.
 - **Real BFT consensus over the wire**: round-robin proposer selection,
   a two-phase prevote/precommit quorum-certificate protocol (a node
   locks onto a candidate only once it independently observes a real
@@ -386,9 +391,16 @@ cargo run --bin tri_sync_node_license_tool -- generate-key
 
 cargo run --bin tri_sync_node_license_tool -- sign \
   --private-key <hex> --org "Acme Corp" --max-nodes 5 \
-  --expiry 2027-01-01 --features "chain_crypto,http_api" \
-  --out acme-license.toml
+  --expiry 2027-01-01 --out acme-license.toml
 ```
+
+`--features <csv>` is also accepted and gets signed into the license
+along with everything else, but it's worth knowing before you rely on
+it: nothing in `tri_sync_node` currently gates behavior on a specific
+feature name (only `max_nodes` is actually enforced) - see
+`License::has_feature`'s doc comment in `tri_sync_node::license` for
+the honest current status. Omitted above for exactly that reason;
+pass it once a real feature-gated capability exists to name.
 
 `generate-key` never runs as a side effect of anything else in this
 repository - the private key it prints is the actual secret that will

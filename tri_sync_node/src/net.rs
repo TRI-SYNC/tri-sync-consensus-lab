@@ -20,7 +20,7 @@
 //! its real Ed25519 identity key (`self_signed_cert_from_identity`) -
 //! the certificate's own public key literally *is* that node's
 //! `verifying_key` - and `send_message` pins the expected server to a
-//! specific known pubkey via [`PinnedServerVerification`], extracting
+//! specific known pubkey via `PinnedServerVerification`, extracting
 //! the presented certificate's embedded Ed25519 key
 //! (`extract_ed25519_spki_pubkey`) and rejecting the connection
 //! outright on any mismatch, before a single `Message` byte is sent.
@@ -228,7 +228,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 
 /// Builds a QUIC server endpoint bound to `listen_addr`, with a real
 /// self-signed certificate tied to this node's own Ed25519 identity -
-/// see [`self_signed_cert_from_identity`].
+/// see `self_signed_cert_from_identity` below.
 pub fn make_server_endpoint(listen_addr: SocketAddr, signing_key: &SigningKey) -> Result<quinn::Endpoint, NetError> {
     let (cert, key) = self_signed_cert_from_identity(signing_key)?;
     // Explicit provider: this binary links both `ring` and `aws-lc-rs`
@@ -281,7 +281,7 @@ pub fn make_client_endpoint() -> Result<quinn::Endpoint, NetError> {
 ///
 /// `expected_server_pubkey`: the Ed25519 identity this connection's
 /// server certificate must present to be trusted at all - see this
-/// module's doc comment and [`PinnedServerVerification`]. `None` is a
+/// module's doc comment and `PinnedServerVerification` below. `None` is a
 /// narrow, explicit opt-out for callers with no real peer identity to
 /// pin to; the production `crate::consensus::broadcast` path always
 /// passes `Some`.

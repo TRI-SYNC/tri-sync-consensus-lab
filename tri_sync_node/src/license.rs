@@ -46,9 +46,17 @@ pub struct License {
 }
 
 impl License {
-    // Feature gating isn't wired to any specific feature name yet
-    // (Stage 5+ networking/persistence code will use this); already
-    // exercised by this module's own tests.
+    // Honest status, not a forward-looking promise: `main.rs` only
+    // ever calls `allows_node_count` - `features` round-trips through
+    // parsing/signing/verification (and `tri_sync_node_license_tool`
+    // happily signs an arbitrary list into a license), but nothing in
+    // this binary actually gates any behavior on a specific feature
+    // name today. `has_feature` exists and is tested purely so the
+    // plumbing is proven correct for whenever a real feature-gated
+    // capability needs it - it is not itself evidence that one exists
+    // yet. Don't read `license.example.toml`'s `features` list (or any
+    // real license's) as naming something this binary currently
+    // restricts; it doesn't restrict anything by feature name at all.
     #[allow(dead_code)]
     pub fn has_feature(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
@@ -362,6 +370,9 @@ mod tests {
         let license = parse_and_verify(toml, LICENSE_PUBLIC_KEY_HEX).expect("example license should verify");
         assert_eq!(license.org, "TriSync Example Org");
         assert_eq!(license.max_nodes, 5);
-        assert!(license.has_feature("chain_crypto"));
+        // Deliberately empty - see the fixture's own header comment for
+        // why this isn't a placeholder someone forgot to fill in.
+        assert!(license.features.is_empty());
+        assert!(!license.has_feature("anything"));
     }
 }

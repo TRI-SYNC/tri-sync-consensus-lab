@@ -5,8 +5,7 @@
 #
 #   cargo run --bin tri_sync_node_license_tool -- sign \
 #     --private-key <dev key, discarded from this machine after signing> \
-#     --org "TriSync Example Org" --max-nodes 5 --expiry 2030-01-01 \
-#     --features "chain_crypto,chain_weighted,http_api"
+#     --org "TriSync Example Org" --max-nodes 5 --expiry 2030-01-01
 #
 # The private key was generated for this repository with
 # `tri_sync_node_license_tool generate-key` and discarded from this
@@ -16,11 +15,21 @@
 # public key generated independently by whoever issues licenses, and
 # licenses signed with its matching private key, which stays with them.
 #
+# `features` is left empty deliberately, not merely as a placeholder:
+# nothing in `tri_sync_node` currently gates behavior on a specific
+# feature name (only `max_nodes` is enforced - see
+# `License::has_feature`'s doc comment in src/license.rs for the
+# honest current status), so this fixture doesn't claim otherwise. An
+# earlier version of this file listed `chain_crypto`/`chain_weighted`/
+# `http_api` here, which were actually the unrelated single-process
+# simulation binaries' names, not real feature flags of this product -
+# corrected once that confusion was noticed, not left as a precedent.
+#
 # The signature covers "org|max_nodes|sorted,features|expiry" - see
 # `canonical_string` in src/license.rs.
 
 org = "TriSync Example Org"
 max_nodes = 5
-features = ["chain_crypto", "chain_weighted", "http_api"]
+features = []
 expiry = "2030-01-01"
-signature = "f57e8601a4e41546fac6cfb486e5e27c86538a97f026d11aa1754b308f0ea5b0e01566297f4099a597a3302c7166673467e4f0fa34ce76b9abb850015323ea09"
+signature = "9591053fef85cff4723d5a162ef55faaee9a829e6f42cbcda0a7bec3a74d3f8dd5abf976bfd1212262ad661f7917bcbe9d1f2daa53a9285e9b106a05bcf1d803"

@@ -1,5 +1,6 @@
 //! Optional Prometheus metrics: head height, forks observed, blocks
-//! that reconciled a fork, mean trust weight toward this node's peers,
+//! that reconciled a fork, (Hardening 4) view-changes triggered by a
+//! stalled proposer, mean trust weight toward this node's peers,
 //! (Hardening 6) per-peer network health - see `crate::health` for
 //! what "health" means here and why it's purely observational - and
 //! (Hardening 7) this node's current epoch.
