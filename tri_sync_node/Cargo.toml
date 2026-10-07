@@ -1,0 +1,42 @@
+[package]
+name = "tri_sync_node"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted, network-capable tri-sync node: loads node.toml/license.toml, verifies the license, and runs consensus rounds using tri_sync_core."
+license-file = "../LICENSE.md"
+publish = false
+
+[lib]
+name = "tri_sync_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tri_sync_node"
+path = "src/main.rs"
+
+[[bin]]
+name = "tri_sync_node_probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "tri_sync_node_license_tool"
+path = "src/bin/sign_license.rs"
+
+[dependencies]
+tri_sync_core = { path = "../tri_sync_core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+rand = "0.8"
+heed = "0.20"
+byteorder = "1"
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+serde_json = "1"
+tiny_http = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

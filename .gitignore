@@ -1,1 +1,4 @@
 /target
+# tri_sync_node's default LMDB data directory
+/data
+/tri_sync_node/data

@@ -1,3 +1,6 @@
+[workspace]
+members = ["tri_sync_core", "tri_sync_node"]
+
 [package]
 name = "tri_sync"
 version = "0.2.0"

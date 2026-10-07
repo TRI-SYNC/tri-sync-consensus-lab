@@ -7,6 +7,17 @@ agreement across noisy, adversarial nodes; telemetry-instrumented. One
 variant (`tri_sync_chain_crypto`) adds real Ed25519 signing and epoch
 key rotation - the rest have no cryptography. Cargo package: `tri_sync`.
 
+This same repository also contains the real product built on what the
+simulation proved out: `tri_sync_core` and `tri_sync_node`, a
+self-hosted, licensed, network-capable consensus node (real QUIC+TLS
+transport, Ed25519-signed messages, LMDB persistence, Prometheus
+metrics) - see
+[The networked node (`tri_sync_node`)](#the-networked-node-tri_sync_node)
+below. The sections above and immediately below this one (What's here
+through Testing) describe only the single-process simulation; the
+networked node has its own section with its own Running/Testing/
+Known-limitations breakdown.
+
 ## What's here
 
 - `src/invariants.rs` — the `clarity_gate` a node applies to its own
@@ -289,6 +300,202 @@ streaming and connection-cap tests were run against a temporarily
 reintroduced version of the bug they're meant to catch (the old
 batch-response behavior; the cap check disabled) to confirm they
 actually fail, not just that they currently pass.
+
+## The networked node (`tri_sync_node`)
+
+Everything above this section describes `tri_sync`, the single-process
+simulation workspace used to design and validate the consensus/trust
+logic in isolation. This section describes the other two workspace
+members built on top of that validated logic: `tri_sync_core` (the
+pure consensus/trust/fusion/chain code, extracted with no I/O
+dependencies) and `tri_sync_node` (a real, self-hosted, licensed,
+network-capable consensus node - independent OS processes exchanging
+real signed messages over a real network, not a loop simulating many
+nodes in one process).
+
+What it actually is:
+
+- **Real transport.** Peers connect over QUIC with TLS 1.3
+  (`quinn`/`rustls`). Each node's certificate is generated from its own
+  Ed25519 identity key, and every outbound connection is pinned to the
+  specific peer being dialed - a validly self-signed certificate for
+  the wrong identity is rejected before a single message is sent, not
+  just caught later at the message layer.
+- **Real cryptography.** Every proposal, vote, precommit, observation,
+  trust-update, key-rotation, and chain-sync message is Ed25519-signed
+  and verified against a known peer key before any of its content is
+  trusted - see `tri_sync_node::protocol`'s per-message canonical
+  signing strings.
+- **Real persistence.** Blocks, the trust graph, peer keys, epoch
+  metadata, and this node's current consensus lock are stored in LMDB
+  (`tri_sync_node::persistence`) and restored on restart.
+- **Real operational surface.** A Prometheus `/metrics` endpoint,
+  per-peer health tracking, clean SIGTERM/SIGINT shutdown, timestamped
+  logs, an offline Ed25519-signed license file
+  (`license.toml`/`LICENSE_PUBLIC_KEY_HEX`) gating node count, and an
+  in-band key-rotation flow (`--rotate-key`) for rotating a node's
+  identity without taking the whole network down. Honest note: a
+  license's `features` list round-trips through parsing, signing, and
+  verification, and `tri_sync_node_license_tool` will happily sign any
+  list you give it - but nothing in this binary gates behavior on a
+  specific feature name yet (see `License::has_feature`'s doc comment
+  in `tri_sync_node::license`). Only `max_nodes` is actually enforced
+  today.
+- **Real BFT consensus over the wire**: round-robin proposer selection,
+  a two-phase prevote/precommit quorum-certificate protocol (a node
+  locks onto a candidate only once it independently observes a real
+  prevote quorum, and a block commits only once a precommit quorum is
+  reached), a liveness fallback that bumps the view and hands off to
+  the next proposer after a timeout, chain-sync for a node that's
+  fallen behind on a committed height, fork detection/logging, and
+  dynamic peer membership (an `Add`/`Remove` change rides the ordinary
+  block-commit path, so it only ever takes effect once its own block
+  earns a real quorum-certificate under the membership as it stood
+  *before* the change) - see `tri_sync_node::consensus`'s module doc
+  comment for the full, precise account of what is and isn't covered
+  (it is the authoritative source; this README summarizes it).
+
+### Running
+
+```bash
+# One-time per node: generate node.toml (see tri_sync_node/src/config.rs
+# for every field) and a license.toml. tri_sync_node/license.example.toml
+# is a real, working fixture signed with a development-only key - issue
+# real licenses with tri_sync_node_license_tool instead (see below), and
+# replace LICENSE_PUBLIC_KEY_HEX in src/license.rs with the resulting
+# production public key before issuing any to a paying customer.
+cargo run --bin tri_sync_node -- node.toml --show-identity   # prints this node's pubkey, then exits
+cargo run --bin tri_sync_node -- node.toml                   # starts the QUIC server + consensus loop, runs until killed
+cargo run --bin tri_sync_node -- node.toml --duration 60      # same, but exits cleanly after 60s (for scripted runs)
+cargo run --bin tri_sync_node -- node.toml --rotate-key       # rotates this node's signing key and announces it to its configured peers; stop the node first (see the flag's own doc comment in main.rs for why)
+cargo run --bin tri_sync_node -- node.toml --propose-add-peer <id> <addr> <pubkey_hex>   # signs and broadcasts a membership-change proposal to add a peer
+cargo run --bin tri_sync_node -- node.toml --propose-remove-peer <id>                     # same, to remove one
+```
+
+The last two only ever *propose* a change - broadcasting one changes
+nothing by itself. It takes effect only once whichever peer becomes
+proposer next attaches it to a block that goes on to earn a real
+precommit quorum-certificate under the network's actual current
+membership, exactly like any other block - see `tri_sync_node::
+consensus`'s module doc comment on dynamic membership for the full
+mechanism.
+
+### Issuing licenses
+
+```bash
+cargo run --bin tri_sync_node_license_tool -- generate-key
+# public_key_hex  = ...
+# private_key_hex = ...   (shown once; move it into your own secret
+#                           storage immediately - this tool never
+#                           persists it anywhere)
+
+cargo run --bin tri_sync_node_license_tool -- sign \
+  --private-key <hex> --org "Acme Corp" --max-nodes 5 \
+  --expiry 2027-01-01 --out acme-license.toml
+```
+
+`--features <csv>` is also accepted and gets signed into the license
+along with everything else, but it's worth knowing before you rely on
+it: nothing in `tri_sync_node` currently gates behavior on a specific
+feature name (only `max_nodes` is actually enforced) - see
+`License::has_feature`'s doc comment in `tri_sync_node::license` for
+the honest current status. Omitted above for exactly that reason;
+pass it once a real feature-gated capability exists to name.
+
+`generate-key` never runs as a side effect of anything else in this
+repository - the private key it prints is the actual secret that will
+let anyone sign a license as you, so it's produced only when you ask
+for it, shown exactly once, and never written to disk by this tool.
+Run it yourself, on a machine you trust, and set
+`LICENSE_PUBLIC_KEY_HEX` in `tri_sync_node/src/license.rs` to the
+`public_key_hex` it prints before relying on it for a real customer.
+`sign` rejects a malformed private key or an expiry date that doesn't
+exist on the calendar, and verifies its own output against the
+signing key's public half before ever printing or writing it - a
+license this tool can't verify is never handed back.
+
+### Testing
+
+```bash
+cargo test --workspace     # includes tri_sync_core and tri_sync_node
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`tri_sync_node`'s own test suite (139 tests at time of writing) covers
+each message handler directly with real Ed25519 keys and real
+`view_block_canon`/`block_canon` signing - not mocks - including a
+dedicated adversarial-input test for every bug this project's own
+focused code-review passes have found (forged signatures, replayed/
+escalating views, malformed peer keys, a flooding expected proposer),
+plus one real two-process end-to-end test that spins up two actual OS
+processes talking QUIC over real sockets and asserts they converge on
+the same committed chain.
+
+### Known limitations and roadmap
+
+Disclosed plainly, not glossed over - the authoritative, always-current
+version of this list is `tri_sync_node::consensus`'s own module doc
+comment. Five items in this family have been identified and closed, as
+a demonstration that "disclosed" items get revisited and actually
+fixed once genuinely scoped, rather than forgotten or left as a
+permanent asterisk:
+
+- **BFT locking / quorum certificates.** The liveness fallback
+  (view-change) used to let a node advance past a stalled proposer
+  while only *locking* its vote implicitly - by however far signature/
+  expected-proposer checks let it advance, never via a real
+  quorum-certificate proof that an earlier view genuinely failed. In
+  an adversarial or badly-partitioned network that left a real window
+  where votes could split across two views' candidates for the same
+  height. Closed with a real two-phase prevote/precommit protocol: a
+  node only locks once its own prevote tally for a (block, view) pair
+  reaches quorum - a genuine polka, not a claim - and a block commits
+  only once a *precommit* quorum (domain-separated signatures,
+  never replayable from a prevote) is reached. Proven, not just
+  implemented: a dedicated test drives two disjoint, individually
+  legitimate candidates for the same height through a real 4-node
+  quorum and confirms only one of them can ever reach a precommit QC.
+- **TLS transport identity.** The QUIC transport used to encrypt every
+  connection with a throwaway, unrelated certificate and accept any
+  server certificate at all - confidentiality with zero peer
+  authentication, resting entirely on message-level signing instead.
+  Closed: each node's certificate is now generated from its real
+  Ed25519 identity key, and every outbound connection is pinned to the
+  specific peer being dialed, rejecting a real, validly self-signed
+  certificate for the wrong identity before a single message is sent.
+- **Chain-sync.** A node behind on an already-*committed* height (not
+  merely a view, which the liveness fallback already handled) used to
+  have no recovery path at all. Closed: `handle_proposal` triggers a
+  debounced sync request the moment it sees evidence it's behind;
+  every synced block is verified independently of whoever relayed it
+  (content hash plus a real reconstructed precommit quorum), never
+  trusted merely because the response envelope was validly signed.
+- **Resource exhaustion.** `RoundState`'s candidate/vote maps are now
+  capped (`MAX_CANDIDATES_PER_HEIGHT`) against a legitimate-but-malicious
+  expected proposer signing unboundedly many distinct blocks for the
+  same (height, view).
+- **Dynamic peer membership.** `--rotate-key` only ever updates the
+  *key* of an already-configured peer id; by itself it never touched
+  `all_ids`/quorum/`network_size`, which used to stay exactly as
+  `node.toml` originally described for the life of the process. Closed
+  by piggybacking an `Add`/`Remove` change onto the ordinary
+  block-commit path instead of building a separate agreement protocol
+  for it: the change is part of the block's own signed identity, and
+  `apply_membership_change` only ever runs *after* that block has
+  independently earned a real precommit quorum-certificate under the
+  membership as it stood before the change - so no node can unilaterally
+  grow or shrink its own voting power, and the mechanism inherits
+  quorum-certificate locking and chain-sync for free rather than
+  needing its own copy of either. `--propose-add-peer`/
+  `--propose-remove-peer` give an operator a way to get a change
+  proposed promptly; a dedicated test proves the actual safety property
+  (a change never takes effect without a real quorum) as well as the
+  live effect (the quorum enforced for the *next* height genuinely
+  rises or falls once a change commits, and chain-sync replays a
+  historical change exactly like a live commit would).
+
+Each of the five above has a dedicated test proving the actual
+property closed, not just that the new code runs.
 
 ## License
 
