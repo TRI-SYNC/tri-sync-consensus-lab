@@ -92,7 +92,9 @@ impl PeerHealth {
             }
         } else {
             self.total_send_failures.fetch_add(1, Ordering::Relaxed);
-            let prev = self.consecutive_send_failures.fetch_add(1, Ordering::Relaxed);
+            let prev = self
+                .consecutive_send_failures
+                .fetch_add(1, Ordering::Relaxed);
             if prev + 1 == UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
                 HealthTransition::BecameUnhealthy
             } else {
@@ -102,7 +104,8 @@ impl PeerHealth {
     }
 
     pub fn record_authenticated_message(&self) {
-        self.last_seen_unix_secs.store(unix_now(), Ordering::Relaxed);
+        self.last_seen_unix_secs
+            .store(unix_now(), Ordering::Relaxed);
     }
 
     pub fn total_sends(&self) -> u64 {
@@ -139,7 +142,10 @@ impl PeerHealth {
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -162,12 +168,21 @@ mod tests {
             assert!(h.is_healthy(), "not enough consecutive failures yet");
         }
         h.record_send_result(false);
-        assert!(!h.is_healthy(), "threshold reached, should now be unhealthy");
+        assert!(
+            !h.is_healthy(),
+            "threshold reached, should now be unhealthy"
+        );
 
         h.record_send_result(true);
-        assert!(h.is_healthy(), "a single success resets the consecutive-failure streak");
+        assert!(
+            h.is_healthy(),
+            "a single success resets the consecutive-failure streak"
+        );
         assert_eq!(h.total_sends(), UNHEALTHY_AFTER_CONSECUTIVE_FAILURES + 1);
-        assert_eq!(h.total_send_failures(), UNHEALTHY_AFTER_CONSECUTIVE_FAILURES);
+        assert_eq!(
+            h.total_send_failures(),
+            UNHEALTHY_AFTER_CONSECUTIVE_FAILURES
+        );
     }
 
     #[test]
@@ -178,7 +193,10 @@ mod tests {
         h.record_send_result(true); // resets the streak
         h.record_send_result(false);
         h.record_send_result(false);
-        assert!(h.is_healthy(), "the reset means only 2 consecutive failures since the last success");
+        assert!(
+            h.is_healthy(),
+            "the reset means only 2 consecutive failures since the last success"
+        );
     }
 
     #[test]
@@ -195,11 +213,23 @@ mod tests {
         for _ in 0..UNHEALTHY_AFTER_CONSECUTIVE_FAILURES - 1 {
             assert_eq!(h.record_send_result(false), HealthTransition::NoChange);
         }
-        assert_eq!(h.record_send_result(false), HealthTransition::BecameUnhealthy, "this call lands exactly on the threshold");
-        assert_eq!(h.record_send_result(false), HealthTransition::NoChange, "already unhealthy, not a new transition");
+        assert_eq!(
+            h.record_send_result(false),
+            HealthTransition::BecameUnhealthy,
+            "this call lands exactly on the threshold"
+        );
+        assert_eq!(
+            h.record_send_result(false),
+            HealthTransition::NoChange,
+            "already unhealthy, not a new transition"
+        );
 
         assert_eq!(h.record_send_result(true), HealthTransition::Recovered);
-        assert_eq!(h.record_send_result(true), HealthTransition::NoChange, "already healthy, a second success isn't a new transition");
+        assert_eq!(
+            h.record_send_result(true),
+            HealthTransition::NoChange,
+            "already healthy, a second success isn't a new transition"
+        );
     }
 
     /// The real bug this stage's own live multi-process test caught:
@@ -209,8 +239,8 @@ mod tests {
     /// `PeerHealth`, not just asserting it from reading the fixed code.
     #[test]
     fn concurrent_failures_report_the_unhealthy_transition_exactly_once() {
-        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
 
         let h = Arc::new(PeerHealth::default());
         // Get to one failure away from the threshold single-threaded,
@@ -236,6 +266,10 @@ mod tests {
             t.join().unwrap();
         }
 
-        assert_eq!(became_unhealthy_count.load(Ordering::Relaxed), 1, "exactly one of the racing calls must land on the threshold");
+        assert_eq!(
+            became_unhealthy_count.load(Ordering::Relaxed),
+            1,
+            "exactly one of the racing calls must land on the threshold"
+        );
     }
 }

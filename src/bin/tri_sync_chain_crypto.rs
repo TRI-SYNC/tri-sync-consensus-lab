@@ -4,8 +4,8 @@
 // with neighboring loops in the same function that touch several.
 #![allow(clippy::needless_range_loop)]
 
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 /// Fixed by default so a run can be reproduced exactly; not yet exposed
 /// as a CLI flag.
@@ -32,12 +32,18 @@ use std::io::{self, Write};
 use tri_sync::invariants;
 use tri_sync::types::TelemetryRow;
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-fn clamp(x: f64, lo: f64, hi: f64) -> f64 { x.max(lo).min(hi) }
-fn l2(v: &[f64]) -> f64 { v.iter().map(|x| x*x).sum::<f64>().sqrt() }
-fn v_sub(a: &[f64], b: &[f64]) -> Vec<f64> { a.iter().zip(b.iter()).map(|(x,y)| x-y).collect() }
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    x.max(lo).min(hi)
+}
+fn l2(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+fn v_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()
+}
 
 fn hex16(bytes: &[u8]) -> String {
     let h = hex::encode(bytes);
@@ -89,7 +95,14 @@ struct Block {
     hash: String,
 }
 
-fn canon_string(height: u64, parent: &str, state_hash: &str, confidence: f64, reconciles_hash: &str, epoch: u64) -> String {
+fn canon_string(
+    height: u64,
+    parent: &str,
+    state_hash: &str,
+    confidence: f64,
+    reconciles_hash: &str,
+    epoch: u64,
+) -> String {
     format!("{height}|{parent}|{state_hash}|{confidence:.8}|{reconciles_hash}|{epoch}")
 }
 
@@ -106,9 +119,15 @@ fn block_hash(canon: &str) -> String {
 /// actually got) get to break the tie before confidence (how tight the
 /// contributing estimates were) does.
 fn prefer(a: &Block, b: &Block) -> bool {
-    if b.height != a.height { return b.height > a.height; }
-    if (b.sig_weight - a.sig_weight).abs() > f64::EPSILON { return b.sig_weight > a.sig_weight; }
-    if (b.confidence - a.confidence).abs() > f64::EPSILON { return b.confidence > a.confidence; }
+    if b.height != a.height {
+        return b.height > a.height;
+    }
+    if (b.sig_weight - a.sig_weight).abs() > f64::EPSILON {
+        return b.sig_weight > a.sig_weight;
+    }
+    if (b.confidence - a.confidence).abs() > f64::EPSILON {
+        return b.confidence > a.confidence;
+    }
     false
 }
 
@@ -123,7 +142,9 @@ fn regen_keys(
     signing.clear();
     verify.clear();
     // consume RNG proportional to epoch (sim-only determinism hint)
-    for _ in 0..(epoch as usize * 3).min(30) { let _: u64 = rng.gen(); }
+    for _ in 0..(epoch as usize * 3).min(30) {
+        let _: u64 = rng.gen();
+    }
     for _i in 0..n {
         let sk = SigningKey::generate(rng);
         let vk = sk.verifying_key();
@@ -149,10 +170,22 @@ fn parse_args() -> (u64, u64, String, String) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed); }
-            "--steps" => { i += 1; steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(steps); }
-            "--out" => { i += 1; out = args.get(i).cloned().unwrap_or(out); }
-            "--chain-log" => { i += 1; chain_log = args.get(i).cloned().unwrap_or(chain_log); }
+            "--seed" => {
+                i += 1;
+                seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed);
+            }
+            "--steps" => {
+                i += 1;
+                steps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(steps);
+            }
+            "--out" => {
+                i += 1;
+                out = args.get(i).cloned().unwrap_or(out);
+            }
+            "--chain-log" => {
+                i += 1;
+                chain_log = args.get(i).cloned().unwrap_or(chain_log);
+            }
             _ => {}
         }
         i += 1;
@@ -179,12 +212,19 @@ fn load_chain_log(
         return Ok(head);
     };
     for (line_no, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let b: Block = serde_json::from_str(line).map_err(|e| {
-            io::Error::other(format!("{path}:{}: corrupt chain log line: {e}", line_no + 1))
+            io::Error::other(format!(
+                "{path}:{}: corrupt chain log line: {e}",
+                line_no + 1
+            ))
         })?;
         let cur = blocks.get(&head).unwrap().clone();
-        if prefer(&cur, &b) { head = b.hash.clone(); }
+        if prefer(&cur, &b) {
+            head = b.hash.clone();
+        }
         blocks.insert(b.hash.clone(), b);
     }
     Ok(head)
@@ -213,7 +253,13 @@ struct Outcome {
     epoch_registries: HashMap<u64, Vec<VerifyingKey>>,
 }
 
-fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose: bool) -> io::Result<Outcome> {
+fn simulate(
+    seed: u64,
+    steps: u64,
+    out_path: &str,
+    chain_log_path: &str,
+    verbose: bool,
+) -> io::Result<Outcome> {
     if let Some(parent) = std::path::Path::new(out_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -227,7 +273,16 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
     let d: usize = 4;
 
     // reliability weights
-    let rel: Vec<f64> = (0..n).map(|i| match i % 6 { 0=>0.6, 1=>0.8, 2=>1.0, 3=>1.2, 4=>1.6, _=>2.0 }).collect();
+    let rel: Vec<f64> = (0..n)
+        .map(|i| match i % 6 {
+            0 => 0.6,
+            1 => 0.8,
+            2 => 1.0,
+            3 => 1.2,
+            4 => 1.6,
+            _ => 2.0,
+        })
+        .collect();
     let rel_sum: f64 = rel.iter().sum();
     let quorum_w: f64 = rel_sum * 0.55;
 
@@ -257,7 +312,7 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
             w_out[j].insert(i, w0 * rng.gen_range(0.8..1.2));
         }
     }
-    for _ in 0..(n*2) {
+    for _ in 0..(n * 2) {
         let a = rng.gen_range(0..n);
         let b = rng.gen_range(0..n);
         if a != b {
@@ -316,7 +371,10 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
             blocks.get(&head).unwrap().height
         );
     }
-    let mut chain_log = std::fs::OpenOptions::new().create(true).append(true).open(chain_log_path)?;
+    let mut chain_log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(chain_log_path)?;
 
     // fork + reconcile tracking
     let fork_prob: f64 = 0.10;
@@ -334,10 +392,16 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         }
 
         // env
-        for k in 0..d { truth[k] += drift; }
+        for k in 0..d {
+            truth[k] += drift;
+        }
         if rng.gen::<f64>() < shock_prob {
             let k = rng.gen_range(0..d);
-            truth[k] += if rng.gen::<bool>() { shock_mag } else { -shock_mag };
+            truth[k] += if rng.gen::<bool>() {
+                shock_mag
+            } else {
+                -shock_mag
+            };
         }
 
         // observe
@@ -346,7 +410,14 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
             let noise = if is_adversarial {
                 ADVERSARIAL_SIGMA
             } else {
-                match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 }
+                match i % 6 {
+                    0 => 0.12,
+                    1 => 0.18,
+                    2 => 0.28,
+                    3 => 0.40,
+                    4 => 0.65,
+                    _ => 0.95,
+                }
             };
             sigma[i] = noise;
             let bias = if i % 11 == 0 { 0.05 } else { 0.0 };
@@ -355,7 +426,11 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
                 // Always draw, whether or not it's used, so the RNG
                 // stream doesn't depend on which nodes are adversarial.
                 let eps: f64 = rng.sample::<f64, _>(StandardNormal) * noise;
-                ov[k] = if is_adversarial { truth[k] + DEVIATION_BIAS } else { truth[k] + bias + eps };
+                ov[k] = if is_adversarial {
+                    truth[k] + DEVIATION_BIAS
+                } else {
+                    truth[k] + bias + eps
+                };
             }
             obs_vec[i] = ov;
         }
@@ -364,16 +439,18 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
 
         // local refs + shares
         let mut refs: Vec<Vec<f64>> = vec![vec![0.0; d]; n];
-        let mut shares: Vec<Vec<(usize,f64)>> = vec![vec![]; n];
+        let mut shares: Vec<Vec<(usize, f64)>> = vec![vec![]; n];
 
         for i in 0..n {
             let mut vals: Vec<Vec<f64>> = vec![obs_vec[i].clone(), head_block.state.clone()];
             let mut ws: Vec<f64> = vec![1.0, 0.8];
 
-            let mut neigh: Vec<(usize,f64)> = vec![];
+            let mut neigh: Vec<(usize, f64)> = vec![];
             let mut sumw = 0.0;
             for (&j, &wij) in w_out[i].iter() {
-                if wij <= 0.0 { continue; }
+                if wij <= 0.0 {
+                    continue;
+                }
                 let wcl = clamp(wij, 0.0, 5.0);
                 vals.push(x_vec[j].clone());
                 ws.push(wcl);
@@ -386,25 +463,40 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
                 let dd = vals[0].len();
                 let mut out = vec![0.0; dd];
                 for kk in 0..dd {
-                    let mut pairs: Vec<(f64,f64)> = vals.iter().zip(ws.iter()).map(|(v,w)| (v[kk], *w)).collect();
-                    pairs.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap());
+                    let mut pairs: Vec<(f64, f64)> = vals
+                        .iter()
+                        .zip(ws.iter())
+                        .map(|(v, w)| (v[kk], *w))
+                        .collect();
+                    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                     let n2 = pairs.len();
-                    let tr = ((n2 as f64)*0.15).floor() as usize;
-                    let core = if n2 > 2*tr { &pairs[tr..(n2-tr)] } else { &pairs[..] };
-                    let wsum: f64 = core.iter().map(|(_,w)| *w).sum();
-                    out[kk] = if wsum > 0.0 { core.iter().map(|(v,w)| v*w).sum::<f64>() / wsum }
-                              else { core.iter().map(|(v,_)| *v).sum::<f64>() / (core.len().max(1) as f64) };
+                    let tr = ((n2 as f64) * 0.15).floor() as usize;
+                    let core = if n2 > 2 * tr {
+                        &pairs[tr..(n2 - tr)]
+                    } else {
+                        &pairs[..]
+                    };
+                    let wsum: f64 = core.iter().map(|(_, w)| *w).sum();
+                    out[kk] = if wsum > 0.0 {
+                        core.iter().map(|(v, w)| v * w).sum::<f64>() / wsum
+                    } else {
+                        core.iter().map(|(v, _)| *v).sum::<f64>() / (core.len().max(1) as f64)
+                    };
                 }
                 out
             };
 
             if sumw > 0.0 {
-                shares[i] = neigh.into_iter().map(|(j,wc)| (j, wc/sumw)).collect();
+                shares[i] = neigh.into_iter().map(|(j, wc)| (j, wc / sumw)).collect();
             }
         }
 
         // lock
-        let tau = if fast_sync_remaining > 0 { tau_fast } else { tau_normal };
+        let tau = if fast_sync_remaining > 0 {
+            tau_fast
+        } else {
+            tau_normal
+        };
         let mut clarified_count = 0usize;
         for i in 0..n {
             if !invariants::clarity_gate(sigma[i], tau) {
@@ -425,7 +517,7 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
                 let keys: Vec<usize> = w_out[i].keys().cloned().collect();
                 for j in keys {
                     let wij = w_out[i].get(&j).cloned().unwrap_or(0.0);
-                    w_out[i].insert(j, clamp(wij*0.995, w_floor, w_ceil));
+                    w_out[i].insert(j, clamp(wij * 0.995, w_floor, w_ceil));
                 }
                 continue;
             }
@@ -449,18 +541,31 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         // disagreement
         let mut ds: Vec<f64> = vec![];
         for i in 0..n {
-            if clarified[i] { continue; }
+            if clarified[i] {
+                continue;
+            }
             ds.push(l2(&v_sub(&x_vec[i], &refs[i])));
         }
-        let dval = if ds.is_empty() { f64::INFINITY } else { ds.iter().sum::<f64>() / (ds.len() as f64) };
+        let dval = if ds.is_empty() {
+            f64::INFINITY
+        } else {
+            ds.iter().sum::<f64>() / (ds.len() as f64)
+        };
 
         // phase
-        if fast_sync_remaining == 0 && dval < delta_explode { fast_sync_remaining = fast_cycles; }
+        if fast_sync_remaining == 0 && dval < delta_explode {
+            fast_sync_remaining = fast_cycles;
+        }
         fast_sync_remaining = fast_sync_remaining.saturating_sub(1);
 
         // completion
-        let all_ok = (0..n).all(|i| !clarified[i] && l2(&v_sub(&x_vec[i], &refs[i])) <= epsilon_align);
-        if all_ok { complete_streak += 1; } else { complete_streak = 0; }
+        let all_ok =
+            (0..n).all(|i| !clarified[i] && l2(&v_sub(&x_vec[i], &refs[i])) <= epsilon_align);
+        if all_ok {
+            complete_streak += 1;
+        } else {
+            complete_streak = 0;
+        }
         let done = complete_streak >= complete_cycles;
 
         // propose blocks (forks): every proposal this step extends the
@@ -470,7 +575,12 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         // proposal for this step exists, not by racing head forward
         // after each one - racing forward is what let the second
         // proposal end up parented on the first.
-        let proposals = if rng.gen::<f64>() < fork_prob { forks += 1; 2 } else { 1 };
+        let proposals = if rng.gen::<f64>() < fork_prob {
+            forks += 1;
+            2
+        } else {
+            1
+        };
         let candidate_height = head_block.height + 1;
         let mut created: Vec<Block> = vec![];
 
@@ -482,12 +592,21 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
             // proposals in the same fork step were always byte-identical
             // and reconciliation could never actually fire.
             let contributors: Vec<usize> = (0..n).filter(|_| rng.gen::<f64>() < 0.85).collect();
-            let contributors: Vec<usize> =
-                if contributors.is_empty() { (0..n).collect() } else { contributors };
+            let contributors: Vec<usize> = if contributors.is_empty() {
+                (0..n).collect()
+            } else {
+                contributors
+            };
 
             let mut cand = vec![0.0; d];
-            for &i in &contributors { for k in 0..d { cand[k] += x_vec[i][k]; } }
-            for k in 0..d { cand[k] /= contributors.len() as f64; }
+            for &i in &contributors {
+                for k in 0..d {
+                    cand[k] += x_vec[i][k];
+                }
+            }
+            for k in 0..d {
+                cand[k] /= contributors.len() as f64;
+            }
 
             // confidence
             let mut var = 0.0;
@@ -501,7 +620,14 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
             // Canonical string
             let st_hash = hash_vec(&cand);
             let rec_hash = hash_list(&[]);
-            let canon = canon_string(candidate_height, &head_block.hash, &st_hash, conf, &rec_hash, epoch);
+            let canon = canon_string(
+                candidate_height,
+                &head_block.hash,
+                &st_hash,
+                conf,
+                &rec_hash,
+                epoch,
+            );
 
             // Each node decides whether to sign based on its OWN locked
             // estimate x_vec[i], not ground truth: does the candidate
@@ -531,28 +657,51 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
                     sigw += rel[i];
                 }
             }
-            if sigw < quorum_w { continue; }
+            if sigw < quorum_w {
+                continue;
+            }
 
             let bh = block_hash(&canon);
 
             // verify signatures against registry for this epoch
             let mut verified_w = 0.0;
             for s in &sigs {
-                if s.node_id >= n { continue; }
-                let pk_bytes = match hex::decode(&s.pubkey_hex) { Ok(b) => b, Err(_) => continue };
-                let pk_arr: [u8; 32] = match pk_bytes.try_into() { Ok(a) => a, Err(_) => continue };
-                let vk = match VerifyingKey::from_bytes(&pk_arr) { Ok(v) => v, Err(_) => continue };
-                if vk.to_bytes() != verify[s.node_id].to_bytes() { continue; }
+                if s.node_id >= n {
+                    continue;
+                }
+                let pk_bytes = match hex::decode(&s.pubkey_hex) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let pk_arr: [u8; 32] = match pk_bytes.try_into() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let vk = match VerifyingKey::from_bytes(&pk_arr) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if vk.to_bytes() != verify[s.node_id].to_bytes() {
+                    continue;
+                }
 
-                let sig_bytes = match hex::decode(&s.sig_hex) { Ok(b) => b, Err(_) => continue };
-                let sig_arr: [u8; 64] = match sig_bytes.try_into() { Ok(a) => a, Err(_) => continue };
+                let sig_bytes = match hex::decode(&s.sig_hex) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let sig_arr: [u8; 64] = match sig_bytes.try_into() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
                 let sig = Signature::from_bytes(&sig_arr);
 
                 if vk.verify(canon.as_bytes(), &sig).is_ok() {
                     verified_w += rel[s.node_id];
                 }
             }
-            if verified_w < quorum_w { continue; }
+            if verified_w < quorum_w {
+                continue;
+            }
 
             let b = Block {
                 height: candidate_height,
@@ -575,13 +724,17 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         if !created.is_empty() {
             let mut best = head_block.clone();
             for b in &created {
-                if prefer(&best, b) { best = b.clone(); }
+                if prefer(&best, b) {
+                    best = b.clone();
+                }
             }
             head = best.hash.clone();
 
             let entry = height_candidates.entry(candidate_height).or_default();
             for b in &created {
-                if !entry.contains(&b.hash) { entry.push(b.hash.clone()); }
+                if !entry.contains(&b.hash) {
+                    entry.push(b.hash.clone());
+                }
             }
         }
 
@@ -595,7 +748,14 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
                     let head_now = blocks.get(&head).unwrap().clone();
                     let st_hash = hash_vec(&head_now.state);
                     let rec_hash = hash_list(&others);
-                    let canon = canon_string(head_now.height + 1, &head, &st_hash, head_now.confidence, &rec_hash, epoch);
+                    let canon = canon_string(
+                        head_now.height + 1,
+                        &head,
+                        &st_hash,
+                        head_now.confidence,
+                        &rec_hash,
+                        epoch,
+                    );
 
                     let mut sigs: Vec<SigEntry> = vec![];
                     let mut sigw = 0.0;
@@ -628,7 +788,9 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
                         writeln!(chain_log, "{}", serde_json::to_string(&rb).unwrap())?;
                         chain_log.flush()?;
                         let cur = blocks.get(&head).unwrap().clone();
-                        if prefer(&cur, &rb) { head = rb.hash.clone(); }
+                        if prefer(&cur, &rb) {
+                            head = rb.hash.clone();
+                        }
                         height_candidates.insert(candidate_height, vec![head.clone()]);
                     }
                 }
@@ -638,7 +800,12 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         // telemetry
         let mut sumw = 0.0;
         let mut cnt = 0usize;
-        for i in 0..n { for wij in w_out[i].values() { sumw += *wij; cnt += 1; } }
+        for i in 0..n {
+            for wij in w_out[i].values() {
+                sumw += *wij;
+                cnt += 1;
+            }
+        }
         let mean_w = if cnt == 0 { 0.0 } else { sumw / (cnt as f64) };
         let head_h = blocks.get(&head).unwrap().height;
 
@@ -660,10 +827,14 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
         });
 
         let line = serde_json::to_string(&out_obj).unwrap();
-        if verbose { println!("{line}"); }
+        if verbose {
+            println!("{line}");
+        }
         writeln!(file, "{line}")?;
 
-        if done { break; }
+        if done {
+            break;
+        }
     }
 
     let head_block = blocks.get(&head).unwrap().clone();
@@ -680,7 +851,13 @@ fn simulate(seed: u64, steps: u64, out_path: &str, chain_log_path: &str, verbose
     })
 }
 
-fn mean(v: &[f64]) -> f64 { if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 } }
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+}
 
 fn incoming(w_out: &[BTreeMap<usize, f64>], m: usize) -> Vec<f64> {
     w_out.iter().filter_map(|wi| wi.get(&m).copied()).collect()
@@ -688,18 +865,30 @@ fn incoming(w_out: &[BTreeMap<usize, f64>], m: usize) -> Vec<f64> {
 
 fn print_adversarial_summary(outcome: &Outcome) {
     println!("\n--- adversarial summary ---");
-    println!("final head height: {}  forks: {}  reconciles: {}", outcome.head_height, outcome.forks, outcome.reconciles);
-    println!("|head.state - truth| = {:.4}", l2(&v_sub(&outcome.head_state, &outcome.truth)));
+    println!(
+        "final head height: {}  forks: {}  reconciles: {}",
+        outcome.head_height, outcome.forks, outcome.reconciles
+    );
+    println!(
+        "|head.state - truth| = {:.4}",
+        l2(&v_sub(&outcome.head_state, &outcome.truth))
+    );
 
     let n = outcome.w_out.len();
-    let baseline_incoming: Vec<f64> = (0..n).filter(|i| !ADVERSARIAL_NODES.contains(i))
-        .flat_map(|i| incoming(&outcome.w_out, i)).collect();
-    let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES.iter()
-        .flat_map(|&i| incoming(&outcome.w_out, i)).collect();
+    let baseline_incoming: Vec<f64> = (0..n)
+        .filter(|i| !ADVERSARIAL_NODES.contains(i))
+        .flat_map(|i| incoming(&outcome.w_out, i))
+        .collect();
+    let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES
+        .iter()
+        .flat_map(|&i| incoming(&outcome.w_out, i))
+        .collect();
     println!(
         "mean incoming trust weight: baseline={:.4} (n={})  adversarial={:.4} (n={})",
-        mean(&baseline_incoming), baseline_incoming.len(),
-        mean(&adversarial_incoming), adversarial_incoming.len()
+        mean(&baseline_incoming),
+        baseline_incoming.len(),
+        mean(&adversarial_incoming),
+        adversarial_incoming.len()
     );
 }
 
@@ -715,7 +904,11 @@ mod sim_tests {
     use super::*;
 
     fn tmp_path(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("tri_sync_chain_crypto_test_{}_{}", std::process::id(), name));
+        let dir = std::env::temp_dir().join(format!(
+            "tri_sync_chain_crypto_test_{}_{}",
+            std::process::id(),
+            name
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name).to_string_lossy().into_owned()
     }
@@ -741,13 +934,19 @@ mod sim_tests {
         let out = tmp_path("telemetry_b.jsonl");
         let outcome = simulate(SEED, 600, &out, &tmp_path("chain_c.jsonl"), false).unwrap();
         let n = outcome.w_out.len();
-        let baseline: Vec<f64> = (0..n).filter(|i| !ADVERSARIAL_NODES.contains(i))
-            .flat_map(|i| incoming(&outcome.w_out, i)).collect();
-        let adversarial: Vec<f64> = ADVERSARIAL_NODES.iter()
-            .flat_map(|&i| incoming(&outcome.w_out, i)).collect();
+        let baseline: Vec<f64> = (0..n)
+            .filter(|i| !ADVERSARIAL_NODES.contains(i))
+            .flat_map(|i| incoming(&outcome.w_out, i))
+            .collect();
+        let adversarial: Vec<f64> = ADVERSARIAL_NODES
+            .iter()
+            .flat_map(|&i| incoming(&outcome.w_out, i))
+            .collect();
         assert!(
             mean(&adversarial) < mean(&baseline) - 0.1,
-            "adversarial={} baseline={}", mean(&adversarial), mean(&baseline)
+            "adversarial={} baseline={}",
+            mean(&adversarial),
+            mean(&baseline)
         );
     }
 
@@ -756,13 +955,20 @@ mod sim_tests {
         let out = tmp_path("telemetry_c.jsonl");
         let outcome = simulate(SEED, 300, &out, &tmp_path("chain_d.jsonl"), false).unwrap();
         for b in outcome.blocks.values() {
-            if b.hash == "GENESIS" { continue; }
-            let parent = outcome.blocks.get(&b.parent)
-                .unwrap_or_else(|| panic!("block {} references missing parent {}", b.hash, b.parent));
+            if b.hash == "GENESIS" {
+                continue;
+            }
+            let parent = outcome.blocks.get(&b.parent).unwrap_or_else(|| {
+                panic!("block {} references missing parent {}", b.hash, b.parent)
+            });
             assert_eq!(
-                b.height, parent.height + 1,
+                b.height,
+                parent.height + 1,
                 "block {} has height {} but parent {} has height {}",
-                b.hash, b.height, b.parent, parent.height
+                b.hash,
+                b.height,
+                b.parent,
+                parent.height
             );
         }
     }
@@ -773,14 +979,21 @@ mod sim_tests {
         let outcome = simulate(SEED, 300, &out, &tmp_path("chain_e.jsonl"), false).unwrap();
         let mut by_height: HashMap<u64, Vec<&Block>> = HashMap::new();
         for b in outcome.blocks.values() {
-            if b.hash == "GENESIS" { continue; }
+            if b.hash == "GENESIS" {
+                continue;
+            }
             by_height.entry(b.height).or_default().push(b);
         }
         for (height, group) in &by_height {
-            if group.len() < 2 { continue; }
+            if group.len() < 2 {
+                continue;
+            }
             let parent = &group[0].parent;
             for b in group {
-                assert_eq!(&b.parent, parent, "two non-sibling blocks share height {height}");
+                assert_eq!(
+                    &b.parent, parent,
+                    "two non-sibling blocks share height {height}"
+                );
             }
         }
     }
@@ -799,26 +1012,49 @@ mod sim_tests {
         // of sync with the real key material almost immediately.
         let out = tmp_path("telemetry_e.jsonl");
         let outcome = simulate(SEED, 300, &out, &tmp_path("chain_f.jsonl"), false).unwrap();
-        assert!(outcome.epoch_registries.len() >= 2, "expected epoch rotation to have occurred in 300 steps");
+        assert!(
+            outcome.epoch_registries.len() >= 2,
+            "expected epoch rotation to have occurred in 300 steps"
+        );
 
         let mut checked = 0usize;
         for b in outcome.blocks.values() {
-            if b.hash == "GENESIS" || b.signatures.is_empty() { continue; }
-            let reg = outcome.epoch_registries.get(&b.epoch)
+            if b.hash == "GENESIS" || b.signatures.is_empty() {
+                continue;
+            }
+            let reg = outcome
+                .epoch_registries
+                .get(&b.epoch)
                 .unwrap_or_else(|| panic!("no registry snapshot for epoch {}", b.epoch));
             for s in &b.signatures {
                 let pk_bytes = hex::decode(&s.pubkey_hex).unwrap();
                 let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
                 let vk = VerifyingKey::from_bytes(&pk_arr).unwrap();
-                assert_eq!(vk.to_bytes(), reg[s.node_id].to_bytes(), "pubkey doesn't match epoch {} registry", b.epoch);
+                assert_eq!(
+                    vk.to_bytes(),
+                    reg[s.node_id].to_bytes(),
+                    "pubkey doesn't match epoch {} registry",
+                    b.epoch
+                );
 
                 let sig_bytes = hex::decode(&s.sig_hex).unwrap();
                 let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
                 let sig = Signature::from_bytes(&sig_arr);
                 let st_hash = hash_vec(&b.state);
                 let rec_hash = hash_list(&b.reconciles);
-                let canon = canon_string(b.height, &b.parent, &st_hash, b.confidence, &rec_hash, b.epoch);
-                assert!(vk.verify(canon.as_bytes(), &sig).is_ok(), "signature failed to verify for block {}", b.hash);
+                let canon = canon_string(
+                    b.height,
+                    &b.parent,
+                    &st_hash,
+                    b.confidence,
+                    &rec_hash,
+                    b.epoch,
+                );
+                assert!(
+                    vk.verify(canon.as_bytes(), &sig).is_ok(),
+                    "signature failed to verify for block {}",
+                    b.hash
+                );
                 checked += 1;
             }
         }
@@ -830,13 +1066,17 @@ mod sim_tests {
         let out = tmp_path("telemetry_f.jsonl");
         let log = tmp_path("chain_resume.jsonl");
         let first = simulate(SEED, 60, &out, &log, false).unwrap();
-        assert_eq!(first.loaded_blocks, 0, "first run should start from genesis");
+        assert_eq!(
+            first.loaded_blocks, 0,
+            "first run should start from genesis"
+        );
 
         let second = simulate(SEED, 60, &out, &log, false).unwrap();
         assert!(
             second.head_height > first.head_height,
             "resumed run should extend the chain, not restart it: first={} second={}",
-            first.head_height, second.head_height
+            first.head_height,
+            second.head_height
         );
     }
 
@@ -845,8 +1085,15 @@ mod sim_tests {
         let log = tmp_path("chain_corrupt.jsonl");
         std::fs::write(&log, "not valid json at all\n").unwrap();
         let genesis = Block {
-            height: 0, parent: String::new(), state: vec![0.0; 4], confidence: 1.0,
-            reconciles: vec![], epoch: 0, signatures: vec![], sig_weight: 999.0, hash: "GENESIS".to_string(),
+            height: 0,
+            parent: String::new(),
+            state: vec![0.0; 4],
+            confidence: 1.0,
+            reconciles: vec![],
+            epoch: 0,
+            signatures: vec![],
+            sig_weight: 999.0,
+            hash: "GENESIS".to_string(),
         };
         let mut blocks = HashMap::new();
         let err = load_chain_log(&log, &genesis, &mut blocks).unwrap_err();

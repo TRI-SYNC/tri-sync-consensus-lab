@@ -4,8 +4,8 @@
 // with neighboring loops in the same function that touch several.
 #![allow(clippy::needless_range_loop)]
 
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 /// Default seed; override with `--seed <u64>` for a different (still
 /// reproducible) run.
@@ -63,12 +63,14 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
     let mut rng = StdRng::seed_from_u64(seed);
 
     let n = 25usize;
-    let mut nodes: Vec<NodeState> = (0..n).map(|_| NodeState{
-        x: 0.0,
-        reliability: 1.0,
-        last_obs: None,
-        clarified: false,
-    }).collect();
+    let mut nodes: Vec<NodeState> = (0..n)
+        .map(|_| NodeState {
+            x: 0.0,
+            reliability: 1.0,
+            last_obs: None,
+            clarified: false,
+        })
+        .collect();
 
     // Environment truth (toy scalar)
     let mut truth: f64 = 0.0;
@@ -100,7 +102,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
     #[allow(unused_assignments)]
     let mut r_star_final: f64 = 0.0;
 
-    if verbose { telemetry::print_header(); }
+    if verbose {
+        telemetry::print_header();
+    }
 
     loop {
         t += 1;
@@ -108,7 +112,11 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         // ENV update
         truth += drift;
         if rng.gen::<f64>() < shock_prob {
-            truth += if rng.gen::<bool>() { shock_mag } else { -shock_mag };
+            truth += if rng.gen::<bool>() {
+                shock_mag
+            } else {
+                -shock_mag
+            };
         }
 
         // OBSERVE
@@ -121,17 +129,37 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
                 ADVERSARIAL_SIGMA
             } else {
                 match i % 6 {
-                    0 => 0.15, 1 => 0.25, 2 => 0.35, 3 => 0.55, 4 => 0.90, _ => 1.30
+                    0 => 0.15,
+                    1 => 0.25,
+                    2 => 0.35,
+                    3 => 0.55,
+                    4 => 0.90,
+                    _ => 1.30,
                 }
             };
-            let bias = if i % 11 == 0 { 0.08 } else if i % 17 == 0 { -0.08 } else { 0.0 };
+            let bias = if i % 11 == 0 {
+                0.08
+            } else if i % 17 == 0 {
+                -0.08
+            } else {
+                0.0
+            };
             // Always draw, whether or not it's used, so the RNG stream
             // doesn't depend on which nodes are adversarial - only what
             // each node reports does.
             let noise: f64 = rng.sample::<f64, _>(StandardNormal) * sigma;
-            let obs_val = if is_adversarial { truth + DEVIATION_BIAS } else { truth + bias + noise };
+            let obs_val = if is_adversarial {
+                truth + DEVIATION_BIAS
+            } else {
+                truth + bias + noise
+            };
 
-            let obs = Observation { node_id: i, value: obs_val, sigma, t };
+            let obs = Observation {
+                node_id: i,
+                value: obs_val,
+                sigma,
+                t,
+            };
             node::set_observation(nd, obs.clone());
 
             observations.push(obs);
@@ -145,7 +173,11 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         r_star_final = r_star;
 
         // SELF -> lock (no drift) with clarity gate
-        let tau = if fast_sync_remaining > 0 { tau_fast } else { tau_normal };
+        let tau = if fast_sync_remaining > 0 {
+            tau_fast
+        } else {
+            tau_normal
+        };
         let mut clarified = 0usize;
         for nd in nodes.iter_mut() {
             let sigma = nd.last_obs.as_ref().unwrap().sigma;
@@ -174,8 +206,14 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         fast_sync_remaining = fast_sync_remaining.saturating_sub(1);
 
         // Completion
-        let all_ok = nodes.iter().all(|nd| !nd.clarified && (nd.x - r_star).abs() <= eps_align);
-        if all_ok { complete_streak += 1; } else { complete_streak = 0; }
+        let all_ok = nodes
+            .iter()
+            .all(|nd| !nd.clarified && (nd.x - r_star).abs() <= eps_align);
+        if all_ok {
+            complete_streak += 1;
+        } else {
+            complete_streak = 0;
+        }
         let done = complete_streak >= complete_cycles;
 
         let mean_rel = nodes.iter().map(|n| n.reliability).sum::<f64>() / (n as f64);
@@ -197,7 +235,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         }
 
         if done {
-            if verbose { println!("\n✅ COMPLETE: sustained alignment achieved."); }
+            if verbose {
+                println!("\n✅ COMPLETE: sustained alignment achieved.");
+            }
             break;
         }
         if t >= 250 {
@@ -216,30 +256,49 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         }
     }
 
-    Outcome { truth, r_star_final, nodes }
+    Outcome {
+        truth,
+        r_star_final,
+        nodes,
+    }
 }
 
 fn print_adversarial_summary(outcome: &Outcome) {
-    let Outcome { truth, r_star_final, nodes } = outcome;
+    let Outcome {
+        truth,
+        r_star_final,
+        nodes,
+    } = outcome;
     println!("\n--- adversarial summary ---");
-    println!("truth={truth:.4}  r_star={r_star_final:.4}  |truth - r_star|={:.4}",
-        (truth - r_star_final).abs());
+    println!(
+        "truth={truth:.4}  r_star={r_star_final:.4}  |truth - r_star|={:.4}",
+        (truth - r_star_final).abs()
+    );
 
-    let baseline_rel: Vec<f64> = nodes.iter().enumerate()
+    let baseline_rel: Vec<f64> = nodes
+        .iter()
+        .enumerate()
         .filter(|(i, _)| !ADVERSARIAL_NODES.contains(i))
         .map(|(_, nd)| nd.reliability)
         .collect();
-    let adversarial_rel: Vec<f64> = ADVERSARIAL_NODES.iter().map(|&i| nodes[i].reliability).collect();
+    let adversarial_rel: Vec<f64> = ADVERSARIAL_NODES
+        .iter()
+        .map(|&i| nodes[i].reliability)
+        .collect();
     let mean = |v: &[f64]| v.iter().sum::<f64>() / (v.len().max(1) as f64);
 
     println!(
         "mean reliability: baseline={:.4} (n={})  adversarial={:.4} (n={})",
-        mean(&baseline_rel), baseline_rel.len(), mean(&adversarial_rel), adversarial_rel.len()
+        mean(&baseline_rel),
+        baseline_rel.len(),
+        mean(&adversarial_rel),
+        adversarial_rel.len()
     );
     for &i in &ADVERSARIAL_NODES {
         println!(
             "  adversarial node {i}: reliability={:.4}  |x - r_star|={:.4}",
-            nodes[i].reliability, (nodes[i].x - r_star_final).abs()
+            nodes[i].reliability,
+            (nodes[i].x - r_star_final).abs()
         );
     }
 }
@@ -282,13 +341,19 @@ mod sim_tests {
     #[test]
     fn adversarial_nodes_end_up_measurably_less_reliable_than_baseline_nodes() {
         let outcome = simulate(SEED, false);
-        let baseline_mean: f64 = outcome.nodes.iter().enumerate()
+        let baseline_mean: f64 = outcome
+            .nodes
+            .iter()
+            .enumerate()
             .filter(|(i, _)| !ADVERSARIAL_NODES.contains(i))
             .map(|(_, nd)| nd.reliability)
-            .sum::<f64>() / (outcome.nodes.len() - ADVERSARIAL_NODES.len()) as f64;
-        let adversarial_mean: f64 = ADVERSARIAL_NODES.iter()
+            .sum::<f64>()
+            / (outcome.nodes.len() - ADVERSARIAL_NODES.len()) as f64;
+        let adversarial_mean: f64 = ADVERSARIAL_NODES
+            .iter()
             .map(|&i| outcome.nodes[i].reliability)
-            .sum::<f64>() / ADVERSARIAL_NODES.len() as f64;
+            .sum::<f64>()
+            / ADVERSARIAL_NODES.len() as f64;
         assert!(
             adversarial_mean < baseline_mean - 0.2,
             "adversarial_mean={adversarial_mean} baseline_mean={baseline_mean}"

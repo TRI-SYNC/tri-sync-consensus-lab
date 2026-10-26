@@ -10,7 +10,14 @@ pub fn print_header() {
 pub fn print_row(r: &TelemetryRow) {
     println!(
         "{:3}  {:8.3}  {:8.3}  {:6.3}   {:3}   {:3}   {:7.3}   {:4}   {}",
-        r.t, r.truth, r.r_star, r.disagreement, r.fast_sync_remaining, r.clarified,
-        r.mean_reliability, r.complete_streak, r.done
+        r.t,
+        r.truth,
+        r.r_star,
+        r.disagreement,
+        r.fast_sync_remaining,
+        r.clarified,
+        r.mean_reliability,
+        r.complete_streak,
+        r.done
     );
 }

@@ -108,14 +108,19 @@ pub fn canonical_string(org: &str, max_nodes: u32, features: &[String], expiry: 
 /// verified [`License`] on success, or a [`LicenseError`] describing
 /// exactly what failed - never panics on malformed input.
 pub fn parse_and_verify(toml_str: &str, pubkey_hex: &str) -> Result<License, LicenseError> {
-    let raw: LicenseFile = toml::from_str(toml_str).map_err(|e| LicenseError::Toml(e.to_string()))?;
+    let raw: LicenseFile =
+        toml::from_str(toml_str).map_err(|e| LicenseError::Toml(e.to_string()))?;
 
     let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| LicenseError::BadPublicKey)?;
-    let pubkey_arr: [u8; 32] = pubkey_bytes.try_into().map_err(|_| LicenseError::BadPublicKey)?;
+    let pubkey_arr: [u8; 32] = pubkey_bytes
+        .try_into()
+        .map_err(|_| LicenseError::BadPublicKey)?;
     let vk = VerifyingKey::from_bytes(&pubkey_arr).map_err(|_| LicenseError::BadPublicKey)?;
 
     let sig_bytes = hex::decode(&raw.signature).map_err(|_| LicenseError::BadSignatureEncoding)?;
-    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| LicenseError::BadSignatureEncoding)?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| LicenseError::BadSignatureEncoding)?;
     let sig = Signature::from_bytes(&sig_arr);
 
     let canon = canonical_string(&raw.org, raw.max_nodes, &raw.features, &raw.expiry);
@@ -220,8 +225,8 @@ fn today_civil_days() -> i64 {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     // --- calendar math self-checks ---
 
@@ -248,7 +253,11 @@ mod tests {
             for m in 1..=12u32 {
                 for d in [1u32, 15, 28] {
                     let days = days_from_civil(y, m, d);
-                    assert_eq!(civil_from_days(days), (y, m, d), "failed for {y:04}-{m:02}-{d:02}");
+                    assert_eq!(
+                        civil_from_days(days),
+                        (y, m, d),
+                        "failed for {y:04}-{m:02}-{d:02}"
+                    );
                 }
             }
         }
@@ -269,11 +278,21 @@ mod tests {
         SigningKey::generate(&mut rng)
     }
 
-    fn make_license_toml(sk: &SigningKey, org: &str, max_nodes: u32, features: &[&str], expiry: &str) -> String {
+    fn make_license_toml(
+        sk: &SigningKey,
+        org: &str,
+        max_nodes: u32,
+        features: &[&str],
+        expiry: &str,
+    ) -> String {
         let features: Vec<String> = features.iter().map(|s| s.to_string()).collect();
         let canon = canonical_string(org, max_nodes, &features, expiry);
         let sig = sk.sign(canon.as_bytes());
-        let features_toml = features.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
+        let features_toml = features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "org = \"{org}\"\nmax_nodes = {max_nodes}\nfeatures = [{features_toml}]\nexpiry = \"{expiry}\"\nsignature = \"{}\"\n",
             hex::encode(sig.to_bytes())
@@ -284,7 +303,13 @@ mod tests {
     fn a_validly_signed_unexpired_license_is_accepted() {
         let sk = test_keypair();
         let vk_hex = hex::encode(sk.verifying_key().to_bytes());
-        let toml = make_license_toml(&sk, "Acme Corp", 5, &["chain_weighted", "http_api"], "2999-01-01");
+        let toml = make_license_toml(
+            &sk,
+            "Acme Corp",
+            5,
+            &["chain_weighted", "http_api"],
+            "2999-01-01",
+        );
         let license = parse_and_verify(&toml, &vk_hex).expect("should verify");
         assert_eq!(license.org, "Acme Corp");
         assert_eq!(license.max_nodes, 5);
@@ -315,7 +340,10 @@ mod tests {
         let vk_hex = hex::encode(sk.verifying_key().to_bytes());
         let toml = make_license_toml(&sk, "Acme Corp", 5, &["http_api"], "2999-01-01");
         let tampered = toml.replace("max_nodes = 5", "max_nodes = 500");
-        assert_eq!(parse_and_verify(&tampered, &vk_hex), Err(LicenseError::SignatureInvalid));
+        assert_eq!(
+            parse_and_verify(&tampered, &vk_hex),
+            Err(LicenseError::SignatureInvalid)
+        );
     }
 
     #[test]
@@ -324,7 +352,10 @@ mod tests {
         let other_sk = SigningKey::generate(&mut StdRng::seed_from_u64(99));
         let vk_hex = hex::encode(other_sk.verifying_key().to_bytes());
         let toml = make_license_toml(&sk, "Acme Corp", 5, &["http_api"], "2999-01-01");
-        assert_eq!(parse_and_verify(&toml, &vk_hex), Err(LicenseError::SignatureInvalid));
+        assert_eq!(
+            parse_and_verify(&toml, &vk_hex),
+            Err(LicenseError::SignatureInvalid)
+        );
     }
 
     #[test]
@@ -343,19 +374,28 @@ mod tests {
         let sk = test_keypair();
         let vk_hex = hex::encode(sk.verifying_key().to_bytes());
         let toml = make_license_toml(&sk, "Acme Corp", 5, &["http_api"], "not-a-date");
-        assert!(matches!(parse_and_verify(&toml, &vk_hex), Err(LicenseError::BadExpiryFormat(_))));
+        assert!(matches!(
+            parse_and_verify(&toml, &vk_hex),
+            Err(LicenseError::BadExpiryFormat(_))
+        ));
     }
 
     #[test]
     fn malformed_toml_is_rejected_without_panicking() {
         let vk_hex = LICENSE_PUBLIC_KEY_HEX;
-        assert!(matches!(parse_and_verify("not valid toml {{{", vk_hex), Err(LicenseError::Toml(_))));
+        assert!(matches!(
+            parse_and_verify("not valid toml {{{", vk_hex),
+            Err(LicenseError::Toml(_))
+        ));
     }
 
     #[test]
     fn a_signature_that_is_not_valid_hex_is_rejected_without_panicking() {
         let toml = "org = \"Acme\"\nmax_nodes = 1\nfeatures = []\nexpiry = \"2999-01-01\"\nsignature = \"not hex\"\n";
-        assert_eq!(parse_and_verify(toml, LICENSE_PUBLIC_KEY_HEX), Err(LicenseError::BadSignatureEncoding));
+        assert_eq!(
+            parse_and_verify(toml, LICENSE_PUBLIC_KEY_HEX),
+            Err(LicenseError::BadSignatureEncoding)
+        );
     }
 
     /// The end-to-end real path: a license file signed with the actual
@@ -367,7 +407,8 @@ mod tests {
     #[test]
     fn the_real_example_license_verifies_against_the_embedded_dev_key() {
         let toml = include_str!("../license.example.toml");
-        let license = parse_and_verify(toml, LICENSE_PUBLIC_KEY_HEX).expect("example license should verify");
+        let license =
+            parse_and_verify(toml, LICENSE_PUBLIC_KEY_HEX).expect("example license should verify");
         assert_eq!(license.org, "TriSync Example Org");
         assert_eq!(license.max_nodes, 5);
         // Deliberately empty - see the fixture's own header comment for

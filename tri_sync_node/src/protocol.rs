@@ -121,7 +121,15 @@ pub fn block_canon(block: &Block) -> String {
     let state_hash = chain::hash_vec(&block.state);
     let reconciles_hash = chain::hash_list(&block.reconciles);
     let membership_hash = chain::hash_membership_change(&block.membership_change);
-    chain::canon_string(block.height, &block.parent, &state_hash, block.confidence, &reconciles_hash, block.epoch, &membership_hash)
+    chain::canon_string(
+        block.height,
+        &block.parent,
+        &state_hash,
+        block.confidence,
+        &reconciles_hash,
+        block.epoch,
+        &membership_hash,
+    )
 }
 
 /// The exact string a [`BlockProposalMsg`]/[`BlockVoteMsg`] signs: the
@@ -215,7 +223,10 @@ pub struct MembershipProposalMsg {
 
 /// The exact string a [`MembershipProposalMsg`] signs.
 pub fn membership_proposal_canon(sender: usize, change: &chain::MembershipChange) -> String {
-    format!("memberprop|{sender}|{}", chain::hash_membership_change(&Some(change.clone())))
+    format!(
+        "memberprop|{sender}|{}",
+        chain::hash_membership_change(&Some(change.clone()))
+    )
 }
 
 /// A gossiped update to how much `sender` trusts `about_peer`.
@@ -256,9 +267,22 @@ mod tests {
     #[test]
     fn every_message_variant_round_trips_through_json() {
         let messages = vec![
-            Message::Observation(ObservationMsg { sender: 1, values: vec![1.0, 2.0], sig_hex: "aa".to_string() }),
-            Message::State(StateMsg { sender: 1, state: vec![1.0], confidence: 0.9, sig_hex: "bb".to_string() }),
-            Message::BlockProposal(BlockProposalMsg { sender: 1, view: 0, block: Block::genesis(2) }),
+            Message::Observation(ObservationMsg {
+                sender: 1,
+                values: vec![1.0, 2.0],
+                sig_hex: "aa".to_string(),
+            }),
+            Message::State(StateMsg {
+                sender: 1,
+                state: vec![1.0],
+                confidence: 0.9,
+                sig_hex: "bb".to_string(),
+            }),
+            Message::BlockProposal(BlockProposalMsg {
+                sender: 1,
+                view: 0,
+                block: Block::genesis(2),
+            }),
             Message::BlockVote(BlockVoteMsg {
                 sender: 1,
                 view: 0,
@@ -273,13 +297,35 @@ mod tests {
                 pubkey_hex: "def".to_string(),
                 sig_hex: "jkl".to_string(),
             }),
-            Message::TrustUpdate(TrustUpdateMsg { sender: 1, about_peer: 2, edge_weight: 1.5, sig_hex: "cc".to_string() }),
-            Message::KeyRotation(KeyRotationMsg { sender: 1, new_pubkey_hex: "dd".to_string(), rotation_seq: 1, sig_hex: "ee".to_string() }),
-            Message::BlockRequest(BlockRequestMsg { sender: 1, from_height: 5, sig_hex: "ff".to_string() }),
-            Message::BlockResponse(BlockResponseMsg { sender: 1, blocks: vec![Block::genesis(2)], sig_hex: "gg".to_string() }),
+            Message::TrustUpdate(TrustUpdateMsg {
+                sender: 1,
+                about_peer: 2,
+                edge_weight: 1.5,
+                sig_hex: "cc".to_string(),
+            }),
+            Message::KeyRotation(KeyRotationMsg {
+                sender: 1,
+                new_pubkey_hex: "dd".to_string(),
+                rotation_seq: 1,
+                sig_hex: "ee".to_string(),
+            }),
+            Message::BlockRequest(BlockRequestMsg {
+                sender: 1,
+                from_height: 5,
+                sig_hex: "ff".to_string(),
+            }),
+            Message::BlockResponse(BlockResponseMsg {
+                sender: 1,
+                blocks: vec![Block::genesis(2)],
+                sig_hex: "gg".to_string(),
+            }),
             Message::MembershipProposal(MembershipProposalMsg {
                 sender: 1,
-                change: chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:2".to_string(), pubkey_hex: "ab".repeat(32) },
+                change: chain::MembershipChange::Add {
+                    node_id: 2,
+                    addr: "127.0.0.1:2".to_string(),
+                    pubkey_hex: "ab".repeat(32),
+                },
                 sig_hex: "hh".to_string(),
             }),
         ];
@@ -298,9 +344,18 @@ mod tests {
 
     #[test]
     fn observation_canon_is_sensitive_to_sender_and_values() {
-        assert_eq!(observation_canon(1, &[1.0, 2.0]), observation_canon(1, &[1.0, 2.0]));
-        assert_ne!(observation_canon(1, &[1.0, 2.0]), observation_canon(2, &[1.0, 2.0]));
-        assert_ne!(observation_canon(1, &[1.0, 2.0]), observation_canon(1, &[1.0, 2.1]));
+        assert_eq!(
+            observation_canon(1, &[1.0, 2.0]),
+            observation_canon(1, &[1.0, 2.0])
+        );
+        assert_ne!(
+            observation_canon(1, &[1.0, 2.0]),
+            observation_canon(2, &[1.0, 2.0])
+        );
+        assert_ne!(
+            observation_canon(1, &[1.0, 2.0]),
+            observation_canon(1, &[1.0, 2.1])
+        );
     }
 
     #[test]
@@ -369,7 +424,10 @@ mod tests {
         for (i, x) in all.iter().enumerate() {
             for (j, y) in all.iter().enumerate() {
                 if i != j {
-                    assert_ne!(x, y, "canon strings at indices {i} and {j} must never collide");
+                    assert_ne!(
+                        x, y,
+                        "canon strings at indices {i} and {j} must never collide"
+                    );
                 }
             }
         }
@@ -388,17 +446,41 @@ mod tests {
         b.height = 3;
         let identity_canon = block_canon(&b);
         b.hash = chain::block_hash(&identity_canon);
-        assert_eq!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(1, &[Block::genesis(2)]));
-        assert_ne!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(2, &[Block::genesis(2)]));
-        assert_ne!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(1, &[b]));
-        assert_ne!(block_response_canon(1, &[Block::genesis(2)]), block_response_canon(1, &[]));
+        assert_eq!(
+            block_response_canon(1, &[Block::genesis(2)]),
+            block_response_canon(1, &[Block::genesis(2)])
+        );
+        assert_ne!(
+            block_response_canon(1, &[Block::genesis(2)]),
+            block_response_canon(2, &[Block::genesis(2)])
+        );
+        assert_ne!(
+            block_response_canon(1, &[Block::genesis(2)]),
+            block_response_canon(1, &[b])
+        );
+        assert_ne!(
+            block_response_canon(1, &[Block::genesis(2)]),
+            block_response_canon(1, &[])
+        );
     }
 
     #[test]
     fn key_rotation_canon_is_sensitive_to_every_field() {
-        assert_eq!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(1, "abcd", 5));
-        assert_ne!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(2, "abcd", 5));
-        assert_ne!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(1, "abce", 5));
-        assert_ne!(key_rotation_canon(1, "abcd", 5), key_rotation_canon(1, "abcd", 6));
+        assert_eq!(
+            key_rotation_canon(1, "abcd", 5),
+            key_rotation_canon(1, "abcd", 5)
+        );
+        assert_ne!(
+            key_rotation_canon(1, "abcd", 5),
+            key_rotation_canon(2, "abcd", 5)
+        );
+        assert_ne!(
+            key_rotation_canon(1, "abcd", 5),
+            key_rotation_canon(1, "abce", 5)
+        );
+        assert_ne!(
+            key_rotation_canon(1, "abcd", 5),
+            key_rotation_canon(1, "abcd", 6)
+        );
     }
 }

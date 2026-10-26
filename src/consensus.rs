@@ -28,7 +28,11 @@ pub fn robust_fuse(
 
     let n = pairs.len();
     let k = ((n as f64) * trim_frac).floor() as usize;
-    let core = if n > 2 * k { &pairs[k..(n - k)] } else { &pairs[..] };
+    let core = if n > 2 * k {
+        &pairs[k..(n - k)]
+    } else {
+        &pairs[..]
+    };
 
     let wsum: f64 = core.iter().map(|(_, w)| *w).sum();
     let r = if wsum > 0.0 {
@@ -38,11 +42,20 @@ pub fn robust_fuse(
     };
 
     let mean = r;
-    let var = core.iter().map(|(v, _)| (v - mean) * (v - mean)).sum::<f64>() / (core.len().max(1) as f64);
+    let var = core
+        .iter()
+        .map(|(v, _)| (v - mean) * (v - mean))
+        .sum::<f64>()
+        / (core.len().max(1) as f64);
     let conf = clamp(1.0 / (1.0 + var), 0.0, 1.0);
 
     let t = obs.first().map(|o| o.t).unwrap_or(0);
-    RStar { value: r, confidence: conf, version, t }
+    RStar {
+        value: r,
+        confidence: conf,
+        version,
+        t,
+    }
 }
 
 #[cfg(test)]

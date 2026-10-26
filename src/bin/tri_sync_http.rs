@@ -32,8 +32,18 @@ fn parse_args() -> (PathBuf, u16) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--file" => { i += 1; if let Some(p) = args.get(i) { file = PathBuf::from(p); } }
-            "--port" => { i += 1; if let Some(p) = args.get(i) { port = p.parse().unwrap_or(port); } }
+            "--file" => {
+                i += 1;
+                if let Some(p) = args.get(i) {
+                    file = PathBuf::from(p);
+                }
+            }
+            "--port" => {
+                i += 1;
+                if let Some(p) = args.get(i) {
+                    port = p.parse().unwrap_or(port);
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -60,7 +70,9 @@ fn write_chunk<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
 fn is_disconnect(e: &io::Error) -> bool {
     matches!(
         e.kind(),
-        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
     )
 }
 
@@ -78,7 +90,10 @@ fn stream_events(mut w: Box<dyn Write + Send>, cache: Arc<Mutex<Vec<String>>>) {
         "Transfer-Encoding: chunked\r\n",
         "\r\n",
     );
-    if w.write_all(head.as_bytes()).and_then(|_| w.flush()).is_err() {
+    if w.write_all(head.as_bytes())
+        .and_then(|_| w.flush())
+        .is_err()
+    {
         return;
     }
 
@@ -105,7 +120,9 @@ fn stream_events(mut w: Box<dyn Write + Send>, cache: Arc<Mutex<Vec<String>>>) {
             if last_activity.elapsed() >= Duration::from_secs(15) {
                 last_activity = Instant::now();
                 if let Err(e) = write_chunk(&mut w, b": keep-alive\n\n") {
-                    if !is_disconnect(&e) { eprintln!("/events write error: {e}"); }
+                    if !is_disconnect(&e) {
+                        eprintln!("/events write error: {e}");
+                    }
                     return;
                 }
             }
@@ -119,7 +136,9 @@ fn stream_events(mut w: Box<dyn Write + Send>, cache: Arc<Mutex<Vec<String>>>) {
             body.push_str(line);
             body.push_str("\n\n");
             if let Err(e) = write_chunk(&mut w, body.as_bytes()) {
-                if !is_disconnect(&e) { eprintln!("/events write error: {e}"); }
+                if !is_disconnect(&e) {
+                    eprintln!("/events write error: {e}");
+                }
                 return;
             }
         }
@@ -136,15 +155,13 @@ fn run_server(file_path: PathBuf, port: u16, max_events_connections: usize) {
     let events_connections: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
     // refresh file cache
-    thread::spawn(move || {
-        loop {
-            if let Ok(text) = fs::read_to_string(&file_bg) {
-                let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-                let mut guard = cache_bg.lock().unwrap();
-                *guard = lines;
-            }
-            thread::sleep(Duration::from_millis(300));
+    thread::spawn(move || loop {
+        if let Ok(text) = fs::read_to_string(&file_bg) {
+            let lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+            let mut guard = cache_bg.lock().unwrap();
+            *guard = lines;
         }
+        thread::sleep(Duration::from_millis(300));
     });
 
     let server = Server::http(&addr).expect("failed to bind");
@@ -219,7 +236,11 @@ mod streaming_tests {
     /// immediately - good enough for a test server started moments later,
     /// and avoids hardcoding a port that might already be in use.
     fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     #[test]
@@ -236,8 +257,12 @@ mod streaming_tests {
         thread::sleep(Duration::from_millis(500));
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        stream.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+            .unwrap();
 
         // Append a uniquely marked line only *after* the connection is
         // already open. A batch-at-connect-time implementation sends its
@@ -249,7 +274,10 @@ mod streaming_tests {
         thread::sleep(Duration::from_millis(200));
         let marker = "STREAM_TEST_MARKER_12345";
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&file_path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .unwrap();
             writeln!(f, "{{\"marker\":\"{marker}\"}}").unwrap();
         }
 
@@ -267,7 +295,12 @@ mod streaming_tests {
                         break;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    continue
+                }
                 Err(e) => panic!("read error: {e}"),
             }
         }
@@ -275,7 +308,8 @@ mod streaming_tests {
             found,
             "expected the line appended after connecting to arrive on the still-open /events \
              connection within 5s; got {} bytes: {}",
-            buf.len(), String::from_utf8_lossy(&buf)
+            buf.len(),
+            String::from_utf8_lossy(&buf)
         );
     }
 
@@ -295,17 +329,29 @@ mod streaming_tests {
         // if the server handled requests inline on one loop instead of a
         // thread per request, this would starve every request behind it.
         let mut events_stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        events_stream.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        events_stream
+            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
 
         let mut health_stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        health_stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        health_stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        health_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        health_stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
 
         let mut resp = Vec::new();
         health_stream.read_to_end(&mut resp).unwrap();
         let text = String::from_utf8_lossy(&resp);
-        assert!(text.starts_with("HTTP/1.1 200"), "expected /health to answer promptly; got: {text}");
-        assert!(text.ends_with("ok") || text.contains("\r\n\r\nok"), "expected body \"ok\"; got: {text}");
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "expected /health to answer promptly; got: {text}"
+        );
+        assert!(
+            text.ends_with("ok") || text.contains("\r\n\r\nok"),
+            "expected body \"ok\"; got: {text}"
+        );
     }
 
     #[test]
@@ -327,7 +373,8 @@ mod streaming_tests {
         let mut open_streams = Vec::new();
         for _ in 0..cap {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            s.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
             open_streams.push(s);
             // give the server's spawned thread time to register the
             // connection (fetch_add) before the next one connects, so the
@@ -337,20 +384,32 @@ mod streaming_tests {
 
         // The (cap + 1)th connection should be turned away with 503.
         let mut over_cap = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        over_cap.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        over_cap.write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        over_cap
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        over_cap
+            .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
         let mut resp = Vec::new();
         over_cap.read_to_end(&mut resp).unwrap();
         let text = String::from_utf8_lossy(&resp);
-        assert!(text.starts_with("HTTP/1.1 503"), "expected the over-cap connection to get 503; got: {text}");
+        assert!(
+            text.starts_with("HTTP/1.1 503"),
+            "expected the over-cap connection to get 503; got: {text}"
+        );
 
         // One of the connections that was already open and under the cap
         // should still be a live, working stream, not something the
         // rejection above disturbed.
         let mut still_open = open_streams.remove(0);
-        still_open.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        still_open
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut head = [0u8; 15];
         still_open.read_exact(&mut head).unwrap();
-        assert_eq!(&head, b"HTTP/1.1 200 OK", "expected the already-open stream to still be serving normally");
+        assert_eq!(
+            &head, b"HTTP/1.1 200 OK",
+            "expected the already-open stream to still be serving normally"
+        );
     }
 }
