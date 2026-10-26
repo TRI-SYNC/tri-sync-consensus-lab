@@ -214,15 +214,18 @@ use crate::license;
 use crate::metrics::Metrics;
 use crate::net;
 use crate::persistence::{LockRecord, MemberRecord, PeerKeyRecord, Store, TrustEntry};
-use crate::protocol::{self, BlockProposalMsg, BlockRequestMsg, BlockResponseMsg, BlockVoteMsg, KeyRotationMsg, MembershipProposalMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg};
+use crate::protocol::{
+    self, BlockProposalMsg, BlockRequestMsg, BlockResponseMsg, BlockVoteMsg, KeyRotationMsg,
+    MembershipProposalMsg, Message, ObservationMsg, PrecommitMsg, TrustUpdateMsg,
+};
 use crate::state::NodeState;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::SeedableRng;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tri_sync_core::chain::{self, Block, SigEntry};
 use tri_sync_core::crypto;
@@ -373,11 +376,21 @@ struct RoundState {
 /// deterministic given the target height alone, so every process
 /// computes the same ground truth with no coordination.
 fn synthetic_truth(dim: usize, height: u64) -> Vec<f64> {
-    (0..dim).map(|d| ((height as f64) * 0.3 + d as f64).sin() * 5.0).collect()
+    (0..dim)
+        .map(|d| ((height as f64) * 0.3 + d as f64).sin() * 5.0)
+        .collect()
 }
 
-fn noisy_observation(dim: usize, height: u64, node_id: usize, rng: &mut impl rand::Rng) -> Vec<f64> {
-    synthetic_truth(dim, height).into_iter().map(|v| v + rng.gen_range(-0.5..0.5) + (node_id as f64 * 0.01)).collect()
+fn noisy_observation(
+    dim: usize,
+    height: u64,
+    node_id: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<f64> {
+    synthetic_truth(dim, height)
+        .into_iter()
+        .map(|v| v + rng.gen_range(-0.5..0.5) + (node_id as f64 * 0.01))
+        .collect()
 }
 
 /// The proposer for `height` at `view`: round-robins by `height + view`,
@@ -465,8 +478,12 @@ fn maybe_bump_view(rs: &mut RoundState, height: u64, timeout: Duration) -> bool 
 /// unknown sender, malformed signature, or bad match. The shared check
 /// behind authenticating observation, state, and trust-update gossip.
 fn verify_from_peer(ctx: &Ctx, sender: usize, canon: &str, sig_hex: &str) -> bool {
-    let Some(peer) = ctx.peers.read().unwrap().get(&sender).copied() else { return false };
-    let Some(sig) = decode_signature(sig_hex) else { return false };
+    let Some(peer) = ctx.peers.read().unwrap().get(&sender).copied() else {
+        return false;
+    };
+    let Some(sig) = decode_signature(sig_hex) else {
+        return false;
+    };
     let ok = crypto::verify_canon(&peer.pubkey, canon, &sig);
     if ok {
         // Health only ever records a genuinely authenticated message -
@@ -491,7 +508,13 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
     // guard across the loop (let alone into a spawned task): a
     // key-rotation write must never be blocked behind, or forced to
     // wait on, however long a round of sends takes.
-    let snapshot: Vec<(usize, PeerInfo)> = ctx.peers.read().unwrap().iter().map(|(&id, &info)| (id, info)).collect();
+    let snapshot: Vec<(usize, PeerInfo)> = ctx
+        .peers
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(&id, &info)| (id, info))
+        .collect();
     for (id, peer) in snapshot {
         let endpoint = ctx.endpoint.clone();
         let addr = peer.addr;
@@ -524,7 +547,9 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
                     );
                 }
                 Some(health::HealthTransition::Recovered) => {
-                    log(format!("peer {id} ({addr}) recovered - a send succeeded after prior failures"));
+                    log(format!(
+                        "peer {id} ({addr}) recovered - a send succeeded after prior failures"
+                    ));
                 }
                 Some(health::HealthTransition::NoChange) | None => {}
             }
@@ -541,7 +566,9 @@ fn broadcast(ctx: &Ctx, msg: &Message) {
 /// health - a sync request/response isn't part of the steady-state
 /// traffic `crate::health` models).
 fn send_direct(ctx: &Ctx, target: usize, msg: &Message) {
-    let Some(peer) = ctx.peers.read().unwrap().get(&target).copied() else { return };
+    let Some(peer) = ctx.peers.read().unwrap().get(&target).copied() else {
+        return;
+    };
     let endpoint = ctx.endpoint.clone();
     let addr = peer.addr;
     let pubkey = peer.pubkey;
@@ -563,10 +590,18 @@ fn send_direct(ctx: &Ctx, target: usize, msg: &Message) {
 /// eye - "did this rejection happen before or after that restart?" -
 /// was slow and error-prone enough to nearly hide the actual bug.
 fn log_timestamp() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let (y, m, d) = license::civil_from_days((secs / 86_400) as i64);
     let sod = secs % 86_400;
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", sod / 3600, (sod % 3600) / 60, sod % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
 }
 
 fn log(line: impl std::fmt::Display) {
@@ -613,29 +648,56 @@ pub async fn run(
     let bootstrap_peers: Vec<(usize, String, String)> = match store.is_membership_initialized() {
         Ok(true) => match store.all_members() {
             Ok(members) => {
-                log(format!("loaded dynamic membership from the store: {} peer(s)", members.len()));
-                members.into_iter().map(|(id, m)| (id, m.addr, m.pubkey_hex)).collect()
+                log(format!(
+                    "loaded dynamic membership from the store: {} peer(s)",
+                    members.len()
+                ));
+                members
+                    .into_iter()
+                    .map(|(id, m)| (id, m.addr, m.pubkey_hex))
+                    .collect()
             }
             Err(e) => {
                 warn(format!("failed to read persisted membership: {e} - falling back to node.toml for this run"));
-                config.peers.iter().map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone())).collect()
+                config
+                    .peers
+                    .iter()
+                    .map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone()))
+                    .collect()
             }
         },
         Ok(false) => {
-            log("seeding dynamic membership from node.toml (first run with this data_dir)".to_string());
+            log(
+                "seeding dynamic membership from node.toml (first run with this data_dir)"
+                    .to_string(),
+            );
             for p in &config.peers {
-                if let Err(e) = store.put_member(p.id, &MemberRecord { addr: p.addr.clone(), pubkey_hex: p.pubkey_hex.clone() }) {
+                if let Err(e) = store.put_member(
+                    p.id,
+                    &MemberRecord {
+                        addr: p.addr.clone(),
+                        pubkey_hex: p.pubkey_hex.clone(),
+                    },
+                ) {
                     warn(format!("failed to seed membership for peer {}: {e}", p.id));
                 }
             }
             if let Err(e) = store.mark_membership_initialized() {
                 warn(format!("failed to mark membership initialized: {e}"));
             }
-            config.peers.iter().map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone())).collect()
+            config
+                .peers
+                .iter()
+                .map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone()))
+                .collect()
         }
         Err(e) => {
             warn(format!("failed to check membership initialization: {e} - falling back to node.toml for this run"));
-            config.peers.iter().map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone())).collect()
+            config
+                .peers
+                .iter()
+                .map(|p| (p.id, p.addr.clone(), p.pubkey_hex.clone()))
+                .collect()
         }
     };
 
@@ -664,14 +726,26 @@ pub async fn run(
             (*id, PeerInfo { addr, pubkey, rotation_seq: 0 })
         })
         .collect();
-    let mut all_ids: Vec<usize> = peers.keys().cloned().chain(std::iter::once(node.node_id)).collect();
+    let mut all_ids: Vec<usize> = peers
+        .keys()
+        .cloned()
+        .chain(std::iter::once(node.node_id))
+        .collect();
     all_ids.sort_unstable();
 
-    metrics.head_height.store(node.head().height, Ordering::Relaxed);
+    metrics
+        .head_height
+        .store(node.head().height, Ordering::Relaxed);
     reconcile_epoch_with_chain(&mut node, &store);
     metrics.epoch.store(node.epoch, Ordering::Relaxed);
 
-    let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(all_ids), endpoint, metrics };
+    let ctx = Ctx {
+        config,
+        peers: std::sync::RwLock::new(peers),
+        all_ids: std::sync::RwLock::new(all_ids),
+        endpoint,
+        metrics,
+    };
     let mut rs = RoundState::default();
     // Restore this node's quorum-certificate lock across a restart -
     // forgetting it would let this node re-prevote for a conflicting
@@ -687,10 +761,13 @@ pub async fn run(
                 "restored lock on height={} view={} hash={} from a previous run",
                 record.height, record.view, record.block_hash
             ));
-            rs.locked.insert(record.height, (record.view, record.block_hash));
+            rs.locked
+                .insert(record.height, (record.view, record.block_hash));
         }
         Ok(_) => {}
-        Err(e) => warn(format!("failed to read persisted lock: {e} - starting unlocked")),
+        Err(e) => warn(format!(
+            "failed to read persisted lock: {e} - starting unlocked"
+        )),
     }
     let mut rng = rand::rngs::StdRng::from_entropy();
 
@@ -718,7 +795,9 @@ pub async fn run(
     // a foreground terminal. Unix-only (SIGTERM has no Windows
     // equivalent); this project's CI matrix is Linux/macOS, both Unix.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("installing a SIGTERM handler should never fail outside extreme resource exhaustion");
+        .expect(
+            "installing a SIGTERM handler should never fail outside extreme resource exhaustion",
+        );
 
     loop {
         tokio::select! {
@@ -747,7 +826,13 @@ pub async fn run(
     }
 }
 
-async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, rng: &mut impl rand::Rng) {
+async fn on_tick(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    rng: &mut impl rand::Rng,
+) {
     let head = node.head().clone();
     let next_height = head.height + 1;
 
@@ -755,7 +840,9 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
     let view_timeout = Duration::from_secs(ctx.config.round_interval_secs.saturating_mul(3).max(1));
     if maybe_bump_view(rs, next_height, view_timeout) {
         let new_view = current_view(rs, next_height);
-        ctx.metrics.view_changes_total.fetch_add(1, Ordering::Relaxed);
+        ctx.metrics
+            .view_changes_total
+            .fetch_add(1, Ordering::Relaxed);
         log(format!(
             "view-change: height={next_height} timed out waiting on proposer {}, advancing to view={new_view} (new proposer {})",
             expected_proposer(&all_ids, next_height, new_view - 1),
@@ -767,7 +854,14 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
     rs.latest_observations.insert(node.node_id, obs.clone());
     let obs_canon = protocol::observation_canon(node.node_id, &obs);
     let obs_sig = crypto::sign_canon(&node.signing_key, &obs_canon);
-    broadcast(ctx, &Message::Observation(ObservationMsg { sender: node.node_id, values: obs, sig_hex: hex::encode(obs_sig.to_bytes()) }));
+    broadcast(
+        ctx,
+        &Message::Observation(ObservationMsg {
+            sender: node.node_id,
+            values: obs,
+            sig_hex: hex::encode(obs_sig.to_bytes()),
+        }),
+    );
 
     let view = current_view(rs, next_height);
     let proposer = expected_proposer(&all_ids, next_height, view);
@@ -776,7 +870,14 @@ async fn on_tick(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundS
     }
 }
 
-async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, head: &Block, view: u64) {
+async fn propose_block(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    head: &Block,
+    view: u64,
+) {
     let next_height = head.height + 1;
 
     // A node that's locked on this height (a real prevote quorum
@@ -802,12 +903,27 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     }
 
     let ids: Vec<usize> = rs.latest_observations.keys().cloned().collect();
-    let values: Vec<Vec<f64>> = ids.iter().map(|id| rs.latest_observations[id].clone()).collect();
-    let weights: Vec<f64> =
-        ids.iter().map(|&id| if id == node.node_id { 1.0 } else { *node.reliability.get(&id).unwrap_or(&0.5) }).collect();
+    let values: Vec<Vec<f64>> = ids
+        .iter()
+        .map(|id| rs.latest_observations[id].clone())
+        .collect();
+    let weights: Vec<f64> = ids
+        .iter()
+        .map(|&id| {
+            if id == node.node_id {
+                1.0
+            } else {
+                *node.reliability.get(&id).unwrap_or(&0.5)
+            }
+        })
+        .collect();
 
     let fused = fusion::trimmed_fuse(&values, &weights, TRIM_FRAC);
-    let spread = values.iter().map(|v| fusion::l2_distance(v, &fused)).sum::<f64>() / values.len() as f64;
+    let spread = values
+        .iter()
+        .map(|v| fusion::l2_distance(v, &fused))
+        .sum::<f64>()
+        / values.len() as f64;
     let confidence = (1.0 / (1.0 + spread)).clamp(0.0, 1.0);
 
     // Piggybacks any accepted-but-not-yet-proposed membership change
@@ -820,7 +936,9 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     // this node isn't locked on anything for this height.
     let membership_change = rs.pending_membership_change.take();
     if let Some(mc) = &membership_change {
-        log(format!("height={next_height}: attaching pending membership change {mc:?} to this proposal"));
+        log(format!(
+            "height={next_height}: attaching pending membership change {mc:?} to this proposal"
+        ));
     }
 
     let mut block = Block {
@@ -848,29 +966,55 @@ async fn propose_block(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut 
     block.hash = chain::block_hash(&identity_canon);
     let signing_canon = protocol::view_block_canon(view, &block);
     let my_sig = crypto::sign_canon(&node.signing_key, &signing_canon);
-    let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
+    let my_entry = SigEntry {
+        node_id: node.node_id,
+        pubkey_hex: hex::encode(node.verifying_key.to_bytes()),
+        sig_hex: hex::encode(my_sig.to_bytes()),
+    };
     block.signatures = vec![my_entry.clone()];
     block.sig_weight = 1.0;
 
-    log(format!("proposing height={} view={view} hash={} state={:?}", block.height, block.hash, block.state));
+    log(format!(
+        "proposing height={} view={view} hash={} state={:?}",
+        block.height, block.hash, block.state
+    ));
 
     rs.candidates.insert(block.hash.clone(), block.clone());
     rs.legitimate_rounds.insert((block.hash.clone(), view));
-    rs.prevotes.entry((block.hash.clone(), view)).or_default().push(my_entry);
+    rs.prevotes
+        .entry((block.hash.clone(), view))
+        .or_default()
+        .push(my_entry);
     rs.proposed_rounds.insert((next_height, view));
 
-    broadcast(ctx, &Message::BlockProposal(BlockProposalMsg { sender: node.node_id, view, block: block.clone() }));
+    broadcast(
+        ctx,
+        &Message::BlockProposal(BlockProposalMsg {
+            sender: node.node_id,
+            view,
+            block: block.clone(),
+        }),
+    );
     maybe_precommit(ctx, node, store, rs, &block.hash, view).await;
 }
 
-async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, msg: Message) {
+async fn on_message(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    msg: Message,
+) {
     match msg {
         Message::Observation(o) => {
             let canon = protocol::observation_canon(o.sender, &o.values);
             if verify_from_peer(ctx, o.sender, &canon, &o.sig_hex) {
                 rs.latest_observations.insert(o.sender, o.values);
             } else {
-                warn(format!("rejected observation from {} - unknown sender or invalid signature", o.sender));
+                warn(format!(
+                    "rejected observation from {} - unknown sender or invalid signature",
+                    o.sender
+                ));
             }
         }
         Message::BlockProposal(p) => handle_proposal(ctx, node, store, rs, p).await,
@@ -879,9 +1023,15 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
         Message::TrustUpdate(t) => {
             let canon = protocol::trust_update_canon(t.sender, t.about_peer, t.edge_weight);
             if verify_from_peer(ctx, t.sender, &canon, &t.sig_hex) {
-                log(format!("peer {} reports edge_weight {:.3} toward peer {}", t.sender, t.edge_weight, t.about_peer));
+                log(format!(
+                    "peer {} reports edge_weight {:.3} toward peer {}",
+                    t.sender, t.edge_weight, t.about_peer
+                ));
             } else {
-                warn(format!("rejected trust-update from {} - unknown sender or invalid signature", t.sender));
+                warn(format!(
+                    "rejected trust-update from {} - unknown sender or invalid signature",
+                    t.sender
+                ));
             }
         }
         // Informational only in this stage - nothing acts on a peer's
@@ -890,7 +1040,10 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
         Message::State(s) => {
             let canon = protocol::state_canon(s.sender, &s.state, s.confidence);
             if !verify_from_peer(ctx, s.sender, &canon, &s.sig_hex) {
-                warn(format!("rejected state broadcast from {} - unknown sender or invalid signature", s.sender));
+                warn(format!(
+                    "rejected state broadcast from {} - unknown sender or invalid signature",
+                    s.sender
+                ));
             }
         }
         Message::KeyRotation(k) => handle_key_rotation(ctx, store, k).await,
@@ -909,7 +1062,11 @@ async fn on_message(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Rou
 /// can ever observe one updated without the other.
 fn apply_membership_change(ctx: &Ctx, store: &Store, mc: &chain::MembershipChange) {
     match mc {
-        chain::MembershipChange::Add { node_id, addr, pubkey_hex } => {
+        chain::MembershipChange::Add {
+            node_id,
+            addr,
+            pubkey_hex,
+        } => {
             let Some(pubkey) = decode_verifying_key(pubkey_hex) else {
                 warn(format!("committed membership change adds peer {node_id} with an unparseable pubkey - this should never happen for a block that reached quorum; refusing to apply it"));
                 return;
@@ -920,7 +1077,14 @@ fn apply_membership_change(ctx: &Ctx, store: &Store, mc: &chain::MembershipChang
             };
             {
                 let mut peers = ctx.peers.write().unwrap();
-                peers.insert(*node_id, PeerInfo { addr: parsed_addr, pubkey, rotation_seq: 0 });
+                peers.insert(
+                    *node_id,
+                    PeerInfo {
+                        addr: parsed_addr,
+                        pubkey,
+                        rotation_seq: 0,
+                    },
+                );
             }
             {
                 let mut all_ids = ctx.all_ids.write().unwrap();
@@ -929,7 +1093,13 @@ fn apply_membership_change(ctx: &Ctx, store: &Store, mc: &chain::MembershipChang
                     all_ids.sort_unstable();
                 }
             }
-            if let Err(e) = store.put_member(*node_id, &MemberRecord { addr: addr.clone(), pubkey_hex: pubkey_hex.clone() }) {
+            if let Err(e) = store.put_member(
+                *node_id,
+                &MemberRecord {
+                    addr: addr.clone(),
+                    pubkey_hex: pubkey_hex.clone(),
+                },
+            ) {
                 warn(format!("failed to persist added member {node_id}: {e}"));
             }
             log(format!("membership: added peer {node_id} ({addr}) - network size and quorum now reflect it"));
@@ -944,9 +1114,13 @@ fn apply_membership_change(ctx: &Ctx, store: &Store, mc: &chain::MembershipChang
                 all_ids.retain(|id| id != node_id);
             }
             if let Err(e) = store.remove_member(*node_id) {
-                warn(format!("failed to persist removal of member {node_id}: {e}"));
+                warn(format!(
+                    "failed to persist removal of member {node_id}: {e}"
+                ));
             }
-            log(format!("membership: removed peer {node_id} - network size and quorum now reflect it"));
+            log(format!(
+                "membership: removed peer {node_id} - network size and quorum now reflect it"
+            ));
         }
     }
 }
@@ -965,23 +1139,37 @@ fn apply_membership_change(ctx: &Ctx, store: &Store, mc: &chain::MembershipChang
 /// expires unused; the peer-to-peer membership-proposal path is a
 /// liveness convenience for getting a change proposed promptly, never
 /// a second way to make one take effect.
-fn handle_membership_proposal(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, msg: MembershipProposalMsg) {
+fn handle_membership_proposal(
+    ctx: &Ctx,
+    node: &NodeState,
+    rs: &mut RoundState,
+    msg: MembershipProposalMsg,
+) {
     let known_pubkey = if msg.sender == node.node_id {
         Some(node.verifying_key)
     } else {
         ctx.peers.read().unwrap().get(&msg.sender).map(|p| p.pubkey)
     };
     let Some(known_pubkey) = known_pubkey else {
-        warn(format!("ignoring membership proposal from unknown sender {}", msg.sender));
+        warn(format!(
+            "ignoring membership proposal from unknown sender {}",
+            msg.sender
+        ));
         return;
     };
     let canon = protocol::membership_proposal_canon(msg.sender, &msg.change);
     let Some(sig) = decode_signature(&msg.sig_hex) else {
-        warn(format!("membership proposal from {} has an unparseable signature", msg.sender));
+        warn(format!(
+            "membership proposal from {} has an unparseable signature",
+            msg.sender
+        ));
         return;
     };
     if !crypto::verify_canon(&known_pubkey, &canon, &sig) {
-        warn(format!("invalid membership-proposal signature from {}", msg.sender));
+        warn(format!(
+            "invalid membership-proposal signature from {}",
+            msg.sender
+        ));
         return;
     }
     log(format!("accepted membership proposal from {}: {:?} - will attach to the next block this node proposes", msg.sender, msg.change));
@@ -989,7 +1177,12 @@ fn handle_membership_proposal(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, 
 }
 
 async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
-    let KeyRotationMsg { sender, new_pubkey_hex, rotation_seq, sig_hex } = msg;
+    let KeyRotationMsg {
+        sender,
+        new_pubkey_hex,
+        rotation_seq,
+        sig_hex,
+    } = msg;
 
     let Some(current) = ctx.peers.read().unwrap().get(&sender).copied() else {
         warn(format!("ignoring key rotation from unknown peer {sender}"));
@@ -1002,14 +1195,20 @@ async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
         );
         return;
     }
-    let Some(sig) = decode_signature(&sig_hex) else { return };
+    let Some(sig) = decode_signature(&sig_hex) else {
+        return;
+    };
     let canon = protocol::key_rotation_canon(sender, &new_pubkey_hex, rotation_seq);
     if !crypto::verify_canon(&current.pubkey, &canon, &sig) {
-        warn(format!("invalid key-rotation signature from {sender} - rejecting, keeping the current key"));
+        warn(format!(
+            "invalid key-rotation signature from {sender} - rejecting, keeping the current key"
+        ));
         return;
     }
     let Some(new_pubkey) = decode_verifying_key(&new_pubkey_hex) else {
-        warn(format!("key rotation from {sender} carries an unparseable new pubkey - rejecting"));
+        warn(format!(
+            "key rotation from {sender} carries an unparseable new pubkey - rejecting"
+        ));
         return;
     };
 
@@ -1020,13 +1219,27 @@ async fn handle_key_rotation(ctx: &Ctx, store: &Store, msg: KeyRotationMsg) {
             info.rotation_seq = rotation_seq;
         }
     }
-    if let Err(e) = store.put_peer_key(sender, &PeerKeyRecord { pubkey_hex: new_pubkey_hex, rotation_seq }) {
-        warn(format!("accepted key rotation from {sender} in memory but failed to persist it: {e}"));
+    if let Err(e) = store.put_peer_key(
+        sender,
+        &PeerKeyRecord {
+            pubkey_hex: new_pubkey_hex,
+            rotation_seq,
+        },
+    ) {
+        warn(format!(
+            "accepted key rotation from {sender} in memory but failed to persist it: {e}"
+        ));
     }
     log(format!("accepted key rotation from peer {sender}: now trusting its new key (rotation_seq={rotation_seq})"));
 }
 
-async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, p: BlockProposalMsg) {
+async fn handle_proposal(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    p: BlockProposalMsg,
+) {
     let head = node.head().clone();
 
     // Authenticate before trusting *any* of this message's content -
@@ -1042,11 +1255,18 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     // checks would otherwise have rejected more cheaply; correctness
     // over that micro-optimization.
     let Some(peer) = ctx.peers.read().unwrap().get(&p.sender).copied() else {
-        warn(format!("ignoring proposal from unknown sender {}", p.sender));
+        warn(format!(
+            "ignoring proposal from unknown sender {}",
+            p.sender
+        ));
         return;
     };
-    let Some(their_sig_entry) = p.block.signatures.first() else { return };
-    let Some(sig) = decode_signature(&their_sig_entry.sig_hex) else { return };
+    let Some(their_sig_entry) = p.block.signatures.first() else {
+        return;
+    };
+    let Some(sig) = decode_signature(&their_sig_entry.sig_hex) else {
+        return;
+    };
     let identity_canon = protocol::block_canon(&p.block);
     let signing_canon = protocol::view_block_canon(p.view, &p.block);
     if !crypto::verify_canon(&peer.pubkey, &signing_canon, &sig) {
@@ -1093,7 +1313,11 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         // for this pass - logged loudly rather than acted on either
         // way, so the blast radius of being fooled here is a noisy log
         // line, never a silent reorg.
-        if let Some(committed) = node.chain.get(p.block.height as usize).filter(|b| b.height == p.block.height) {
+        if let Some(committed) = node
+            .chain
+            .get(p.block.height as usize)
+            .filter(|b| b.height == p.block.height)
+        {
             if committed.hash != p.block.hash && chain::prefer(committed, &p.block) {
                 ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
@@ -1139,22 +1363,34 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     }
     let expected = expected_proposer(&all_ids_snapshot(ctx), p.block.height, p.view);
     if p.sender != expected {
-        warn(format!("ignoring proposal from {} - expected proposer for view {} is {}", p.sender, p.view, expected));
+        warn(format!(
+            "ignoring proposal from {} - expected proposer for view {} is {}",
+            p.sender, p.view, expected
+        ));
         return;
     }
 
     if p.view > current_view(rs, p.block.height) {
-        log(format!("catching up: adopting view={} for height={} from proposer {}", p.view, p.block.height, p.sender));
+        log(format!(
+            "catching up: adopting view={} for height={} from proposer {}",
+            p.view, p.block.height, p.sender
+        ));
         rs.view_for_height.insert(p.block.height, p.view);
         rs.waiting_for = Some((p.block.height, p.view));
         rs.waiting_since = Some(tokio::time::Instant::now());
     }
 
-    let is_new_fork =
-        !rs.candidates.contains_key(&block_hash) && rs.candidates.values().any(|b| b.height == p.block.height && b.hash != block_hash);
+    let is_new_fork = !rs.candidates.contains_key(&block_hash)
+        && rs
+            .candidates
+            .values()
+            .any(|b| b.height == p.block.height && b.hash != block_hash);
     if is_new_fork {
         ctx.metrics.forks_total.fetch_add(1, Ordering::Relaxed);
-        log(format!("fork observed at height={}: competing candidate {block_hash}", p.block.height));
+        log(format!(
+            "fork observed at height={}: competing candidate {block_hash}",
+            p.block.height
+        ));
     }
     // Closes a real, disclosed resource-exhaustion vector: a
     // legitimate-but-malicious expected proposer is still free to sign
@@ -1167,7 +1403,11 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
     // one already cached still proceeds below so its tallies can keep
     // growing toward quorum.
     if !rs.candidates.contains_key(&block_hash) {
-        let distinct_at_height = rs.candidates.values().filter(|b| b.height == p.block.height).count();
+        let distinct_at_height = rs
+            .candidates
+            .values()
+            .filter(|b| b.height == p.block.height)
+            .count();
         if distinct_at_height >= MAX_CANDIDATES_PER_HEIGHT {
             warn(format!(
                 "dropping proposal from {} for height {} - already tracking {MAX_CANDIDATES_PER_HEIGHT} distinct \
@@ -1177,7 +1417,9 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
             return;
         }
     }
-    rs.candidates.entry(block_hash.clone()).or_insert_with(|| p.block.clone());
+    rs.candidates
+        .entry(block_hash.clone())
+        .or_insert_with(|| p.block.clone());
     // This (hash, view) pair is now legitimate: a correctly-signed
     // proposal from this view's real expected proposer established it
     // - see `RoundState::legitimate_rounds`'s doc comment for why a
@@ -1189,17 +1431,41 @@ async fn handle_proposal(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         tally.push(their_sig_entry.clone());
     }
 
-    maybe_cast_own_prevote(ctx, node, rs, p.block.height, p.view, &block_hash, &signing_canon);
+    maybe_cast_own_prevote(
+        ctx,
+        node,
+        rs,
+        p.block.height,
+        p.view,
+        &block_hash,
+        &signing_canon,
+    );
     maybe_precommit(ctx, node, store, rs, &block_hash, p.view).await;
 }
 
-async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, v: BlockVoteMsg) {
-    let known_pubkey =
-        if v.sender == node.node_id { Some(node.verifying_key) } else { ctx.peers.read().unwrap().get(&v.sender).map(|p| p.pubkey) };
-    let Some(known_pubkey) = known_pubkey else { return };
-    let Some(claimed_pubkey) = decode_verifying_key(&v.pubkey_hex) else { return };
+async fn handle_vote(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    v: BlockVoteMsg,
+) {
+    let known_pubkey = if v.sender == node.node_id {
+        Some(node.verifying_key)
+    } else {
+        ctx.peers.read().unwrap().get(&v.sender).map(|p| p.pubkey)
+    };
+    let Some(known_pubkey) = known_pubkey else {
+        return;
+    };
+    let Some(claimed_pubkey) = decode_verifying_key(&v.pubkey_hex) else {
+        return;
+    };
     if claimed_pubkey != known_pubkey {
-        warn(format!("vote from {} claims an unexpected pubkey", v.sender));
+        warn(format!(
+            "vote from {} claims an unexpected pubkey",
+            v.sender
+        ));
         return;
     }
 
@@ -1227,14 +1493,19 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     // `expected_proposer`. A vote can never establish a view's
     // legitimacy on its own; it can only ever agree with one a
     // legitimate proposal already did.
-    if !rs.legitimate_rounds.contains(&(v.block_hash.clone(), v.view)) {
+    if !rs
+        .legitimate_rounds
+        .contains(&(v.block_hash.clone(), v.view))
+    {
         warn(format!(
             "ignoring vote from {} claiming view {} for height {} - no legitimate proposal was ever seen for that (hash, view) pair",
             v.sender, v.view, block.height
         ));
         return;
     }
-    let Some(sig) = decode_signature(&v.sig_hex) else { return };
+    let Some(sig) = decode_signature(&v.sig_hex) else {
+        return;
+    };
     let signing_canon = protocol::view_block_canon(v.view, &block);
     if !crypto::verify_canon(&known_pubkey, &signing_canon, &sig) {
         warn(format!("invalid vote signature from {}", v.sender));
@@ -1242,12 +1513,27 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
     }
     ctx.metrics.record_peer_seen(v.sender); // no-op if v.sender is this node's own id
 
-    let tally = rs.prevotes.entry((v.block_hash.clone(), v.view)).or_default();
+    let tally = rs
+        .prevotes
+        .entry((v.block_hash.clone(), v.view))
+        .or_default();
     if !tally.iter().any(|e| e.node_id == v.sender) {
-        tally.push(SigEntry { node_id: v.sender, pubkey_hex: v.pubkey_hex, sig_hex: v.sig_hex });
+        tally.push(SigEntry {
+            node_id: v.sender,
+            pubkey_hex: v.pubkey_hex,
+            sig_hex: v.sig_hex,
+        });
     }
 
-    maybe_cast_own_prevote(ctx, node, rs, block.height, v.view, &v.block_hash, &signing_canon);
+    maybe_cast_own_prevote(
+        ctx,
+        node,
+        rs,
+        block.height,
+        v.view,
+        &v.block_hash,
+        &signing_canon,
+    );
     maybe_precommit(ctx, node, store, rs, &v.block_hash, v.view).await;
 }
 
@@ -1260,9 +1546,21 @@ async fn handle_vote(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut Ro
 /// lock: a real, independently-observed prevote quorum certificate
 /// ("polka") for the new candidate - never a bare claim. See this
 /// module's doc comment on quorum-certificate locking.
-fn maybe_cast_own_prevote(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, height: u64, view: u64, block_hash: &str, signing_canon: &str) {
+fn maybe_cast_own_prevote(
+    ctx: &Ctx,
+    node: &NodeState,
+    rs: &mut RoundState,
+    height: u64,
+    view: u64,
+    block_hash: &str,
+    signing_canon: &str,
+) {
     let key = (block_hash.to_string(), view);
-    let already_voted = rs.prevotes.get(&key).map(|t| t.iter().any(|e| e.node_id == node.node_id)).unwrap_or(false);
+    let already_voted = rs
+        .prevotes
+        .get(&key)
+        .map(|t| t.iter().any(|e| e.node_id == node.node_id))
+        .unwrap_or(false);
     if already_voted {
         return;
     }
@@ -1278,9 +1576,15 @@ fn maybe_cast_own_prevote(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, heig
         }
     }
     let my_sig = crypto::sign_canon(&node.signing_key, signing_canon);
-    let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
+    let my_entry = SigEntry {
+        node_id: node.node_id,
+        pubkey_hex: hex::encode(node.verifying_key.to_bytes()),
+        sig_hex: hex::encode(my_sig.to_bytes()),
+    };
     rs.prevotes.entry(key).or_default().push(my_entry.clone());
-    log(format!("prevoting for height={height} view={view} hash={block_hash}"));
+    log(format!(
+        "prevoting for height={height} view={view} hash={block_hash}"
+    ));
     broadcast(
         ctx,
         &Message::BlockVote(BlockVoteMsg {
@@ -1301,10 +1605,21 @@ fn maybe_cast_own_prevote(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, heig
 /// node's own precommit (signed over `protocol::precommit_canon`, a
 /// string a prevote signature can never be replayed into), and checks
 /// whether the *precommit* tally has itself reached quorum.
-async fn maybe_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str, view: u64) {
-    let Some(block) = rs.candidates.get(block_hash).cloned() else { return };
+async fn maybe_precommit(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    block_hash: &str,
+    view: u64,
+) {
+    let Some(block) = rs.candidates.get(block_hash).cloned() else {
+        return;
+    };
     let key = (block_hash.to_string(), view);
-    let Some(tally) = rs.prevotes.get(&key) else { return };
+    let Some(tally) = rs.prevotes.get(&key) else {
+        return;
+    };
     if tally.len() < quorum_for(ctx.all_ids.read().unwrap().len()) {
         return;
     }
@@ -1314,19 +1629,34 @@ async fn maybe_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
         }
     }
 
-    rs.locked.insert(block.height, (view, block_hash.to_string()));
-    if let Err(e) = store.put_lock(&LockRecord { height: block.height, view, block_hash: block_hash.to_string() }) {
-        warn(format!("failed to persist lock for height={}: {e}", block.height));
+    rs.locked
+        .insert(block.height, (view, block_hash.to_string()));
+    if let Err(e) = store.put_lock(&LockRecord {
+        height: block.height,
+        view,
+        block_hash: block_hash.to_string(),
+    }) {
+        warn(format!(
+            "failed to persist lock for height={}: {e}",
+            block.height
+        ));
     }
 
     let precommit_canon_str = protocol::precommit_canon(view, &block);
     let my_sig = crypto::sign_canon(&node.signing_key, &precommit_canon_str);
-    let my_entry = SigEntry { node_id: node.node_id, pubkey_hex: hex::encode(node.verifying_key.to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) };
+    let my_entry = SigEntry {
+        node_id: node.node_id,
+        pubkey_hex: hex::encode(node.verifying_key.to_bytes()),
+        sig_hex: hex::encode(my_sig.to_bytes()),
+    };
     let ptally = rs.precommits.entry(key.clone()).or_default();
     if !ptally.iter().any(|e| e.node_id == node.node_id) {
         ptally.push(my_entry.clone());
     }
-    log(format!("precommitting (locked) for height={} view={view} hash={block_hash}", block.height));
+    log(format!(
+        "precommitting (locked) for height={} view={view} hash={block_hash}",
+        block.height
+    ));
     broadcast(
         ctx,
         &Message::Precommit(PrecommitMsg {
@@ -1345,26 +1675,47 @@ async fn maybe_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mu
 /// domain-separated signature that's the only thing `maybe_commit`
 /// ever actually counts toward finalizing a block. See this module's
 /// doc comment on quorum-certificate locking.
-async fn handle_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, pc: PrecommitMsg) {
-    let known_pubkey =
-        if pc.sender == node.node_id { Some(node.verifying_key) } else { ctx.peers.read().unwrap().get(&pc.sender).map(|p| p.pubkey) };
-    let Some(known_pubkey) = known_pubkey else { return };
-    let Some(claimed_pubkey) = decode_verifying_key(&pc.pubkey_hex) else { return };
+async fn handle_precommit(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    pc: PrecommitMsg,
+) {
+    let known_pubkey = if pc.sender == node.node_id {
+        Some(node.verifying_key)
+    } else {
+        ctx.peers.read().unwrap().get(&pc.sender).map(|p| p.pubkey)
+    };
+    let Some(known_pubkey) = known_pubkey else {
+        return;
+    };
+    let Some(claimed_pubkey) = decode_verifying_key(&pc.pubkey_hex) else {
+        return;
+    };
     if claimed_pubkey != known_pubkey {
-        warn(format!("precommit from {} claims an unexpected pubkey", pc.sender));
+        warn(format!(
+            "precommit from {} claims an unexpected pubkey",
+            pc.sender
+        ));
         return;
     }
     let Some(block) = rs.candidates.get(&pc.block_hash).cloned() else {
         return; // precommit for a candidate we haven't cached - dropped; no retry in this stage
     };
-    if !rs.legitimate_rounds.contains(&(pc.block_hash.clone(), pc.view)) {
+    if !rs
+        .legitimate_rounds
+        .contains(&(pc.block_hash.clone(), pc.view))
+    {
         warn(format!(
             "ignoring precommit from {} claiming view {} for height {} - no legitimate proposal was ever seen for that (hash, view) pair",
             pc.sender, pc.view, block.height
         ));
         return;
     }
-    let Some(sig) = decode_signature(&pc.sig_hex) else { return };
+    let Some(sig) = decode_signature(&pc.sig_hex) else {
+        return;
+    };
     let canon = protocol::precommit_canon(pc.view, &block);
     if !crypto::verify_canon(&known_pubkey, &canon, &sig) {
         warn(format!("invalid precommit signature from {}", pc.sender));
@@ -1372,9 +1723,16 @@ async fn handle_precommit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &m
     }
     ctx.metrics.record_peer_seen(pc.sender);
 
-    let tally = rs.precommits.entry((pc.block_hash.clone(), pc.view)).or_default();
+    let tally = rs
+        .precommits
+        .entry((pc.block_hash.clone(), pc.view))
+        .or_default();
     if !tally.iter().any(|e| e.node_id == pc.sender) {
-        tally.push(SigEntry { node_id: pc.sender, pubkey_hex: pc.pubkey_hex, sig_hex: pc.sig_hex });
+        tally.push(SigEntry {
+            node_id: pc.sender,
+            pubkey_hex: pc.pubkey_hex,
+            sig_hex: pc.sig_hex,
+        });
     }
 
     maybe_commit(ctx, node, store, rs, &pc.block_hash, pc.view).await;
@@ -1401,9 +1759,18 @@ fn reconcile_epoch_with_chain(node: &mut NodeState, store: &Store) {
     }
 }
 
-async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, block_hash: &str, view: u64) {
+async fn maybe_commit(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    block_hash: &str,
+    view: u64,
+) {
     let head = node.head().clone();
-    let Some(mut block) = rs.candidates.get(block_hash).cloned() else { return };
+    let Some(mut block) = rs.candidates.get(block_hash).cloned() else {
+        return;
+    };
     if block.parent != head.hash {
         return; // superseded by a different committed block already
     }
@@ -1415,7 +1782,9 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     // signatures, which is what let votes for two different views'
     // candidates at the same height both have a real chance to reach
     // quorum in an adversarial/partitioned network.
-    let Some(precommits) = rs.precommits.get(&(block_hash.to_string(), view)).cloned() else { return };
+    let Some(precommits) = rs.precommits.get(&(block_hash.to_string(), view)).cloned() else {
+        return;
+    };
     if precommits.len() < quorum_for(ctx.all_ids.read().unwrap().len()) {
         return;
     }
@@ -1435,11 +1804,16 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     if let Err(e) = store.put_block(&block) {
         warn(format!("failed to persist committed block: {e}"));
     }
-    ctx.metrics.head_height.store(block.height, Ordering::Relaxed);
+    ctx.metrics
+        .head_height
+        .store(block.height, Ordering::Relaxed);
     if !block.reconciles.is_empty() {
         ctx.metrics.reconciles_total.fetch_add(1, Ordering::Relaxed);
     }
-    log(format!("COMMITTED height={} hash={} sig_weight={} state={:?}", block.height, block.hash, block.sig_weight, block.state));
+    log(format!(
+        "COMMITTED height={} hash={} sig_weight={} state={:?}",
+        block.height, block.hash, block.sig_weight, block.state
+    ));
 
     // block.epoch (set by whoever proposed it, from the same pure
     // chain::epoch_for_height every honest node computes) is now this
@@ -1449,7 +1823,10 @@ async fn maybe_commit(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut R
     // commit, so the log stays meaningful at epoch boundaries instead
     // of repeating the same value every round_interval_secs.
     if block.epoch != node.epoch {
-        log(format!("epoch rotated: {} -> {} at height={}", node.epoch, block.epoch, block.height));
+        log(format!(
+            "epoch rotated: {} -> {} at height={}",
+            node.epoch, block.epoch, block.height
+        ));
         node.epoch = block.epoch;
         ctx.metrics.epoch.store(block.epoch, Ordering::Relaxed);
         if let Err(e) = store.put_epoch(block.epoch) {
@@ -1497,7 +1874,9 @@ async fn maybe_request_sync(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, ta
     let from_height = node.head().height + 1;
     let now = tokio::time::Instant::now();
     if let Some((requested_height, requested_at)) = rs.last_sync_request {
-        if requested_height == from_height && now.duration_since(requested_at) < SYNC_REQUEST_COOLDOWN {
+        if requested_height == from_height
+            && now.duration_since(requested_at) < SYNC_REQUEST_COOLDOWN
+        {
             return;
         }
     }
@@ -1505,11 +1884,17 @@ async fn maybe_request_sync(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, ta
 
     let canon = protocol::block_request_canon(node.node_id, from_height);
     let sig = crypto::sign_canon(&node.signing_key, &canon);
-    log(format!("requesting chain-sync from peer {target}, starting at height={from_height}"));
+    log(format!(
+        "requesting chain-sync from peer {target}, starting at height={from_height}"
+    ));
     send_direct(
         ctx,
         target,
-        &Message::BlockRequest(BlockRequestMsg { sender: node.node_id, from_height, sig_hex: hex::encode(sig.to_bytes()) }),
+        &Message::BlockRequest(BlockRequestMsg {
+            sender: node.node_id,
+            from_height,
+            sig_hex: hex::encode(sig.to_bytes()),
+        }),
     );
 }
 
@@ -1522,17 +1907,39 @@ async fn maybe_request_sync(ctx: &Ctx, node: &NodeState, rs: &mut RoundState, ta
 async fn handle_block_request(ctx: &Ctx, node: &NodeState, req: BlockRequestMsg) {
     let canon = protocol::block_request_canon(req.sender, req.from_height);
     if !verify_from_peer(ctx, req.sender, &canon, &req.sig_hex) {
-        warn(format!("rejected block request from {} - unknown sender or invalid signature", req.sender));
+        warn(format!(
+            "rejected block request from {} - unknown sender or invalid signature",
+            req.sender
+        ));
         return;
     }
-    let blocks: Vec<Block> = node.chain.iter().filter(|b| b.height >= req.from_height).take(MAX_SYNC_BATCH).cloned().collect();
+    let blocks: Vec<Block> = node
+        .chain
+        .iter()
+        .filter(|b| b.height >= req.from_height)
+        .take(MAX_SYNC_BATCH)
+        .cloned()
+        .collect();
     if blocks.is_empty() {
         return;
     }
-    log(format!("answering chain-sync request from {} with {} block(s) starting at height={}", req.sender, blocks.len(), req.from_height));
+    log(format!(
+        "answering chain-sync request from {} with {} block(s) starting at height={}",
+        req.sender,
+        blocks.len(),
+        req.from_height
+    ));
     let response_canon = protocol::block_response_canon(node.node_id, &blocks);
     let sig = crypto::sign_canon(&node.signing_key, &response_canon);
-    send_direct(ctx, req.sender, &Message::BlockResponse(BlockResponseMsg { sender: node.node_id, blocks, sig_hex: hex::encode(sig.to_bytes()) }));
+    send_direct(
+        ctx,
+        req.sender,
+        &Message::BlockResponse(BlockResponseMsg {
+            sender: node.node_id,
+            blocks,
+            sig_hex: hex::encode(sig.to_bytes()),
+        }),
+    );
 }
 
 /// Applies a [`BlockResponseMsg`], verifying every block independently
@@ -1565,10 +1972,19 @@ async fn handle_block_request(ctx: &Ctx, node: &NodeState, req: BlockRequestMsg)
 /// this node's own `latest_observations` from the round the block was
 /// actually proposed in, which a node catching up on history never
 /// had - there's nothing meaningful to recompute from.
-async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, rs: &mut RoundState, resp: BlockResponseMsg) {
+async fn handle_block_response(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    rs: &mut RoundState,
+    resp: BlockResponseMsg,
+) {
     let canon = protocol::block_response_canon(resp.sender, &resp.blocks);
     if !verify_from_peer(ctx, resp.sender, &canon, &resp.sig_hex) {
-        warn(format!("rejected block response from {} - unknown sender or invalid signature", resp.sender));
+        warn(format!(
+            "rejected block response from {} - unknown sender or invalid signature",
+            resp.sender
+        ));
         return;
     }
     let mut applied = 0u64;
@@ -1584,7 +2000,10 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
         }
         let identity_canon = protocol::block_canon(&block);
         if chain::block_hash(&identity_canon) != block.hash {
-            warn(format!("block-sync: hash mismatch at height={} from {} - stopping this batch", block.height, resp.sender));
+            warn(format!(
+                "block-sync: hash mismatch at height={} from {} - stopping this batch",
+                block.height, resp.sender
+            ));
             break;
         }
 
@@ -1609,14 +2028,24 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
             let known_pubkey = if sig_entry.node_id == node.node_id {
                 Some(node.verifying_key)
             } else {
-                ctx.peers.read().unwrap().get(&sig_entry.node_id).map(|p| p.pubkey)
+                ctx.peers
+                    .read()
+                    .unwrap()
+                    .get(&sig_entry.node_id)
+                    .map(|p| p.pubkey)
             };
-            let Some(known_pubkey) = known_pubkey else { continue };
-            let Some(claimed_pubkey) = decode_verifying_key(&sig_entry.pubkey_hex) else { continue };
+            let Some(known_pubkey) = known_pubkey else {
+                continue;
+            };
+            let Some(claimed_pubkey) = decode_verifying_key(&sig_entry.pubkey_hex) else {
+                continue;
+            };
             if claimed_pubkey != known_pubkey {
                 continue;
             }
-            let Some(sig) = decode_signature(&sig_entry.sig_hex) else { continue };
+            let Some(sig) = decode_signature(&sig_entry.sig_hex) else {
+                continue;
+            };
             if crypto::verify_canon(&known_pubkey, &precommit_canon_str, &sig) {
                 valid += 1;
             }
@@ -1629,14 +2058,22 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
             break;
         }
 
-        log(format!("block-sync: catching up height={} hash={} (committed_at_view={})", block.height, block.hash, block.committed_at_view));
+        log(format!(
+            "block-sync: catching up height={} hash={} (committed_at_view={})",
+            block.height, block.hash, block.committed_at_view
+        ));
         node.chain.push(block.clone());
         if let Err(e) = store.put_block(&block) {
             warn(format!("failed to persist synced block: {e}"));
         }
-        ctx.metrics.head_height.store(block.height, Ordering::Relaxed);
+        ctx.metrics
+            .head_height
+            .store(block.height, Ordering::Relaxed);
         if block.epoch != node.epoch {
-            log(format!("epoch rotated via sync: {} -> {} at height={}", node.epoch, block.epoch, block.height));
+            log(format!(
+                "epoch rotated via sync: {} -> {} at height={}",
+                node.epoch, block.epoch, block.height
+            ));
             node.epoch = block.epoch;
             ctx.metrics.epoch.store(block.epoch, Ordering::Relaxed);
             if let Err(e) = store.put_epoch(block.epoch) {
@@ -1675,14 +2112,31 @@ async fn handle_block_response(ctx: &Ctx, node: &mut NodeState, store: &Store, r
 /// removal barely changes anything, or whose own observation was close
 /// to the committed state, gains trust; a peer whose observation was
 /// an outlier loses it.
-async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, block: &Block, rs: &RoundState) {
+async fn apply_trust_updates(
+    ctx: &Ctx,
+    node: &mut NodeState,
+    store: &Store,
+    block: &Block,
+    rs: &RoundState,
+) {
     let ids: Vec<usize> = rs.latest_observations.keys().cloned().collect();
     if ids.len() < 2 {
         return;
     }
-    let values: Vec<Vec<f64>> = ids.iter().map(|id| rs.latest_observations[id].clone()).collect();
-    let weights: Vec<f64> =
-        ids.iter().map(|&id| if id == node.node_id { 1.0 } else { *node.reliability.get(&id).unwrap_or(&0.5) }).collect();
+    let values: Vec<Vec<f64>> = ids
+        .iter()
+        .map(|id| rs.latest_observations[id].clone())
+        .collect();
+    let weights: Vec<f64> = ids
+        .iter()
+        .map(|&id| {
+            if id == node.node_id {
+                1.0
+            } else {
+                *node.reliability.get(&id).unwrap_or(&0.5)
+            }
+        })
+        .collect();
     let total_weight: f64 = weights.iter().sum();
 
     for (idx, &peer_id) in ids.iter().enumerate() {
@@ -1700,9 +2154,23 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
         // weighting trust at all. Falls back to the old uniform value
         // only if every weight were somehow zero - defensive, not
         // expected, since this node's own entry is always 1.0 above.
-        let share = if total_weight > 0.0 { weights[idx] / total_weight } else { 1.0 / ids.len() as f64 };
-        let without_values: Vec<Vec<f64>> = values.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, v)| v.clone()).collect();
-        let without_weights: Vec<f64> = weights.iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, w)| *w).collect();
+        let share = if total_weight > 0.0 {
+            weights[idx] / total_weight
+        } else {
+            1.0 / ids.len() as f64
+        };
+        let without_values: Vec<Vec<f64>> = values
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, v)| v.clone())
+            .collect();
+        let without_weights: Vec<f64> = weights
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, w)| *w)
+            .collect();
         if without_values.is_empty() {
             continue;
         }
@@ -1711,14 +2179,30 @@ async fn apply_trust_updates(ctx: &Ctx, node: &mut NodeState, store: &Store, blo
         let peer_obs_error = fusion::l2_distance(&values[idx], &block.state);
 
         let old_rel = *node.reliability.get(&peer_id).unwrap_or(&0.5);
-        let new_rel = trust::update_reliability(old_rel, peer_obs_error, 0.0, RELIABILITY_ALPHA, RELIABILITY_FLOOR, RELIABILITY_CEIL);
+        let new_rel = trust::update_reliability(
+            old_rel,
+            peer_obs_error,
+            0.0,
+            RELIABILITY_ALPHA,
+            RELIABILITY_FLOOR,
+            RELIABILITY_CEIL,
+        );
         let old_w = *node.edge_weight.get(&peer_id).unwrap_or(&1.0);
-        let new_w = trust::update_edge_weight(old_w, share, delta_e, EDGE_ALPHA, EDGE_FLOOR, EDGE_CEIL);
+        let new_w =
+            trust::update_edge_weight(old_w, share, delta_e, EDGE_ALPHA, EDGE_FLOOR, EDGE_CEIL);
 
         node.reliability.insert(peer_id, new_rel);
         node.edge_weight.insert(peer_id, new_w);
-        if let Err(e) = store.put_trust(peer_id, TrustEntry { edge_weight: new_w, reliability: new_rel }) {
-            warn(format!("failed to persist trust update for peer {peer_id}: {e}"));
+        if let Err(e) = store.put_trust(
+            peer_id,
+            TrustEntry {
+                edge_weight: new_w,
+                reliability: new_rel,
+            },
+        ) {
+            warn(format!(
+                "failed to persist trust update for peer {peer_id}: {e}"
+            ));
         }
         let trust_canon = protocol::trust_update_canon(node.node_id, peer_id, new_w);
         let trust_sig = crypto::sign_canon(&node.signing_key, &trust_canon);
@@ -1782,7 +2266,10 @@ mod tests {
     async fn maybe_bump_view_does_nothing_before_the_timeout_elapses() {
         let mut rs = RoundState::default();
         let timeout = Duration::from_secs(10);
-        assert!(!maybe_bump_view(&mut rs, 5, timeout), "first call just starts the timer, it shouldn't bump yet");
+        assert!(
+            !maybe_bump_view(&mut rs, 5, timeout),
+            "first call just starts the timer, it shouldn't bump yet"
+        );
         tokio::time::advance(Duration::from_secs(5)).await; // halfway there
         assert!(!maybe_bump_view(&mut rs, 5, timeout));
         assert_eq!(current_view(&rs, 5), 0);
@@ -1794,7 +2281,10 @@ mod tests {
         let timeout = Duration::from_secs(10);
         maybe_bump_view(&mut rs, 5, timeout); // starts the timer
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert!(maybe_bump_view(&mut rs, 5, timeout), "the timeout has fully elapsed, this call should bump");
+        assert!(
+            maybe_bump_view(&mut rs, 5, timeout),
+            "the timeout has fully elapsed, this call should bump"
+        );
         assert_eq!(current_view(&rs, 5), 1);
 
         // Immediately calling again shouldn't bump a second time - the
@@ -1813,7 +2303,10 @@ mod tests {
         assert_eq!(current_view(&rs, 5), 1);
 
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert!(maybe_bump_view(&mut rs, 5, timeout), "a second stalled proposer should bump again");
+        assert!(
+            maybe_bump_view(&mut rs, 5, timeout),
+            "a second stalled proposer should bump again"
+        );
         assert_eq!(current_view(&rs, 5), 2);
     }
 
@@ -1829,13 +2322,20 @@ mod tests {
         // over to height 6's fresh timer.
         assert!(!maybe_bump_view(&mut rs, 6, timeout));
         tokio::time::advance(Duration::from_secs(9)).await;
-        assert!(!maybe_bump_view(&mut rs, 6, timeout), "only 9s elapsed for height 6's own timer, not enough to bump");
+        assert!(
+            !maybe_bump_view(&mut rs, 6, timeout),
+            "only 9s elapsed for height 6's own timer, not enough to bump"
+        );
     }
 
     #[test]
     fn log_timestamp_has_the_expected_shape_and_a_plausible_year() {
         let ts = log_timestamp();
-        assert_eq!(ts.len(), 20, "YYYY-MM-DDTHH:MM:SSZ is exactly 20 chars, got {ts:?}");
+        assert_eq!(
+            ts.len(),
+            20,
+            "YYYY-MM-DDTHH:MM:SSZ is exactly 20 chars, got {ts:?}"
+        );
         assert_eq!(&ts[4..5], "-");
         assert_eq!(&ts[7..8], "-");
         assert_eq!(&ts[10..11], "T");
@@ -1843,7 +2343,10 @@ mod tests {
         assert_eq!(&ts[16..17], ":");
         assert_eq!(&ts[19..20], "Z");
         let year: u32 = ts[0..4].parse().expect("year digits should parse");
-        assert!((2020..2200).contains(&year), "sanity bound on the current year, got {year}");
+        assert!(
+            (2020..2200).contains(&year),
+            "sanity bound on the current year, got {year}"
+        );
     }
 
     #[test]
@@ -1867,8 +2370,15 @@ mod tests {
             committed_at_view: 0,
             membership_change: None,
         };
-        let expected =
-            chain::canon_string(1, "GENESIS", &chain::hash_vec(&[1.0, 2.0]), 0.9, &chain::hash_list(&[]), 0, &chain::hash_membership_change(&None));
+        let expected = chain::canon_string(
+            1,
+            "GENESIS",
+            &chain::hash_vec(&[1.0, 2.0]),
+            0.9,
+            &chain::hash_list(&[]),
+            0,
+            &chain::hash_membership_change(&None),
+        );
         assert_eq!(protocol::block_canon(&block), expected);
     }
 
@@ -1897,11 +2407,28 @@ mod tests {
             data_dir: String::new(),
             round_interval_secs: 1,
             metrics_addr: None,
-            peers: vec![PeerConfig { id: 1, addr: "127.0.0.1:1".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) }],
+            peers: vec![PeerConfig {
+                id: 1,
+                addr: "127.0.0.1:1".to_string(),
+                pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()),
+            }],
         };
-        let peers = HashMap::from([(1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key(), rotation_seq: 0 })]);
+        let peers = HashMap::from([(
+            1,
+            PeerInfo {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                pubkey: peer_sk.verifying_key(),
+                rotation_seq: 0,
+            },
+        )]);
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(vec![0, 1]), endpoint, metrics: Arc::new(Metrics::new(&[1])) };
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(peers),
+            all_ids: std::sync::RwLock::new(vec![0, 1]),
+            endpoint,
+            metrics: Arc::new(Metrics::new(&[1])),
+        };
         (ctx, self_sk, peer_sk)
     }
 
@@ -1910,9 +2437,28 @@ mod tests {
         let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
         let canon = protocol::observation_canon(1, &[1.0, 2.0]);
         let sig = crypto::sign_canon(&peer_sk, &canon);
-        assert_eq!(ctx.metrics.peer_health(1).unwrap().seconds_since_last_seen(), None, "not seen yet");
-        assert!(verify_from_peer(&ctx, 1, &canon, &hex::encode(sig.to_bytes())));
-        assert!(ctx.metrics.peer_health(1).unwrap().seconds_since_last_seen().is_some(), "a genuine signature should mark the peer seen (Hardening 6)");
+        assert_eq!(
+            ctx.metrics
+                .peer_health(1)
+                .unwrap()
+                .seconds_since_last_seen(),
+            None,
+            "not seen yet"
+        );
+        assert!(verify_from_peer(
+            &ctx,
+            1,
+            &canon,
+            &hex::encode(sig.to_bytes())
+        ));
+        assert!(
+            ctx.metrics
+                .peer_health(1)
+                .unwrap()
+                .seconds_since_last_seen()
+                .is_some(),
+            "a genuine signature should mark the peer seen (Hardening 6)"
+        );
     }
 
     #[tokio::test]
@@ -1920,8 +2466,20 @@ mod tests {
         let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer();
         let canon = protocol::observation_canon(1, &[1.0, 2.0]);
         let forged_sig = crypto::sign_canon(&self_sk, &canon); // wrong key
-        assert!(!verify_from_peer(&ctx, 1, &canon, &hex::encode(forged_sig.to_bytes())));
-        assert_eq!(ctx.metrics.peer_health(1).unwrap().seconds_since_last_seen(), None, "a forged signature must never count as having seen the real peer 1");
+        assert!(!verify_from_peer(
+            &ctx,
+            1,
+            &canon,
+            &hex::encode(forged_sig.to_bytes())
+        ));
+        assert_eq!(
+            ctx.metrics
+                .peer_health(1)
+                .unwrap()
+                .seconds_since_last_seen(),
+            None,
+            "a forged signature must never count as having seen the real peer 1"
+        );
     }
 
     #[tokio::test]
@@ -1929,7 +2487,10 @@ mod tests {
         let (ctx, _self_sk, peer_sk) = test_ctx_with_one_peer();
         let canon = protocol::observation_canon(99, &[1.0, 2.0]);
         let sig = crypto::sign_canon(&peer_sk, &canon);
-        assert!(!verify_from_peer(&ctx, 99, &canon, &hex::encode(sig.to_bytes())), "sender 99 isn't a configured peer");
+        assert!(
+            !verify_from_peer(&ctx, 99, &canon, &hex::encode(sig.to_bytes())),
+            "sender 99 isn't a configured peer"
+        );
     }
 
     #[tokio::test]
@@ -1939,7 +2500,12 @@ mod tests {
         // Signed by node 0's own key, not peer 1's configured key - the
         // exact spoofing attempt this authentication closes.
         let forged_sig = crypto::sign_canon(&self_sk, &canon);
-        assert!(!verify_from_peer(&ctx, 1, &canon, &hex::encode(forged_sig.to_bytes())));
+        assert!(!verify_from_peer(
+            &ctx,
+            1,
+            &canon,
+            &hex::encode(forged_sig.to_bytes())
+        ));
     }
 
     #[tokio::test]
@@ -1948,13 +2514,28 @@ mod tests {
         let real_canon = protocol::observation_canon(1, &[1.0, 2.0]);
         let sig = crypto::sign_canon(&peer_sk, &real_canon);
         let tampered_canon = protocol::observation_canon(1, &[1.0, 999.0]);
-        assert!(!verify_from_peer(&ctx, 1, &tampered_canon, &hex::encode(sig.to_bytes())));
+        assert!(!verify_from_peer(
+            &ctx,
+            1,
+            &tampered_canon,
+            &hex::encode(sig.to_bytes())
+        ));
     }
 
-    fn signed_key_rotation(sender: usize, old_sk: &ed25519_dalek::SigningKey, new_pubkey_hex: &str, rotation_seq: u64) -> KeyRotationMsg {
+    fn signed_key_rotation(
+        sender: usize,
+        old_sk: &ed25519_dalek::SigningKey,
+        new_pubkey_hex: &str,
+        rotation_seq: u64,
+    ) -> KeyRotationMsg {
         let canon = protocol::key_rotation_canon(sender, new_pubkey_hex, rotation_seq);
         let sig = crypto::sign_canon(old_sk, &canon);
-        KeyRotationMsg { sender, new_pubkey_hex: new_pubkey_hex.to_string(), rotation_seq, sig_hex: hex::encode(sig.to_bytes()) }
+        KeyRotationMsg {
+            sender,
+            new_pubkey_hex: new_pubkey_hex.to_string(),
+            rotation_seq,
+            sig_hex: hex::encode(sig.to_bytes()),
+        }
     }
 
     #[tokio::test]
@@ -1969,11 +2550,24 @@ mod tests {
 
         handle_key_rotation(&ctx, &store, msg).await;
 
-        let updated = ctx.peers.read().unwrap().get(&1).copied().expect("peer 1 should still be known");
-        assert_eq!(updated.pubkey, new_sk.verifying_key(), "ctx.peers must be updated to the new key immediately");
+        let updated = ctx
+            .peers
+            .read()
+            .unwrap()
+            .get(&1)
+            .copied()
+            .expect("peer 1 should still be known");
+        assert_eq!(
+            updated.pubkey,
+            new_sk.verifying_key(),
+            "ctx.peers must be updated to the new key immediately"
+        );
         assert_eq!(updated.rotation_seq, 1);
 
-        let persisted = store.get_peer_key(1).unwrap().expect("the rotation must be persisted");
+        let persisted = store
+            .get_peer_key(1)
+            .unwrap()
+            .expect("the rotation must be persisted");
         assert_eq!(persisted.pubkey_hex, new_pubkey_hex);
         assert_eq!(persisted.rotation_seq, 1);
     }
@@ -1991,8 +2585,17 @@ mod tests {
 
         let new_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let new_pubkey_hex = hex::encode(new_sk.verifying_key().to_bytes());
-        handle_key_rotation(&ctx, &store, signed_key_rotation(1, &peer_sk, &new_pubkey_hex, 1)).await;
-        assert_eq!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, new_sk.verifying_key(), "sanity: rotation took effect");
+        handle_key_rotation(
+            &ctx,
+            &store,
+            signed_key_rotation(1, &peer_sk, &new_pubkey_hex, 1),
+        )
+        .await;
+        assert_eq!(
+            ctx.peers.read().unwrap().get(&1).unwrap().pubkey,
+            new_sk.verifying_key(),
+            "sanity: rotation took effect"
+        );
 
         let mut node = NodeState {
             node_id: 0,
@@ -2025,8 +2628,14 @@ mod tests {
         // maybe_commit prunes the now-committed candidate, so checking
         // the real chain (not rs.candidates) is the correct success
         // signal here.
-        let committed = node.chain.last().expect("the proposal should have verified, prevoted, precommitted, and committed");
-        assert_eq!(committed.hash, proposal.block.hash, "the committed block must be the one signed with the newly-rotated key");
+        let committed = node
+            .chain
+            .last()
+            .expect("the proposal should have verified, prevoted, precommitted, and committed");
+        assert_eq!(
+            committed.hash, proposal.block.hash,
+            "the committed block must be the one signed with the newly-rotated key"
+        );
     }
 
     #[tokio::test]
@@ -2043,8 +2652,16 @@ mod tests {
 
         handle_key_rotation(&ctx, &store, msg).await;
 
-        assert_ne!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, new_sk.verifying_key(), "an impersonated rotation must never take effect");
-        assert_eq!(store.get_peer_key(1).unwrap(), None, "nothing should be persisted either");
+        assert_ne!(
+            ctx.peers.read().unwrap().get(&1).unwrap().pubkey,
+            new_sk.verifying_key(),
+            "an impersonated rotation must never take effect"
+        );
+        assert_eq!(
+            store.get_peer_key(1).unwrap(),
+            None,
+            "nothing should be persisted either"
+        );
     }
 
     #[tokio::test]
@@ -2054,7 +2671,12 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let unrelated_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let new_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let msg = signed_key_rotation(99, &unrelated_sk, &hex::encode(new_sk.verifying_key().to_bytes()), 1);
+        let msg = signed_key_rotation(
+            99,
+            &unrelated_sk,
+            &hex::encode(new_sk.verifying_key().to_bytes()),
+            1,
+        );
 
         handle_key_rotation(&ctx, &store, msg).await; // must not panic on an unknown id
 
@@ -2072,16 +2694,28 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
 
         let key_b = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let rotate_to_b = signed_key_rotation(1, &peer_sk, &hex::encode(key_b.verifying_key().to_bytes()), 1);
+        let rotate_to_b = signed_key_rotation(
+            1,
+            &peer_sk,
+            &hex::encode(key_b.verifying_key().to_bytes()),
+            1,
+        );
         handle_key_rotation(&ctx, &store, rotate_to_b.clone()).await;
-        assert_eq!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, key_b.verifying_key());
+        assert_eq!(
+            ctx.peers.read().unwrap().get(&1).unwrap().pubkey,
+            key_b.verifying_key()
+        );
 
         let key_c = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         // The real next rotation is signed by key_b (the now-current
         // key) at a higher seq.
-        let rotate_to_c = signed_key_rotation(1, &key_b, &hex::encode(key_c.verifying_key().to_bytes()), 2);
+        let rotate_to_c =
+            signed_key_rotation(1, &key_b, &hex::encode(key_c.verifying_key().to_bytes()), 2);
         handle_key_rotation(&ctx, &store, rotate_to_c).await;
-        assert_eq!(ctx.peers.read().unwrap().get(&1).unwrap().pubkey, key_c.verifying_key());
+        assert_eq!(
+            ctx.peers.read().unwrap().get(&1).unwrap().pubkey,
+            key_c.verifying_key()
+        );
 
         // An attacker replays the original A->B announcement (genuinely
         // signed, by the real old key, but at the now-stale seq=1).
@@ -2105,19 +2739,35 @@ mod tests {
         let (ctx, _self_sk, _peer_sk) = test_ctx_with_one_peer(); // peer 1 at 127.0.0.1:1
         assert_eq!(ctx.metrics.peer_health(1).unwrap().total_sends(), 0);
 
-        broadcast(&ctx, &Message::Observation(ObservationMsg { sender: 0, values: vec![1.0], sig_hex: "aa".to_string() }));
+        broadcast(
+            &ctx,
+            &Message::Observation(ObservationMsg {
+                sender: 0,
+                values: vec![1.0],
+                sig_hex: "aa".to_string(),
+            }),
+        );
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
             if ctx.metrics.peer_health(1).unwrap().total_sends() > 0 {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "broadcast's spawned send never completed within the connect timeout");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "broadcast's spawned send never completed within the connect timeout"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         assert_eq!(ctx.metrics.peer_health(1).unwrap().total_send_failures(), 1);
-        assert_eq!(ctx.metrics.peer_health(1).unwrap().consecutive_send_failures(), 1);
+        assert_eq!(
+            ctx.metrics
+                .peer_health(1)
+                .unwrap()
+                .consecutive_send_failures(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -2140,11 +2790,18 @@ mod tests {
         let fake_values = vec![999.0, 999.0];
         let canon = protocol::observation_canon(1, &fake_values);
         let forged_sig = crypto::sign_canon(&self_sk, &canon);
-        let spoofed = Message::Observation(ObservationMsg { sender: 1, values: fake_values, sig_hex: hex::encode(forged_sig.to_bytes()) });
+        let spoofed = Message::Observation(ObservationMsg {
+            sender: 1,
+            values: fake_values,
+            sig_hex: hex::encode(forged_sig.to_bytes()),
+        });
 
         on_message(&ctx, &mut node, &store, &mut rs, spoofed).await;
 
-        assert!(!rs.latest_observations.contains_key(&1), "a forged observation must never be accepted as peer 1's real data");
+        assert!(
+            !rs.latest_observations.contains_key(&1),
+            "a forged observation must never be accepted as peer 1's real data"
+        );
     }
 
     /// The real property this stage exists to prove: once this node's
@@ -2215,9 +2872,23 @@ mod tests {
         }];
         block.sig_weight = 1.0;
 
-        handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: stale_view, block }).await;
+        handle_proposal(
+            &ctx,
+            &mut node,
+            &store,
+            &mut rs,
+            BlockProposalMsg {
+                sender: 1,
+                view: stale_view,
+                block,
+            },
+        )
+        .await;
 
-        assert!(rs.candidates.is_empty(), "a proposal signed for an abandoned view must never be cached as a live candidate");
+        assert!(
+            rs.candidates.is_empty(),
+            "a proposal signed for an abandoned view must never be cached as a live candidate"
+        );
     }
 
     /// The fix for the real bug the manual liveness test caught: nodes
@@ -2257,12 +2928,19 @@ mod tests {
             reliability: HashMap::new(),
         };
         let mut rs = RoundState::default();
-        assert_eq!(current_view(&rs, 2), 0, "this node hasn't tracked any view bump for height 2 yet");
+        assert_eq!(
+            current_view(&rs, 2),
+            0,
+            "this node hasn't tracked any view bump for height 2 yet"
+        );
 
         // Peer 1 is the real expected proposer for (height=2, view=1):
         // expected_proposer([0,1], 2, 1) == all_ids[(2+1)%2] == 1.
         let ahead_view = 1u64;
-        assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 2, ahead_view), 1);
+        assert_eq!(
+            expected_proposer(&ctx.all_ids.read().unwrap(), 2, ahead_view),
+            1
+        );
 
         let mut block = Block {
             height: 2,
@@ -2288,7 +2966,18 @@ mod tests {
         }];
         block.sig_weight = 1.0;
 
-        handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: ahead_view, block: block.clone() }).await;
+        handle_proposal(
+            &ctx,
+            &mut node,
+            &store,
+            &mut rs,
+            BlockProposalMsg {
+                sender: 1,
+                view: ahead_view,
+                block: block.clone(),
+            },
+        )
+        .await;
 
         // With only two participants, the proposer's own signature plus
         // this node's prevote already meets prevote quorum (2), so
@@ -2306,17 +2995,41 @@ mod tests {
         // itself, signed at ahead_view, is the real proof the catch-up
         // happened.)
         let committed = node.chain.last().expect("chain should have advanced");
-        assert_eq!(committed.hash, block.hash, "the block from the higher view should be the one that committed");
-        assert_eq!(committed.sig_weight, 2.0, "proposer's precommit plus this node's own precommit");
-        assert!(!rs.view_for_height.contains_key(&2), "the now-committed height's view bookkeeping should be pruned");
+        assert_eq!(
+            committed.hash, block.hash,
+            "the block from the higher view should be the one that committed"
+        );
+        assert_eq!(
+            committed.sig_weight, 2.0,
+            "proposer's precommit plus this node's own precommit"
+        );
+        assert!(
+            !rs.view_for_height.contains_key(&2),
+            "the now-committed height's view bookkeeping should be pruned"
+        );
     }
 
     /// Builds a `BlockProposalMsg` genuinely signed by `signer_sk` as
     /// `sender`, for the given height/parent/view, with `sig_weight`
     /// set afterward to whatever the test wants to claim (never covered
     /// by the signature - see the long comment in `handle_proposal`).
-    fn signed_proposal(sender: usize, signer_sk: &ed25519_dalek::SigningKey, height: u64, parent: &str, view: u64, sig_weight: f64) -> BlockProposalMsg {
-        signed_proposal_with_state(sender, signer_sk, height, parent, view, sig_weight, vec![height as f64, height as f64])
+    fn signed_proposal(
+        sender: usize,
+        signer_sk: &ed25519_dalek::SigningKey,
+        height: u64,
+        parent: &str,
+        view: u64,
+        sig_weight: f64,
+    ) -> BlockProposalMsg {
+        signed_proposal_with_state(
+            sender,
+            signer_sk,
+            height,
+            parent,
+            view,
+            sig_weight,
+            vec![height as f64, height as f64],
+        )
     }
 
     /// Same as `signed_proposal`, but with an explicit `state` vector -
@@ -2356,7 +3069,11 @@ mod tests {
             sig_hex: hex::encode(sig.to_bytes()),
         }];
         block.sig_weight = sig_weight;
-        BlockProposalMsg { sender, view, block }
+        BlockProposalMsg {
+            sender,
+            view,
+            block,
+        }
     }
 
     /// Same as `signed_proposal`, but carrying a `MembershipChange` -
@@ -2395,10 +3112,20 @@ mod tests {
             sig_hex: hex::encode(sig.to_bytes()),
         }];
         block.sig_weight = sig_weight;
-        BlockProposalMsg { sender, view, block }
+        BlockProposalMsg {
+            sender,
+            view,
+            block,
+        }
     }
 
-    fn signed_vote(sender: usize, signer_sk: &ed25519_dalek::SigningKey, block_hash: &str, view: u64, block: &Block) -> BlockVoteMsg {
+    fn signed_vote(
+        sender: usize,
+        signer_sk: &ed25519_dalek::SigningKey,
+        block_hash: &str,
+        view: u64,
+        block: &Block,
+    ) -> BlockVoteMsg {
         let signing_canon = protocol::view_block_canon(view, block);
         let sig = crypto::sign_canon(signer_sk, &signing_canon);
         BlockVoteMsg {
@@ -2413,7 +3140,13 @@ mod tests {
     /// Builds a genuine second-phase precommit - see
     /// `protocol::precommit_canon`'s doc comment for why this signs a
     /// different string than `signed_vote`'s prevote.
-    fn signed_precommit(sender: usize, signer_sk: &ed25519_dalek::SigningKey, block_hash: &str, view: u64, block: &Block) -> PrecommitMsg {
+    fn signed_precommit(
+        sender: usize,
+        signer_sk: &ed25519_dalek::SigningKey,
+        block_hash: &str,
+        view: u64,
+        block: &Block,
+    ) -> PrecommitMsg {
         let canon = protocol::precommit_canon(view, block);
         let sig = crypto::sign_canon(signer_sk, &canon);
         PrecommitMsg {
@@ -2430,8 +3163,20 @@ mod tests {
     /// `signers`, exactly as `maybe_commit` itself would have embedded
     /// them - for tests that need a historical block to chain-sync,
     /// not a live round in progress.
-    fn committed_block(height: u64, parent: &str, state: Vec<f64>, view: u64, signers: &[(usize, &ed25519_dalek::SigningKey)]) -> Block {
-        let mut block = Block { height, parent: parent.to_string(), state, confidence: 0.9, ..Block::genesis(0) };
+    fn committed_block(
+        height: u64,
+        parent: &str,
+        state: Vec<f64>,
+        view: u64,
+        signers: &[(usize, &ed25519_dalek::SigningKey)],
+    ) -> Block {
+        let mut block = Block {
+            height,
+            parent: parent.to_string(),
+            state,
+            confidence: 0.9,
+            ..Block::genesis(0)
+        };
         block.reconciles = vec![];
         block.epoch = chain::epoch_for_height(height);
         let identity_canon = protocol::block_canon(&block);
@@ -2442,7 +3187,11 @@ mod tests {
             .iter()
             .map(|(id, sk)| {
                 let sig = crypto::sign_canon(sk, &canon);
-                SigEntry { node_id: *id, pubkey_hex: hex::encode(sk.verifying_key().to_bytes()), sig_hex: hex::encode(sig.to_bytes()) }
+                SigEntry {
+                    node_id: *id,
+                    pubkey_hex: hex::encode(sk.verifying_key().to_bytes()),
+                    sig_hex: hex::encode(sig.to_bytes()),
+                }
             })
             .collect();
         block.sig_weight = block.signatures.len() as f64;
@@ -2462,7 +3211,14 @@ mod tests {
         signers: &[(usize, &ed25519_dalek::SigningKey)],
         change: chain::MembershipChange,
     ) -> Block {
-        let mut block = Block { height, parent: parent.to_string(), state, confidence: 0.9, membership_change: Some(change), ..Block::genesis(0) };
+        let mut block = Block {
+            height,
+            parent: parent.to_string(),
+            state,
+            confidence: 0.9,
+            membership_change: Some(change),
+            ..Block::genesis(0)
+        };
         block.reconciles = vec![];
         block.epoch = chain::epoch_for_height(height);
         let identity_canon = protocol::block_canon(&block);
@@ -2473,7 +3229,11 @@ mod tests {
             .iter()
             .map(|(id, sk)| {
                 let sig = crypto::sign_canon(sk, &canon);
-                SigEntry { node_id: *id, pubkey_hex: hex::encode(sk.verifying_key().to_bytes()), sig_hex: hex::encode(sig.to_bytes()) }
+                SigEntry {
+                    node_id: *id,
+                    pubkey_hex: hex::encode(sk.verifying_key().to_bytes()),
+                    sig_hex: hex::encode(sig.to_bytes()),
+                }
             })
             .collect();
         block.sig_weight = block.signatures.len() as f64;
@@ -2511,7 +3271,11 @@ mod tests {
         let blocks = vec![b1.clone(), b2.clone(), b3.clone()];
         let response_canon = protocol::block_response_canon(1, &blocks);
         let sig = crypto::sign_canon(&peer_sk, &response_canon);
-        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+        let resp = BlockResponseMsg {
+            sender: 1,
+            blocks,
+            sig_hex: hex::encode(sig.to_bytes()),
+        };
 
         handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
 
@@ -2520,7 +3284,11 @@ mod tests {
         // Genesis itself is synthesized, not persisted (same as every
         // other commit path in this module) - only the 3 synced
         // blocks should actually be written to the store.
-        assert_eq!(store.all_blocks().unwrap().len(), 3, "synced blocks must be persisted, not just held in memory");
+        assert_eq!(
+            store.all_blocks().unwrap().len(),
+            3,
+            "synced blocks must be persisted, not just held in memory"
+        );
     }
 
     /// The actual security property, not just "sync works": a block
@@ -2550,11 +3318,19 @@ mod tests {
         let blocks = vec![under_signed];
         let response_canon = protocol::block_response_canon(1, &blocks);
         let sig = crypto::sign_canon(&peer_sk, &response_canon);
-        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+        let resp = BlockResponseMsg {
+            sender: 1,
+            blocks,
+            sig_hex: hex::encode(sig.to_bytes()),
+        };
 
         handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
 
-        assert_eq!(node.chain.len(), 1, "an under-signed block must never be applied, regardless of who relayed it");
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "an under-signed block must never be applied, regardless of who relayed it"
+        );
     }
 
     /// A node must never apply a batch out of order or skip a height -
@@ -2580,15 +3356,24 @@ mod tests {
         // height=2 first, with no height=1 in the batch at all - does
         // not extend genesis (head.height + 1 == 1, not 2).
         let b1 = committed_block(1, "GENESIS", vec![1.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
-        let b2_skipping = committed_block(2, &b1.hash, vec![2.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
+        let b2_skipping =
+            committed_block(2, &b1.hash, vec![2.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
         let blocks = vec![b2_skipping];
         let response_canon = protocol::block_response_canon(1, &blocks);
         let sig = crypto::sign_canon(&peer_sk, &response_canon);
-        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+        let resp = BlockResponseMsg {
+            sender: 1,
+            blocks,
+            sig_hex: hex::encode(sig.to_bytes()),
+        };
 
         handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
 
-        assert_eq!(node.chain.len(), 1, "a batch that doesn't start by extending the current head must apply nothing");
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "a batch that doesn't start by extending the current head must apply nothing"
+        );
     }
 
     /// Proves the actual trigger a live node relies on: observing a
@@ -2618,12 +3403,27 @@ mod tests {
         let far_view = 0u64;
         let proposer = expected_proposer(&ctx.all_ids.read().unwrap(), far_height, far_view);
         let proposer_sk = if proposer == 1 { &peer_sk } else { &self_sk };
-        let far_proposal = signed_proposal(proposer, proposer_sk, far_height, "whatever-parent-hash", far_view, 1.0);
+        let far_proposal = signed_proposal(
+            proposer,
+            proposer_sk,
+            far_height,
+            "whatever-parent-hash",
+            far_view,
+            1.0,
+        );
 
         handle_proposal(&ctx, &mut node, &store, &mut rs, far_proposal).await;
 
-        assert_eq!(rs.last_sync_request.map(|(h, _)| h), Some(1), "should have requested sync starting at this node's real next-needed height");
-        assert_eq!(node.chain.len(), 1, "the far-ahead proposal itself must never be applied directly");
+        assert_eq!(
+            rs.last_sync_request.map(|(h, _)| h),
+            Some(1),
+            "should have requested sync starting at this node's real next-needed height"
+        );
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "the far-ahead proposal itself must never be applied directly"
+        );
     }
 
     /// The debounce: a second trigger for the *same* still-unmet
@@ -2645,7 +3445,10 @@ mod tests {
         let mut rs = RoundState::default();
 
         maybe_request_sync(&ctx, &node, &mut rs, 1).await;
-        let first_requested_at = rs.last_sync_request.expect("should have recorded a request").1;
+        let first_requested_at = rs
+            .last_sync_request
+            .expect("should have recorded a request")
+            .1;
 
         maybe_request_sync(&ctx, &node, &mut rs, 1).await;
         let second_requested_at = rs.last_sync_request.unwrap().1;
@@ -2666,7 +3469,8 @@ mod tests {
     /// differ, since a higher-weight peer now gets a proportionally
     /// larger adjustment for the same-sized error.
     #[tokio::test]
-    async fn apply_trust_updates_gives_a_higher_weight_peer_a_larger_adjustment_for_the_same_error() {
+    async fn apply_trust_updates_gives_a_higher_weight_peer_a_larger_adjustment_for_the_same_error()
+    {
         async fn run_with_peer_reliability(peer_reliability: f64) -> f64 {
             let (ctx, self_sk, _peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1
             let dir = crate::test_support::TempDir::new(&format!("trust_share_{peer_reliability}"));
@@ -2687,7 +3491,11 @@ mod tests {
             // fusion output - apply_trust_updates only ever measures
             // distances *from* it, so an arbitrary fixed value is
             // enough to drive a reproducible, comparable delta_e.
-            let block = Block { height: 1, state: vec![5.0], ..Block::genesis(1) };
+            let block = Block {
+                height: 1,
+                state: vec![5.0],
+                ..Block::genesis(1)
+            };
 
             apply_trust_updates(&ctx, &mut node, &store, &block, &rs).await;
 
@@ -2738,9 +3546,11 @@ mod tests {
         // (view, block) state matters for this test).
         let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
         let block_hash = proposal.block.hash.clone();
-        rs.candidates.insert(block_hash.clone(), proposal.block.clone());
+        rs.candidates
+            .insert(block_hash.clone(), proposal.block.clone());
         rs.legitimate_rounds.insert((block_hash.clone(), 0));
-        rs.prevotes.insert((block_hash.clone(), 0), proposal.block.signatures.clone());
+        rs.prevotes
+            .insert((block_hash.clone(), 0), proposal.block.signatures.clone());
         assert_eq!(current_view(&rs, 1), 0);
 
         // The attack: peer 1 (a real, correctly-configured peer) signs
@@ -2752,11 +3562,29 @@ mod tests {
         let fake_escalation = signed_vote(1, &peer_sk, &block_hash, 99, &proposal.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, fake_escalation).await;
 
-        assert_eq!(current_view(&rs, 1), 0, "a vote alone must never be able to advance the view");
-        assert!(rs.waiting_for.is_none(), "no legitimate view-change timeout should have been touched");
-        assert_eq!(rs.prevotes.get(&(block_hash.clone(), 0)).unwrap().len(), 1, "the fabricated vote must not be tallied");
-        assert!(!rs.prevotes.contains_key(&(block_hash, 99)), "an illegitimate (hash, view) pair must never even get a tally bucket");
-        assert_eq!(node.chain.len(), 1, "nothing should have committed off a rejected vote");
+        assert_eq!(
+            current_view(&rs, 1),
+            0,
+            "a vote alone must never be able to advance the view"
+        );
+        assert!(
+            rs.waiting_for.is_none(),
+            "no legitimate view-change timeout should have been touched"
+        );
+        assert_eq!(
+            rs.prevotes.get(&(block_hash.clone(), 0)).unwrap().len(),
+            1,
+            "the fabricated vote must not be tallied"
+        );
+        assert!(
+            !rs.prevotes.contains_key(&(block_hash, 99)),
+            "an illegitimate (hash, view) pair must never even get a tally bucket"
+        );
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "nothing should have committed off a rejected vote"
+        );
     }
 
     /// The flip side: a genuine vote whose claimed view matches the
@@ -2781,16 +3609,21 @@ mod tests {
 
         let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 1.0);
         let block_hash = proposal.block.hash.clone();
-        rs.candidates.insert(block_hash.clone(), proposal.block.clone());
+        rs.candidates
+            .insert(block_hash.clone(), proposal.block.clone());
         rs.legitimate_rounds.insert((block_hash.clone(), 0));
-        rs.prevotes.insert((block_hash.clone(), 0), proposal.block.signatures.clone());
+        rs.prevotes
+            .insert((block_hash.clone(), 0), proposal.block.signatures.clone());
 
         // Node 0's own vote, matching the candidate's real view - the
         // second prevote needed to reach the 2-of-2 prevote quorum,
         // which locks this node and casts its own precommit.
         let my_vote = signed_vote(0, &self_sk, &block_hash, 0, &proposal.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, my_vote).await;
-        assert!(node.chain.last().unwrap().hash != block_hash, "a prevote quorum alone must not commit - only a precommit quorum can");
+        assert!(
+            node.chain.last().unwrap().hash != block_hash,
+            "a prevote quorum alone must not commit - only a precommit quorum can"
+        );
 
         // The peer's own precommit - driven, on a real node, by it
         // independently reaching the same prevote quorum - is what
@@ -2798,7 +3631,10 @@ mod tests {
         let peer_precommit = signed_precommit(1, &peer_sk, &block_hash, 0, &proposal.block);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer_precommit).await;
 
-        let committed = node.chain.last().expect("a genuine matching-view vote should have let this commit");
+        let committed = node
+            .chain
+            .last()
+            .expect("a genuine matching-view vote should have let this commit");
         assert_eq!(committed.hash, block_hash);
         assert_eq!(committed.sig_weight, 2.0);
     }
@@ -2821,10 +3657,13 @@ mod tests {
     /// quorum (a real polka), at which point node 0 unlocks, switches,
     /// and B - not A - goes on to reach a precommit QC and commit.
     #[tokio::test]
-    async fn locking_prevents_two_conflicting_blocks_from_both_reaching_a_precommit_quorum_certificate() {
+    async fn locking_prevents_two_conflicting_blocks_from_both_reaching_a_precommit_quorum_certificate(
+    ) {
         use crate::config::PeerConfig;
         let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let peer_sks: Vec<ed25519_dalek::SigningKey> = (0..3).map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)).collect();
+        let peer_sks: Vec<ed25519_dalek::SigningKey> = (0..3)
+            .map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng))
+            .collect();
         let config = NodeConfig {
             node_id: 0,
             dim: 2,
@@ -2842,10 +3681,23 @@ mod tests {
                 .collect(),
         };
         let peers = HashMap::from_iter((1..=3).map(|id| {
-            (id, PeerInfo { addr: format!("127.0.0.1:{id}").parse().unwrap(), pubkey: peer_sks[id - 1].verifying_key(), rotation_seq: 0 })
+            (
+                id,
+                PeerInfo {
+                    addr: format!("127.0.0.1:{id}").parse().unwrap(),
+                    pubkey: peer_sks[id - 1].verifying_key(),
+                    rotation_seq: 0,
+                },
+            )
         }));
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(vec![0, 1, 2, 3]), endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(peers),
+            all_ids: std::sync::RwLock::new(vec![0, 1, 2, 3]),
+            endpoint,
+            metrics: Arc::new(Metrics::new(&[1, 2, 3])),
+        };
         let dir = crate::test_support::TempDir::new("locking_prevents_split_commit");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -2869,36 +3721,63 @@ mod tests {
         let vote_a_from_2 = signed_vote(2, &peer_sks[1], &a.block.hash, 0, &a.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, vote_a_from_2).await; // prevotes[(A,0)] = 3 = quorum -> locks on A
 
-        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())), "a genuine prevote quorum must lock this node onto A");
+        assert_eq!(
+            rs.locked.get(&1),
+            Some(&(0, a.block.hash.clone())),
+            "a genuine prevote quorum must lock this node onto A"
+        );
         assert_eq!(node.chain.len(), 1, "A's precommit tally is only 1 (this node's own) - nowhere near quorum 3, so nothing has committed");
 
         // --- View 1: block B is a different, equally legitimate proposal - but node 0 is locked on A. ---
         let b = signed_proposal_with_state(2, &peer_sks[1], 1, "GENESIS", 1, 1.0, vec![2.0, 2.0]);
-        assert_ne!(a.block.hash, b.block.hash, "A and B must be genuinely different candidates for this test to mean anything");
+        assert_ne!(
+            a.block.hash, b.block.hash,
+            "A and B must be genuinely different candidates for this test to mean anything"
+        );
         handle_proposal(&ctx, &mut node, &store, &mut rs, b.clone()).await; // prevotes[(B,1)]: peer2 only = 1
 
-        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())), "a merely-legitimate competing proposal must not break an existing lock");
+        assert_eq!(
+            rs.locked.get(&1),
+            Some(&(0, a.block.hash.clone())),
+            "a merely-legitimate competing proposal must not break an existing lock"
+        );
         assert!(
-            rs.prevotes.get(&(b.block.hash.clone(), 1)).unwrap().iter().all(|e| e.node_id != 0),
+            rs.prevotes
+                .get(&(b.block.hash.clone(), 1))
+                .unwrap()
+                .iter()
+                .all(|e| e.node_id != 0),
             "node 0 must not prevote for B while locked on A, with no polka for B yet"
         );
 
         // A second, genuine vote for B - still short of quorum (2 of 3).
         let vote_b_from_1 = signed_vote(1, &peer_sks[0], &b.block.hash, 1, &b.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, vote_b_from_1).await;
-        assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())), "still short of a real polka for B - the lock on A must hold");
+        assert_eq!(
+            rs.locked.get(&1),
+            Some(&(0, a.block.hash.clone())),
+            "still short of a real polka for B - the lock on A must hold"
+        );
 
         // --- The polka: a THIRD genuine vote for B reaches prevote quorum - real evidence, not a claim. ---
         let vote_b_from_3 = signed_vote(3, &peer_sks[2], &b.block.hash, 1, &b.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, vote_b_from_3).await;
 
-        assert_eq!(rs.locked.get(&1), Some(&(1, b.block.hash.clone())), "a genuine prevote QC for B must unlock A and lock onto B instead");
+        assert_eq!(
+            rs.locked.get(&1),
+            Some(&(1, b.block.hash.clone())),
+            "a genuine prevote QC for B must unlock A and lock onto B instead"
+        );
         assert_eq!(
             rs.precommits.get(&(a.block.hash.clone(), 0)).unwrap().len(),
             1,
             "A's precommit tally must be frozen forever at 1 - nothing in this scenario ever gives it a second"
         );
-        assert_eq!(node.chain.len(), 1, "B has only this node's own precommit so far - not yet quorum");
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "B has only this node's own precommit so far - not yet quorum"
+        );
 
         // The other two participants' precommits for B finalize it.
         let precommit_b_from_1 = signed_precommit(1, &peer_sks[0], &b.block.hash, 1, &b.block);
@@ -2906,8 +3785,14 @@ mod tests {
         let precommit_b_from_2 = signed_precommit(2, &peer_sks[1], &b.block.hash, 1, &b.block);
         handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_b_from_2).await;
 
-        let committed = node.chain.last().expect("B should have reached a real precommit quorum and committed");
-        assert_eq!(committed.hash, b.block.hash, "B, never A, must be the one that actually committed");
+        let committed = node
+            .chain
+            .last()
+            .expect("B should have reached a real precommit quorum and committed");
+        assert_eq!(
+            committed.hash, b.block.hash,
+            "B, never A, must be the one that actually committed"
+        );
     }
 
     /// Domain separation end-to-end, not just at the `protocol::*_canon`
@@ -2940,8 +3825,16 @@ mod tests {
         // this node has already locked and cast its own *genuine*
         // precommit by this point - the real baseline to compare
         // against below, not an empty tally.
-        let genuine_precommits_so_far = rs.precommits.get(&(proposal.block.hash.clone(), 0)).cloned().unwrap_or_default();
-        assert_eq!(genuine_precommits_so_far.len(), 1, "sanity: this node's own real precommit, from reaching prevote quorum above");
+        let genuine_precommits_so_far = rs
+            .precommits
+            .get(&(proposal.block.hash.clone(), 0))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            genuine_precommits_so_far.len(),
+            1,
+            "sanity: this node's own real precommit, from reaching prevote quorum above"
+        );
 
         // A real prevote from peer 1, genuinely signed over
         // view_block_canon - valid as a prevote, never as a precommit.
@@ -2989,15 +3882,32 @@ mod tests {
         let a = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![1.0, 1.0]);
         handle_proposal(&ctx, &mut node, &store, &mut rs, a.clone()).await; // prevotes[(A,0)] = peer1 + self = 2 = quorum -> locks on A
         assert_eq!(rs.locked.get(&1), Some(&(0, a.block.hash.clone())));
-        assert_eq!(store.get_lock().unwrap(), Some(LockRecord { height: 1, view: 0, block_hash: a.block.hash.clone() }), "the lock must be persisted, not just in memory");
+        assert_eq!(
+            store.get_lock().unwrap(),
+            Some(LockRecord {
+                height: 1,
+                view: 0,
+                block_hash: a.block.hash.clone()
+            }),
+            "the lock must be persisted, not just in memory"
+        );
 
         // Simulate a restart: a brand-new, empty RoundState (as a real
         // process restart would start with), restoring only what
         // `run` itself restores from the store.
         let mut rs_after_restart = RoundState::default();
-        let record = store.get_lock().unwrap().expect("the lock must still be on disk");
-        assert_eq!(record.height, node.head().height + 1, "sanity: this is the in-flight height, not a stale record");
-        rs_after_restart.locked.insert(record.height, (record.view, record.block_hash));
+        let record = store
+            .get_lock()
+            .unwrap()
+            .expect("the lock must still be on disk");
+        assert_eq!(
+            record.height,
+            node.head().height + 1,
+            "sanity: this is the in-flight height, not a stale record"
+        );
+        rs_after_restart
+            .locked
+            .insert(record.height, (record.view, record.block_hash));
 
         // A different, equally legitimate proposal B at a higher view
         // - without the restored lock, this node would have nothing
@@ -3014,7 +3924,11 @@ mod tests {
             rs_after_restart.prevotes.get(&(b.block.hash.clone(), 2)).unwrap().iter().all(|e| e.node_id != 0),
             "the restored lock must still block this node's own prevote for a different candidate, with no polka observed yet"
         );
-        assert_eq!(rs_after_restart.locked.get(&1), Some(&(0, a.block.hash)), "the restored lock must be untouched by a merely-legitimate competing proposal");
+        assert_eq!(
+            rs_after_restart.locked.get(&1),
+            Some(&(0, a.block.hash)),
+            "the restored lock must be untouched by a merely-legitimate competing proposal"
+        );
     }
 
     /// The bug this stage's own code review caught before any test
@@ -3065,7 +3979,11 @@ mod tests {
             confidence: 0.99,
             reconciles: vec![],
             epoch: 0,
-            signatures: vec![SigEntry { node_id: 1, pubkey_hex: "ab".repeat(32), sig_hex: "cd".repeat(64) }],
+            signatures: vec![SigEntry {
+                node_id: 1,
+                pubkey_hex: "ab".repeat(32),
+                sig_hex: "cd".repeat(64),
+            }],
             sig_weight: 1000.0,
             hash: String::new(),
             committed_at_view: 0,
@@ -3074,10 +3992,29 @@ mod tests {
         let identity_canon = protocol::block_canon(&forged);
         forged.hash = chain::block_hash(&identity_canon);
 
-        handle_proposal(&ctx, &mut node, &store, &mut rs, BlockProposalMsg { sender: 1, view: 0, block: forged }).await;
+        handle_proposal(
+            &ctx,
+            &mut node,
+            &store,
+            &mut rs,
+            BlockProposalMsg {
+                sender: 1,
+                view: 0,
+                block: forged,
+            },
+        )
+        .await;
 
-        assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 0, "an unauthenticated message must never count as an observed fork");
-        assert_eq!(node.chain.last().unwrap().hash, "real-head-1", "committed history must never be touched by an unverified message");
+        assert_eq!(
+            ctx.metrics.forks_total.load(Ordering::Relaxed),
+            0,
+            "an unauthenticated message must never count as an observed fork"
+        );
+        assert_eq!(
+            node.chain.last().unwrap().hash,
+            "real-head-1",
+            "committed history must never be touched by an unverified message"
+        );
     }
 
     /// The flip side: a *genuinely* signed proposal from a real,
@@ -3088,7 +4025,8 @@ mod tests {
     /// disclosed-as-narrow, use of `tri_sync_core::chain::prefer` in
     /// the live node loop.
     #[tokio::test]
-    async fn a_genuinely_signed_conflicting_proposal_for_an_already_committed_height_is_detected_but_not_reorged() {
+    async fn a_genuinely_signed_conflicting_proposal_for_an_already_committed_height_is_detected_but_not_reorged(
+    ) {
         let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer();
         let dir = crate::test_support::TempDir::new("genuine_conflict_already_committed");
         let store = Store::open(dir.path()).unwrap();
@@ -3121,12 +4059,23 @@ mod tests {
         // same height, with a higher sig_weight than what actually
         // committed - `prefer()` ranks it above `committed`.
         let proposal = signed_proposal(1, &peer_sk, 1, "GENESIS", 0, 5.0);
-        assert_ne!(proposal.block.hash, committed.hash, "must be a genuinely different block, not the same one re-sent");
+        assert_ne!(
+            proposal.block.hash, committed.hash,
+            "must be a genuinely different block, not the same one re-sent"
+        );
 
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
 
-        assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 1, "a genuinely-authenticated conflicting commit must be counted");
-        assert_eq!(node.chain.last().unwrap().hash, "real-head-1", "detecting the conflict must never silently rewrite already-committed history");
+        assert_eq!(
+            ctx.metrics.forks_total.load(Ordering::Relaxed),
+            1,
+            "a genuinely-authenticated conflicting commit must be counted"
+        );
+        assert_eq!(
+            node.chain.last().unwrap().hash,
+            "real-head-1",
+            "detecting the conflict must never silently rewrite already-committed history"
+        );
     }
 
     /// A genuinely signed proposal for an already-committed height
@@ -3168,7 +4117,11 @@ mod tests {
 
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
 
-        assert_eq!(ctx.metrics.forks_total.load(Ordering::Relaxed), 0, "a weaker competing block is not a safety violation worth counting");
+        assert_eq!(
+            ctx.metrics.forks_total.load(Ordering::Relaxed),
+            0,
+            "a weaker competing block is not a safety violation worth counting"
+        );
         assert_eq!(node.chain.last().unwrap().hash, "real-head-1");
     }
 
@@ -3197,7 +4150,10 @@ mod tests {
         // pending, which is what this test needs to see.
         let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let other_sks = [ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng), ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)];
+        let other_sks = [
+            ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+            ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+        ];
         let config = NodeConfig {
             node_id: 0,
             dim: 2,
@@ -3207,18 +4163,57 @@ mod tests {
             round_interval_secs: 1,
             metrics_addr: None,
             peers: vec![
-                PeerConfig { id: 1, addr: "127.0.0.1:1".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) },
-                PeerConfig { id: 2, addr: "127.0.0.1:2".to_string(), pubkey_hex: hex::encode(other_sks[0].verifying_key().to_bytes()) },
-                PeerConfig { id: 3, addr: "127.0.0.1:3".to_string(), pubkey_hex: hex::encode(other_sks[1].verifying_key().to_bytes()) },
+                PeerConfig {
+                    id: 1,
+                    addr: "127.0.0.1:1".to_string(),
+                    pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()),
+                },
+                PeerConfig {
+                    id: 2,
+                    addr: "127.0.0.1:2".to_string(),
+                    pubkey_hex: hex::encode(other_sks[0].verifying_key().to_bytes()),
+                },
+                PeerConfig {
+                    id: 3,
+                    addr: "127.0.0.1:3".to_string(),
+                    pubkey_hex: hex::encode(other_sks[1].verifying_key().to_bytes()),
+                },
             ],
         };
         let peers = HashMap::from([
-            (1, PeerInfo { addr: "127.0.0.1:1".parse().unwrap(), pubkey: peer_sk.verifying_key(), rotation_seq: 0 }),
-            (2, PeerInfo { addr: "127.0.0.1:2".parse().unwrap(), pubkey: other_sks[0].verifying_key(), rotation_seq: 0 }),
-            (3, PeerInfo { addr: "127.0.0.1:3".parse().unwrap(), pubkey: other_sks[1].verifying_key(), rotation_seq: 0 }),
+            (
+                1,
+                PeerInfo {
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    pubkey: peer_sk.verifying_key(),
+                    rotation_seq: 0,
+                },
+            ),
+            (
+                2,
+                PeerInfo {
+                    addr: "127.0.0.1:2".parse().unwrap(),
+                    pubkey: other_sks[0].verifying_key(),
+                    rotation_seq: 0,
+                },
+            ),
+            (
+                3,
+                PeerInfo {
+                    addr: "127.0.0.1:3".parse().unwrap(),
+                    pubkey: other_sks[1].verifying_key(),
+                    rotation_seq: 0,
+                },
+            ),
         ]);
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(peers), all_ids: std::sync::RwLock::new(vec![0, 1, 2, 3]), endpoint, metrics: Arc::new(Metrics::new(&[1, 2, 3])) };
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(peers),
+            all_ids: std::sync::RwLock::new(vec![0, 1, 2, 3]),
+            endpoint,
+            metrics: Arc::new(Metrics::new(&[1, 2, 3])),
+        };
         let dir = crate::test_support::TempDir::new("candidate_flood_cap");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3233,12 +4228,16 @@ mod tests {
         let mut rs = RoundState::default();
 
         for i in 0..(MAX_CANDIDATES_PER_HEIGHT + 3) {
-            let proposal = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![i as f64, 0.0]);
+            let proposal =
+                signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![i as f64, 0.0]);
             handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
         }
 
         let distinct_at_height_1 = rs.candidates.values().filter(|b| b.height == 1).count();
-        assert_eq!(distinct_at_height_1, MAX_CANDIDATES_PER_HEIGHT, "the cap must hold even though every flood message was genuinely signed");
+        assert_eq!(
+            distinct_at_height_1, MAX_CANDIDATES_PER_HEIGHT,
+            "the cap must hold even though every flood message was genuinely signed"
+        );
         assert_eq!(
             rs.prevotes.len(),
             MAX_CANDIDATES_PER_HEIGHT,
@@ -3252,24 +4251,40 @@ mod tests {
         // be perfectly usable - the cap rejects brand-new hashes once
         // full, it does not evict or disturb anything already cached.
         let first = signed_proposal_with_state(1, &peer_sk, 1, "GENESIS", 0, 1.0, vec![0.0, 0.0]);
-        assert!(rs.candidates.contains_key(&first.block.hash), "a candidate cached before the cap filled up must not have been evicted");
+        assert!(
+            rs.candidates.contains_key(&first.block.hash),
+            "a candidate cached before the cap filled up must not have been evicted"
+        );
         assert_eq!(
-            rs.prevotes.get(&(first.block.hash.clone(), 0)).unwrap().len(),
+            rs.prevotes
+                .get(&(first.block.hash.clone(), 0))
+                .unwrap()
+                .len(),
             2,
             "proposer + this node's own auto-prevote, from the flood loop above"
         );
         let third_vote = signed_vote(2, &other_sks[0], &first.block.hash, 0, &first.block);
         handle_vote(&ctx, &mut node, &store, &mut rs, third_vote).await;
-        assert_ne!(node.chain.last().unwrap().hash, first.block.hash, "a prevote quorum alone must not commit - only a precommit quorum can");
+        assert_ne!(
+            node.chain.last().unwrap().hash,
+            first.block.hash,
+            "a prevote quorum alone must not commit - only a precommit quorum can"
+        );
 
         // The other two participants' own precommits - driven, on a
         // real node, by each of them independently reaching the same
         // prevote quorum - are what actually finalizes it.
-        let precommit_from_2 = signed_precommit(2, &other_sks[0], &first.block.hash, 0, &first.block);
+        let precommit_from_2 =
+            signed_precommit(2, &other_sks[0], &first.block.hash, 0, &first.block);
         handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_from_2).await;
-        let precommit_from_3 = signed_precommit(3, &other_sks[1], &first.block.hash, 0, &first.block);
+        let precommit_from_3 =
+            signed_precommit(3, &other_sks[1], &first.block.hash, 0, &first.block);
         handle_precommit(&ctx, &mut node, &store, &mut rs, precommit_from_3).await;
-        assert_eq!(node.chain.last().unwrap().hash, first.block.hash, "quorum must still be reachable for an already-cached candidate despite the flood");
+        assert_eq!(
+            node.chain.last().unwrap().hash,
+            first.block.hash,
+            "quorum must still be reachable for an already-cached candidate despite the flood"
+        );
     }
 
     /// The structural claim documented in this module's doc comment:
@@ -3294,7 +4309,13 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: std::sync::RwLock::new(vec![0]), endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(HashMap::new()),
+            all_ids: std::sync::RwLock::new(vec![0]),
+            endpoint,
+            metrics: Arc::new(Metrics::default()),
+        };
         let dir = crate::test_support::TempDir::new("no_local_double_commit");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3311,7 +4332,11 @@ mod tests {
 
         let head = node.head().clone();
         propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
-        assert_eq!(node.chain.len(), 2, "1-of-1 quorum should commit immediately");
+        assert_eq!(
+            node.chain.len(),
+            2,
+            "1-of-1 quorum should commit immediately"
+        );
         let first_hash = node.chain.last().unwrap().hash.clone();
 
         // A second, independently-proposed candidate for the exact
@@ -3323,8 +4348,16 @@ mod tests {
         let still_head_at_height_0 = Block::genesis(2); // the pre-commit head, reused as the stale parent
         propose_block(&ctx, &mut node, &store, &mut rs, &still_head_at_height_0, 0).await;
 
-        assert_eq!(node.chain.len(), 2, "a second candidate for an already-committed height must never be committed on top");
-        assert_eq!(node.chain.last().unwrap().hash, first_hash, "the real committed block must be untouched");
+        assert_eq!(
+            node.chain.len(),
+            2,
+            "a second candidate for an already-committed height must never be committed on top"
+        );
+        assert_eq!(
+            node.chain.last().unwrap().hash,
+            first_hash,
+            "the real committed block must be untouched"
+        );
     }
 
     /// A real resource leak a focused code review caught: `maybe_commit`
@@ -3348,7 +4381,13 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: std::sync::RwLock::new(vec![0]), endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(HashMap::new()),
+            all_ids: std::sync::RwLock::new(vec![0]),
+            endpoint,
+            metrics: Arc::new(Metrics::default()),
+        };
         let dir = crate::test_support::TempDir::new("prune_view_for_height");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3369,8 +4408,15 @@ mod tests {
         let head = node.head().clone();
         propose_block(&ctx, &mut node, &store, &mut rs, &head, 3).await;
 
-        assert_eq!(node.chain.len(), 2, "1-of-1 quorum should commit immediately");
-        assert!(!rs.view_for_height.contains_key(&1), "the committed height's view-change bookkeeping must be pruned, not kept forever");
+        assert_eq!(
+            node.chain.len(),
+            2,
+            "1-of-1 quorum should commit immediately"
+        );
+        assert!(
+            !rs.view_for_height.contains_key(&1),
+            "the committed height's view-change bookkeeping must be pruned, not kept forever"
+        );
     }
 
     /// Drives a real single-node (1-of-1 quorum) chain across a real
@@ -3393,7 +4439,13 @@ mod tests {
             peers: vec![],
         };
         let endpoint = net::make_client_endpoint().unwrap();
-        let ctx = Ctx { config, peers: std::sync::RwLock::new(HashMap::new()), all_ids: std::sync::RwLock::new(vec![0]), endpoint, metrics: Arc::new(Metrics::default()) };
+        let ctx = Ctx {
+            config,
+            peers: std::sync::RwLock::new(HashMap::new()),
+            all_ids: std::sync::RwLock::new(vec![0]),
+            endpoint,
+            metrics: Arc::new(Metrics::default()),
+        };
         let dir = crate::test_support::TempDir::new("epoch_rotation_boundary");
         let store = Store::open(dir.path()).unwrap();
         let mut node = NodeState {
@@ -3413,7 +4465,11 @@ mod tests {
             let head = node.head().clone();
             propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
             assert_eq!(node.chain.last().unwrap().height, h);
-            assert_eq!(node.chain.last().unwrap().epoch, 0, "height {h} should still be epoch 0");
+            assert_eq!(
+                node.chain.last().unwrap().epoch,
+                0,
+                "height {h} should still be epoch 0"
+            );
             assert_eq!(node.epoch, 0);
         }
         assert_eq!(store.get_epoch().unwrap(), None, "nothing has rotated yet, so nothing new should be persisted beyond genesis's implicit 0");
@@ -3425,8 +4481,15 @@ mod tests {
         let committed = node.chain.last().unwrap();
         assert_eq!(committed.height, chain::BLOCKS_PER_EPOCH);
         assert_eq!(committed.epoch, 1, "this height belongs to epoch 1");
-        assert_eq!(node.epoch, 1, "maybe_commit should have updated node.epoch to match");
-        assert_eq!(store.get_epoch().unwrap(), Some(1), "the rotation must be persisted, not just held in memory");
+        assert_eq!(
+            node.epoch, 1,
+            "maybe_commit should have updated node.epoch to match"
+        );
+        assert_eq!(
+            store.get_epoch().unwrap(),
+            Some(1),
+            "the rotation must be persisted, not just held in memory"
+        );
 
         // One more commit just past the boundary: epoch should stay at
         // 1, not keep incrementing every block.
@@ -3441,7 +4504,11 @@ mod tests {
         let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let dir = crate::test_support::TempDir::new("reconcile_epoch_stale");
         let store = Store::open(dir.path()).unwrap();
-        let tall_block = Block { height: chain::BLOCKS_PER_EPOCH * 2, parent: "GENESIS".to_string(), ..Block::genesis(2) };
+        let tall_block = Block {
+            height: chain::BLOCKS_PER_EPOCH * 2,
+            parent: "GENESIS".to_string(),
+            ..Block::genesis(2)
+        };
         let mut node = NodeState {
             node_id: 0,
             chain: vec![Block::genesis(2), tall_block],
@@ -3455,7 +4522,11 @@ mod tests {
         reconcile_epoch_with_chain(&mut node, &store);
 
         assert_eq!(node.epoch, 2, "should be corrected to match the real chain height, not left at the stale loaded value");
-        assert_eq!(store.get_epoch().unwrap(), Some(2), "the correction must be persisted too");
+        assert_eq!(
+            store.get_epoch().unwrap(),
+            Some(2),
+            "the correction must be persisted too"
+        );
     }
 
     #[test]
@@ -3476,7 +4547,11 @@ mod tests {
         reconcile_epoch_with_chain(&mut node, &store);
 
         assert_eq!(node.epoch, 0);
-        assert_eq!(store.get_epoch().unwrap(), None, "nothing to correct, so nothing should be written");
+        assert_eq!(
+            store.get_epoch().unwrap(),
+            None,
+            "nothing to correct, so nothing should be written"
+        );
     }
 
     /// The real end-to-end claim this stage exists to prove: two
@@ -3513,7 +4588,11 @@ mod tests {
             data_dir: String::new(),
             round_interval_secs: 1,
             metrics_addr: None,
-            peers: vec![PeerConfig { id: 1, addr: addr_b.to_string(), pubkey_hex: hex::encode(sk_b.verifying_key().to_bytes()) }],
+            peers: vec![PeerConfig {
+                id: 1,
+                addr: addr_b.to_string(),
+                pubkey_hex: hex::encode(sk_b.verifying_key().to_bytes()),
+            }],
         };
         let config_b = NodeConfig {
             node_id: 1,
@@ -3523,7 +4602,11 @@ mod tests {
             data_dir: String::new(),
             round_interval_secs: 1,
             metrics_addr: None,
-            peers: vec![PeerConfig { id: 0, addr: addr_a.to_string(), pubkey_hex: hex::encode(sk_a.verifying_key().to_bytes()) }],
+            peers: vec![PeerConfig {
+                id: 0,
+                addr: addr_a.to_string(),
+                pubkey_hex: hex::encode(sk_a.verifying_key().to_bytes()),
+            }],
         };
 
         let store_a = Store::open(dir_a.path()).unwrap();
@@ -3560,28 +4643,66 @@ mod tests {
         let metrics_a = Arc::new(Metrics::default());
         let metrics_b = Arc::new(Metrics::default());
         tokio::join!(
-            run(config_a, node_a, store_a, client_a, rx_a, Some(duration), metrics_a.clone()),
-            run(config_b, node_b, store_b, client_b, rx_b, Some(duration), metrics_b.clone())
+            run(
+                config_a,
+                node_a,
+                store_a,
+                client_a,
+                rx_a,
+                Some(duration),
+                metrics_a.clone()
+            ),
+            run(
+                config_b,
+                node_b,
+                store_b,
+                client_b,
+                rx_b,
+                Some(duration),
+                metrics_b.clone()
+            )
         );
 
         let blocks_a = Store::open(dir_a.path()).unwrap().all_blocks().unwrap();
         let blocks_b = Store::open(dir_b.path()).unwrap().all_blocks().unwrap();
 
-        assert!(blocks_a.len() >= 2, "node A should have committed at least one real block, got {}", blocks_a.len());
-        assert!(blocks_b.len() >= 2, "node B should have committed at least one real block, got {}", blocks_b.len());
+        assert!(
+            blocks_a.len() >= 2,
+            "node A should have committed at least one real block, got {}",
+            blocks_a.len()
+        );
+        assert!(
+            blocks_b.len() >= 2,
+            "node B should have committed at least one real block, got {}",
+            blocks_b.len()
+        );
 
         let common = blocks_a.len().min(blocks_b.len());
         for i in 0..common {
             assert_eq!(blocks_a[i].height, blocks_b[i].height);
-            assert_eq!(blocks_a[i].hash, blocks_b[i].hash, "both nodes must agree on block {}'s hash", blocks_a[i].height);
-            assert_eq!(blocks_a[i].sig_weight, 2.0, "a 2-node network should always reach full 2-of-2 quorum");
+            assert_eq!(
+                blocks_a[i].hash, blocks_b[i].hash,
+                "both nodes must agree on block {}'s hash",
+                blocks_a[i].height
+            );
+            assert_eq!(
+                blocks_a[i].sig_weight, 2.0,
+                "a 2-node network should always reach full 2-of-2 quorum"
+            );
         }
 
         let last_a = blocks_a.last().unwrap();
         let last_b = blocks_b.last().unwrap();
-        assert_eq!(metrics_a.head_height.load(Ordering::Relaxed), last_a.height, "metrics head_height should track the real committed chain");
+        assert_eq!(
+            metrics_a.head_height.load(Ordering::Relaxed),
+            last_a.height,
+            "metrics head_height should track the real committed chain"
+        );
         assert_eq!(metrics_b.head_height.load(Ordering::Relaxed), last_b.height);
-        assert!(metrics_a.mean_trust_weight() > 0.0, "trust toward the peer should have grown from real observations");
+        assert!(
+            metrics_a.mean_trust_weight() > 0.0,
+            "trust toward the peer should have grown from real observations"
+        );
         assert!(metrics_b.mean_trust_weight() > 0.0);
     }
 
@@ -3589,10 +4710,19 @@ mod tests {
     /// arbitrary peer-id list - built for the dynamic-membership tests
     /// below, which need more than one peer to show a quorum actually
     /// changing.
-    fn test_ctx_with_peers(peer_ids: &[usize]) -> (Ctx, ed25519_dalek::SigningKey, Vec<ed25519_dalek::SigningKey>) {
+    fn test_ctx_with_peers(
+        peer_ids: &[usize],
+    ) -> (
+        Ctx,
+        ed25519_dalek::SigningKey,
+        Vec<ed25519_dalek::SigningKey>,
+    ) {
         use crate::config::PeerConfig;
         let self_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let peer_sks: Vec<ed25519_dalek::SigningKey> = peer_ids.iter().map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)).collect();
+        let peer_sks: Vec<ed25519_dalek::SigningKey> = peer_ids
+            .iter()
+            .map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng))
+            .collect();
         let config = NodeConfig {
             node_id: 0,
             dim: 2,
@@ -3604,15 +4734,23 @@ mod tests {
             peers: peer_ids
                 .iter()
                 .zip(&peer_sks)
-                .map(|(&id, sk)| PeerConfig { id, addr: format!("127.0.0.1:{id}"), pubkey_hex: hex::encode(sk.verifying_key().to_bytes()) })
+                .map(|(&id, sk)| PeerConfig {
+                    id,
+                    addr: format!("127.0.0.1:{id}"),
+                    pubkey_hex: hex::encode(sk.verifying_key().to_bytes()),
+                })
                 .collect(),
         };
-        let peers = HashMap::from_iter(
-            peer_ids
-                .iter()
-                .zip(&peer_sks)
-                .map(|(&id, sk)| (id, PeerInfo { addr: format!("127.0.0.1:{id}").parse().unwrap(), pubkey: sk.verifying_key(), rotation_seq: 0 })),
-        );
+        let peers = HashMap::from_iter(peer_ids.iter().zip(&peer_sks).map(|(&id, sk)| {
+            (
+                id,
+                PeerInfo {
+                    addr: format!("127.0.0.1:{id}").parse().unwrap(),
+                    pubkey: sk.verifying_key(),
+                    rotation_seq: 0,
+                },
+            )
+        }));
         let endpoint = net::make_client_endpoint().unwrap();
         let mut all_ids = vec![0];
         all_ids.extend(peer_ids.iter().copied());
@@ -3639,7 +4777,11 @@ mod tests {
             reliability: HashMap::new(),
         };
         let mut rs = RoundState::default();
-        let change = chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:7".to_string(), pubkey_hex: "ab".repeat(32) };
+        let change = chain::MembershipChange::Add {
+            node_id: 2,
+            addr: "127.0.0.1:7".to_string(),
+            pubkey_hex: "ab".repeat(32),
+        };
 
         // Sender 99 isn't configured as a peer at all.
         let unrelated_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -3649,9 +4791,16 @@ mod tests {
             &ctx,
             &node,
             &mut rs,
-            MembershipProposalMsg { sender: 99, change: change.clone(), sig_hex: hex::encode(sig.to_bytes()) },
+            MembershipProposalMsg {
+                sender: 99,
+                change: change.clone(),
+                sig_hex: hex::encode(sig.to_bytes()),
+            },
         );
-        assert_eq!(rs.pending_membership_change, None, "an unknown sender must never get its proposal staged");
+        assert_eq!(
+            rs.pending_membership_change, None,
+            "an unknown sender must never get its proposal staged"
+        );
 
         // Sender 1 is a real, current member, but this signature is
         // forged - signed by this node's own key, not peer 1's.
@@ -3661,9 +4810,16 @@ mod tests {
             &ctx,
             &node,
             &mut rs,
-            MembershipProposalMsg { sender: 1, change: change.clone(), sig_hex: hex::encode(forged_sig.to_bytes()) },
+            MembershipProposalMsg {
+                sender: 1,
+                change: change.clone(),
+                sig_hex: hex::encode(forged_sig.to_bytes()),
+            },
         );
-        assert_eq!(rs.pending_membership_change, None, "a forged signature from a real member's id must still be rejected");
+        assert_eq!(
+            rs.pending_membership_change, None,
+            "a forged signature from a real member's id must still be rejected"
+        );
 
         // Sanity: the identical message, genuinely signed by peer 1's
         // real key, is accepted - proving the two rejections above
@@ -3673,7 +4829,11 @@ mod tests {
             &ctx,
             &node,
             &mut rs,
-            MembershipProposalMsg { sender: 1, change: change.clone(), sig_hex: hex::encode(genuine_sig.to_bytes()) },
+            MembershipProposalMsg {
+                sender: 1,
+                change: change.clone(),
+                sig_hex: hex::encode(genuine_sig.to_bytes()),
+            },
         );
         assert_eq!(rs.pending_membership_change, Some(change));
     }
@@ -3715,10 +4875,23 @@ mod tests {
         rs.latest_observations.insert(0, vec![1.0, 1.0]);
         rs.latest_observations.insert(1, vec![1.0, 1.0]);
 
-        let change = chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:7".to_string(), pubkey_hex: "ab".repeat(32) };
+        let change = chain::MembershipChange::Add {
+            node_id: 2,
+            addr: "127.0.0.1:7".to_string(),
+            pubkey_hex: "ab".repeat(32),
+        };
         let canon = protocol::membership_proposal_canon(1, &change);
         let sig = crypto::sign_canon(&peer_sk, &canon);
-        handle_membership_proposal(&ctx, &node, &mut rs, MembershipProposalMsg { sender: 1, change: change.clone(), sig_hex: hex::encode(sig.to_bytes()) });
+        handle_membership_proposal(
+            &ctx,
+            &node,
+            &mut rs,
+            MembershipProposalMsg {
+                sender: 1,
+                change: change.clone(),
+                sig_hex: hex::encode(sig.to_bytes()),
+            },
+        );
         assert_eq!(rs.pending_membership_change, Some(change.clone()));
 
         // height=2, view=0: expected_proposer([0,1], 2, 0) == 0, so
@@ -3726,9 +4899,20 @@ mod tests {
         assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 2, 0), 0);
         propose_block(&ctx, &mut node, &store, &mut rs, &head, 0).await;
 
-        assert_eq!(rs.pending_membership_change, None, "the staged change must be taken, not merely copied, so it's never attached twice");
-        let proposed = rs.candidates.values().find(|b| b.height == 2).expect("this node should have proposed height 2");
-        assert_eq!(proposed.membership_change, Some(change), "the proposal this node actually built must carry the staged change");
+        assert_eq!(
+            rs.pending_membership_change, None,
+            "the staged change must be taken, not merely copied, so it's never attached twice"
+        );
+        let proposed = rs
+            .candidates
+            .values()
+            .find(|b| b.height == 2)
+            .expect("this node should have proposed height 2");
+        assert_eq!(
+            proposed.membership_change,
+            Some(change),
+            "the proposal this node actually built must carry the staged change"
+        );
     }
 
     /// The core safety property of dynamic membership, stated
@@ -3739,7 +4923,8 @@ mod tests {
     /// nothing about this node's live membership or persisted state
     /// may change, regardless of what the uncommitted block claims.
     #[tokio::test]
-    async fn a_membership_change_never_takes_effect_unless_its_own_block_reaches_a_real_precommit_quorum() {
+    async fn a_membership_change_never_takes_effect_unless_its_own_block_reaches_a_real_precommit_quorum(
+    ) {
         let (ctx, self_sk, peer_sk) = test_ctx_with_one_peer(); // self=0, peer=1, quorum=2
         let dir = crate::test_support::TempDir::new("membership_gated_by_quorum");
         let store = Store::open(dir.path()).unwrap();
@@ -3754,23 +4939,47 @@ mod tests {
         };
         let mut rs = RoundState::default();
 
-        let change = chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:7".to_string(), pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()) };
-        let proposal = signed_proposal_with_membership_change(1, &peer_sk, 1, "GENESIS", 0, 1.0, change);
+        let change = chain::MembershipChange::Add {
+            node_id: 2,
+            addr: "127.0.0.1:7".to_string(),
+            pubkey_hex: hex::encode(peer_sk.verifying_key().to_bytes()),
+        };
+        let proposal =
+            signed_proposal_with_membership_change(1, &peer_sk, 1, "GENESIS", 0, 1.0, change);
         let block_hash = proposal.block.hash.clone();
-        rs.candidates.insert(block_hash.clone(), proposal.block.clone());
+        rs.candidates
+            .insert(block_hash.clone(), proposal.block.clone());
         rs.legitimate_rounds.insert((block_hash.clone(), 0));
         let my_sig = crypto::sign_canon(&self_sk, &protocol::precommit_canon(0, &proposal.block));
         rs.precommits.insert(
             (block_hash.clone(), 0),
-            vec![SigEntry { node_id: 0, pubkey_hex: hex::encode(self_sk.verifying_key().to_bytes()), sig_hex: hex::encode(my_sig.to_bytes()) }],
+            vec![SigEntry {
+                node_id: 0,
+                pubkey_hex: hex::encode(self_sk.verifying_key().to_bytes()),
+                sig_hex: hex::encode(my_sig.to_bytes()),
+            }],
         );
 
         maybe_commit(&ctx, &mut node, &store, &mut rs, &block_hash, 0).await;
 
-        assert_eq!(node.chain.len(), 1, "a lone precommit must never reach this network's real 2-of-2 quorum");
-        assert!(!ctx.peers.read().unwrap().contains_key(&2), "an uncommitted block's membership change must never take effect");
-        assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1], "network size must stay exactly as configured until a real quorum confirms otherwise");
-        assert!(store.all_members().unwrap().is_empty(), "nothing should ever be persisted for an unconfirmed change");
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "a lone precommit must never reach this network's real 2-of-2 quorum"
+        );
+        assert!(
+            !ctx.peers.read().unwrap().contains_key(&2),
+            "an uncommitted block's membership change must never take effect"
+        );
+        assert_eq!(
+            *ctx.all_ids.read().unwrap(),
+            vec![0, 1],
+            "network size must stay exactly as configured until a real quorum confirms otherwise"
+        );
+        assert!(
+            store.all_members().unwrap().is_empty(),
+            "nothing should ever be persisted for an unconfirmed change"
+        );
     }
 
     /// The real end-to-end claim: once a block carrying `Add` reaches
@@ -3797,12 +5006,23 @@ mod tests {
         let mut rs = RoundState::default();
 
         let new_peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let change =
-            chain::MembershipChange::Add { node_id: 3, addr: "127.0.0.1:4".to_string(), pubkey_hex: hex::encode(new_peer_sk.verifying_key().to_bytes()) };
+        let change = chain::MembershipChange::Add {
+            node_id: 3,
+            addr: "127.0.0.1:4".to_string(),
+            pubkey_hex: hex::encode(new_peer_sk.verifying_key().to_bytes()),
+        };
 
         // height=1, view=0: expected_proposer([0,1,2], 1, 0) == 1.
         assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 0), 1);
-        let proposal = signed_proposal_with_membership_change(1, &peer_sks[0], 1, "GENESIS", 0, 1.0, change.clone());
+        let proposal = signed_proposal_with_membership_change(
+            1,
+            &peer_sks[0],
+            1,
+            "GENESIS",
+            0,
+            1.0,
+            change.clone(),
+        );
         let block_hash = proposal.block.hash.clone();
         let block_snapshot = proposal.block.clone();
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
@@ -3811,12 +5031,21 @@ mod tests {
         let peer2_precommit = signed_precommit(2, &peer_sks[1], &block_hash, 0, &block_snapshot);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer2_precommit).await;
 
-        let committed = node.chain.last().expect("height 1 should have reached a genuine 2-of-3 precommit quorum");
+        let committed = node
+            .chain
+            .last()
+            .expect("height 1 should have reached a genuine 2-of-3 precommit quorum");
         assert_eq!(committed.height, 1);
         assert_eq!(committed.membership_change, Some(change));
-        assert!(ctx.peers.read().unwrap().contains_key(&3), "the committed Add must take effect immediately");
+        assert!(
+            ctx.peers.read().unwrap().contains_key(&3),
+            "the committed Add must take effect immediately"
+        );
         assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1, 2, 3]);
-        assert!(store.all_members().unwrap().iter().any(|(id, _)| *id == 3), "the new member must be persisted too");
+        assert!(
+            store.all_members().unwrap().iter().any(|(id, _)| *id == 3),
+            "the new member must be persisted too"
+        );
 
         // Network is now 4 nodes, quorum_for(4) == 3 - strictly more
         // than the 2 that just sufficed for height 1.
@@ -3840,11 +5069,18 @@ mod tests {
 
         let peer2_precommit2 = signed_precommit(2, &peer_sks[1], &block2_hash, 0, &block2_snapshot);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer2_precommit2).await;
-        assert_eq!(node.chain.len(), 2, "2 of the 3 required precommits still isn't quorum under the grown network");
+        assert_eq!(
+            node.chain.len(),
+            2,
+            "2 of the 3 required precommits still isn't quorum under the grown network"
+        );
 
         let peer3_precommit = signed_precommit(3, &new_peer_sk, &block2_hash, 0, &block2_snapshot);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer3_precommit).await;
-        let committed2 = node.chain.last().expect("the 3rd precommit should complete the new 3-of-4 quorum");
+        let committed2 = node
+            .chain
+            .last()
+            .expect("the 3rd precommit should complete the new 3-of-4 quorum");
         assert_eq!(committed2.hash, block2_hash, "height 2 should have committed only once the grown network's real quorum was actually met");
     }
 
@@ -3854,7 +5090,8 @@ mod tests {
     /// commits on exactly 2 precommits - which would never have been
     /// enough before the removal.
     #[tokio::test]
-    async fn removing_a_peer_via_a_committed_change_lowers_the_quorum_enforced_for_the_next_height() {
+    async fn removing_a_peer_via_a_committed_change_lowers_the_quorum_enforced_for_the_next_height()
+    {
         let (ctx, self_sk, peer_sks) = test_ctx_with_peers(&[1, 2, 3]); // self=0, quorum=3 over {0,1,2,3}
         let dir = crate::test_support::TempDir::new("membership_remove_lowers_quorum");
         let store = Store::open(dir.path()).unwrap();
@@ -3872,7 +5109,15 @@ mod tests {
         let change = chain::MembershipChange::Remove { node_id: 3 };
         // height=1, view=0: expected_proposer([0,1,2,3], 1, 0) == 1.
         assert_eq!(expected_proposer(&ctx.all_ids.read().unwrap(), 1, 0), 1);
-        let proposal = signed_proposal_with_membership_change(1, &peer_sks[0], 1, "GENESIS", 0, 1.0, change.clone());
+        let proposal = signed_proposal_with_membership_change(
+            1,
+            &peer_sks[0],
+            1,
+            "GENESIS",
+            0,
+            1.0,
+            change.clone(),
+        );
         let block_hash = proposal.block.hash.clone();
         let block_snapshot = proposal.block.clone();
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal).await;
@@ -3884,15 +5129,28 @@ mod tests {
 
         let peer2_precommit = signed_precommit(2, &peer_sks[1], &block_hash, 0, &block_snapshot);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer2_precommit).await;
-        assert_eq!(node.chain.len(), 1, "2 of the 3 required precommits still isn't quorum");
+        assert_eq!(
+            node.chain.len(),
+            1,
+            "2 of the 3 required precommits still isn't quorum"
+        );
 
         let peer3_precommit = signed_precommit(3, &peer_sks[2], &block_hash, 0, &block_snapshot);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer3_precommit).await;
-        let committed = node.chain.last().expect("the 3rd precommit should complete the real 3-of-4 quorum");
+        let committed = node
+            .chain
+            .last()
+            .expect("the 3rd precommit should complete the real 3-of-4 quorum");
         assert_eq!(committed.membership_change, Some(change));
-        assert!(!ctx.peers.read().unwrap().contains_key(&3), "the committed Remove must take effect immediately");
+        assert!(
+            !ctx.peers.read().unwrap().contains_key(&3),
+            "the committed Remove must take effect immediately"
+        );
         assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1, 2]);
-        assert!(!store.all_members().unwrap().iter().any(|(id, _)| *id == 3), "the removal must be persisted too");
+        assert!(
+            !store.all_members().unwrap().iter().any(|(id, _)| *id == 3),
+            "the removal must be persisted too"
+        );
 
         // Network is now 3 nodes, quorum_for(3) == 2 - strictly less
         // than the 3 that height 1 just needed.
@@ -3902,12 +5160,21 @@ mod tests {
         let block2_hash = proposal2.block.hash.clone();
         let block2_snapshot = proposal2.block.clone();
         handle_proposal(&ctx, &mut node, &store, &mut rs, proposal2).await;
-        assert_eq!(node.chain.len(), 2, "2-of-3 prevotes (proposer + self) now meets the shrunk quorum and locks immediately");
+        assert_eq!(
+            node.chain.len(),
+            2,
+            "2-of-3 prevotes (proposer + self) now meets the shrunk quorum and locks immediately"
+        );
 
         let peer1_precommit = signed_precommit(1, &peer_sks[0], &block2_hash, 0, &block2_snapshot);
         handle_precommit(&ctx, &mut node, &store, &mut rs, peer1_precommit).await;
-        let committed2 = node.chain.last().expect("2 precommits should now be enough under the shrunk network's real quorum of 2");
-        assert_eq!(committed2.hash, block2_hash, "height 2 should commit on exactly the quorum the shrunk membership actually requires");
+        let committed2 = node.chain.last().expect(
+            "2 precommits should now be enough under the shrunk network's real quorum of 2",
+        );
+        assert_eq!(
+            committed2.hash, block2_hash,
+            "height 2 should commit on exactly the quorum the shrunk membership actually requires"
+        );
     }
 
     /// Chain-sync's own replay path must apply a historical
@@ -3932,21 +5199,45 @@ mod tests {
         let mut rs = RoundState::default();
 
         let new_peer_sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let change =
-            chain::MembershipChange::Add { node_id: 2, addr: "127.0.0.1:9".to_string(), pubkey_hex: hex::encode(new_peer_sk.verifying_key().to_bytes()) };
-        let b1 = committed_block_with_membership_change(1, "GENESIS", vec![1.0], 0, &[(0, &self_sk), (1, &peer_sk)], change.clone());
+        let change = chain::MembershipChange::Add {
+            node_id: 2,
+            addr: "127.0.0.1:9".to_string(),
+            pubkey_hex: hex::encode(new_peer_sk.verifying_key().to_bytes()),
+        };
+        let b1 = committed_block_with_membership_change(
+            1,
+            "GENESIS",
+            vec![1.0],
+            0,
+            &[(0, &self_sk), (1, &peer_sk)],
+            change.clone(),
+        );
         let b2 = committed_block(2, &b1.hash, vec![2.0], 0, &[(0, &self_sk), (1, &peer_sk)]);
         let blocks = vec![b1.clone(), b2.clone()];
         let response_canon = protocol::block_response_canon(1, &blocks);
         let sig = crypto::sign_canon(&peer_sk, &response_canon);
-        let resp = BlockResponseMsg { sender: 1, blocks, sig_hex: hex::encode(sig.to_bytes()) };
+        let resp = BlockResponseMsg {
+            sender: 1,
+            blocks,
+            sig_hex: hex::encode(sig.to_bytes()),
+        };
 
         handle_block_response(&ctx, &mut node, &store, &mut rs, resp).await;
 
         assert_eq!(node.chain.len(), 3, "genesis + 2 synced blocks");
-        assert_eq!(node.head().hash, b2.hash, "sync must still apply every block, not stop at the one carrying the membership change");
-        assert!(ctx.peers.read().unwrap().contains_key(&2), "replaying a synced membership-change block must apply it exactly like a live commit");
+        assert_eq!(
+            node.head().hash,
+            b2.hash,
+            "sync must still apply every block, not stop at the one carrying the membership change"
+        );
+        assert!(
+            ctx.peers.read().unwrap().contains_key(&2),
+            "replaying a synced membership-change block must apply it exactly like a live commit"
+        );
         assert_eq!(*ctx.all_ids.read().unwrap(), vec![0, 1, 2]);
-        assert!(store.all_members().unwrap().iter().any(|(id, _)| *id == 2), "the replayed change must be persisted too");
+        assert!(
+            store.all_members().unwrap().iter().any(|(id, _)| *id == 2),
+            "the replayed change must be persisted too"
+        );
     }
 }

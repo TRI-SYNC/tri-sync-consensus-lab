@@ -13,7 +13,11 @@ pub struct TempDir(PathBuf);
 impl TempDir {
     pub fn new(label: &str) -> TempDir {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("tri_sync_node_test_{label}_{}_{}", std::process::id(), n));
+        let path = std::env::temp_dir().join(format!(
+            "tri_sync_node_test_{label}_{}_{}",
+            std::process::id(),
+            n
+        ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir(path)
     }

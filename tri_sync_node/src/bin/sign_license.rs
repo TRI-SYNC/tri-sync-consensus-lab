@@ -89,16 +89,25 @@ fn parse_sign_args(mut args: impl Iterator<Item = String>) -> Result<SignArgs, S
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--private-key" => private_key_hex = Some(args.next().ok_or("--private-key requires a value")?),
+            "--private-key" => {
+                private_key_hex = Some(args.next().ok_or("--private-key requires a value")?)
+            }
             "--org" => org = Some(args.next().ok_or("--org requires a value")?),
             "--max-nodes" => {
                 let raw = args.next().ok_or("--max-nodes requires a value")?;
-                max_nodes = Some(raw.parse::<u32>().map_err(|_| format!("--max-nodes value '{raw}' is not a valid non-negative integer"))?);
+                max_nodes = Some(raw.parse::<u32>().map_err(|_| {
+                    format!("--max-nodes value '{raw}' is not a valid non-negative integer")
+                })?);
             }
             "--expiry" => expiry = Some(args.next().ok_or("--expiry requires a value")?),
             "--features" => {
                 let raw = args.next().ok_or("--features requires a value")?;
-                features = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
+                features = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
             }
             "--out" => out = Some(args.next().ok_or("--out requires a value")?),
             other => return Err(format!("unrecognized argument '{other}'")),
@@ -167,12 +176,26 @@ fn build_signed_license(parsed: &SignArgs) -> Result<String, String> {
     // doesn't exist) before issuing a license carrying it, rather than
     // after a customer's node rejects it.
     if license::civil_days_from_iso(&parsed.expiry).is_none() {
-        return Err(format!("--expiry '{}' is not a valid YYYY-MM-DD calendar date", parsed.expiry));
+        return Err(format!(
+            "--expiry '{}' is not a valid YYYY-MM-DD calendar date",
+            parsed.expiry
+        ));
     }
 
-    let canon = license::canonical_string(&parsed.org, parsed.max_nodes, &parsed.features, &parsed.expiry);
+    let canon = license::canonical_string(
+        &parsed.org,
+        parsed.max_nodes,
+        &parsed.features,
+        &parsed.expiry,
+    );
     let signature = signing_key.sign(canon.as_bytes());
-    let toml_out = render_license_toml(&parsed.org, parsed.max_nodes, &parsed.features, &parsed.expiry, &hex::encode(signature.to_bytes()));
+    let toml_out = render_license_toml(
+        &parsed.org,
+        parsed.max_nodes,
+        &parsed.features,
+        &parsed.expiry,
+        &hex::encode(signature.to_bytes()),
+    );
 
     // Self-check before ever emitting the file: verify it the same
     // way a real node would, against the public key this private key
@@ -189,8 +212,18 @@ fn build_signed_license(parsed: &SignArgs) -> Result<String, String> {
     Ok(toml_out)
 }
 
-fn render_license_toml(org: &str, max_nodes: u32, features: &[String], expiry: &str, signature_hex: &str) -> String {
-    let features_toml = features.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
+fn render_license_toml(
+    org: &str,
+    max_nodes: u32,
+    features: &[String],
+    expiry: &str,
+    signature_hex: &str,
+) -> String {
+    let features_toml = features
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "org = \"{org}\"\nmax_nodes = {max_nodes}\nfeatures = [{features_toml}]\nexpiry = \"{expiry}\"\nsignature = \"{signature_hex}\"\n"
     )
@@ -201,46 +234,127 @@ mod tests {
     use super::*;
 
     fn args(v: &[&str]) -> impl Iterator<Item = String> {
-        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+        v.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     #[test]
     fn parse_sign_args_accepts_every_flag_including_a_multi_value_feature_list() {
         let parsed = parse_sign_args(args(&[
-            "--private-key", "ab", "--org", "Acme", "--max-nodes", "7", "--expiry", "2030-01-01", "--features", "a, b ,c", "--out", "/tmp/x.toml",
+            "--private-key",
+            "ab",
+            "--org",
+            "Acme",
+            "--max-nodes",
+            "7",
+            "--expiry",
+            "2030-01-01",
+            "--features",
+            "a, b ,c",
+            "--out",
+            "/tmp/x.toml",
         ]))
         .unwrap();
         assert_eq!(parsed.private_key_hex, "ab");
         assert_eq!(parsed.org, "Acme");
         assert_eq!(parsed.max_nodes, 7);
         assert_eq!(parsed.expiry, "2030-01-01");
-        assert_eq!(parsed.features, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            parsed.features,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         assert_eq!(parsed.out, Some("/tmp/x.toml".to_string()));
     }
 
     #[test]
     fn parse_sign_args_defaults_features_to_empty_and_out_to_none() {
-        let parsed = parse_sign_args(args(&["--private-key", "ab", "--org", "Acme", "--max-nodes", "1", "--expiry", "2030-01-01"])).unwrap();
+        let parsed = parse_sign_args(args(&[
+            "--private-key",
+            "ab",
+            "--org",
+            "Acme",
+            "--max-nodes",
+            "1",
+            "--expiry",
+            "2030-01-01",
+        ]))
+        .unwrap();
         assert_eq!(parsed.features, Vec::<String>::new());
         assert_eq!(parsed.out, None);
     }
 
     #[test]
     fn parse_sign_args_rejects_each_missing_required_flag() {
-        assert!(parse_sign_args(args(&["--org", "Acme", "--max-nodes", "1", "--expiry", "2030-01-01"])).is_err());
-        assert!(parse_sign_args(args(&["--private-key", "ab", "--max-nodes", "1", "--expiry", "2030-01-01"])).is_err());
-        assert!(parse_sign_args(args(&["--private-key", "ab", "--org", "Acme", "--expiry", "2030-01-01"])).is_err());
-        assert!(parse_sign_args(args(&["--private-key", "ab", "--org", "Acme", "--max-nodes", "1"])).is_err());
+        assert!(parse_sign_args(args(&[
+            "--org",
+            "Acme",
+            "--max-nodes",
+            "1",
+            "--expiry",
+            "2030-01-01"
+        ]))
+        .is_err());
+        assert!(parse_sign_args(args(&[
+            "--private-key",
+            "ab",
+            "--max-nodes",
+            "1",
+            "--expiry",
+            "2030-01-01"
+        ]))
+        .is_err());
+        assert!(parse_sign_args(args(&[
+            "--private-key",
+            "ab",
+            "--org",
+            "Acme",
+            "--expiry",
+            "2030-01-01"
+        ]))
+        .is_err());
+        assert!(parse_sign_args(args(&[
+            "--private-key",
+            "ab",
+            "--org",
+            "Acme",
+            "--max-nodes",
+            "1"
+        ]))
+        .is_err());
     }
 
     #[test]
     fn parse_sign_args_rejects_a_non_numeric_max_nodes() {
-        assert!(parse_sign_args(args(&["--private-key", "ab", "--org", "Acme", "--max-nodes", "not-a-number", "--expiry", "2030-01-01"])).is_err());
+        assert!(parse_sign_args(args(&[
+            "--private-key",
+            "ab",
+            "--org",
+            "Acme",
+            "--max-nodes",
+            "not-a-number",
+            "--expiry",
+            "2030-01-01"
+        ]))
+        .is_err());
     }
 
     #[test]
     fn parse_sign_args_rejects_an_unrecognized_flag() {
-        assert!(parse_sign_args(args(&["--private-key", "ab", "--org", "Acme", "--max-nodes", "1", "--expiry", "2030-01-01", "--bogus", "x"])).is_err());
+        assert!(parse_sign_args(args(&[
+            "--private-key",
+            "ab",
+            "--org",
+            "Acme",
+            "--max-nodes",
+            "1",
+            "--expiry",
+            "2030-01-01",
+            "--bogus",
+            "x"
+        ]))
+        .is_err());
     }
 
     fn test_key_hex() -> String {
@@ -253,7 +367,9 @@ mod tests {
     #[test]
     fn a_signed_license_actually_verifies_against_its_signing_keys_public_half() {
         let private_key_hex = test_key_hex();
-        let signing_key = SigningKey::from_bytes(&<[u8; 32]>::try_from(hex::decode(&private_key_hex).unwrap()).unwrap());
+        let signing_key = SigningKey::from_bytes(
+            &<[u8; 32]>::try_from(hex::decode(&private_key_hex).unwrap()).unwrap(),
+        );
         let public_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
         let parsed = SignArgs {
@@ -264,9 +380,11 @@ mod tests {
             features: vec!["chain_crypto".to_string(), "http_api".to_string()],
             out: None,
         };
-        let toml_out = build_signed_license(&parsed).expect("a well-formed request should sign successfully");
+        let toml_out =
+            build_signed_license(&parsed).expect("a well-formed request should sign successfully");
 
-        let license = license::parse_and_verify(&toml_out, &public_key_hex).expect("the signed license must verify against its own public key");
+        let license = license::parse_and_verify(&toml_out, &public_key_hex)
+            .expect("the signed license must verify against its own public key");
         assert_eq!(license.org, "Acme Corp");
         assert_eq!(license.max_nodes, 10);
         assert!(license.has_feature("chain_crypto"));
@@ -288,7 +406,8 @@ mod tests {
         };
         let toml_out = build_signed_license(&parsed).unwrap();
 
-        let unrelated_public_key_hex = hex::encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
+        let unrelated_public_key_hex =
+            hex::encode(SigningKey::generate(&mut OsRng).verifying_key().to_bytes());
         assert!(license::parse_and_verify(&toml_out, &unrelated_public_key_hex).is_err());
     }
 
@@ -320,7 +439,13 @@ mod tests {
 
     #[test]
     fn render_license_toml_sorts_nothing_but_preserves_every_field_round_trippably() {
-        let toml_out = render_license_toml("Acme", 3, &["b".to_string(), "a".to_string()], "2030-01-01", "deadbeef");
+        let toml_out = render_license_toml(
+            "Acme",
+            3,
+            &["b".to_string(), "a".to_string()],
+            "2030-01-01",
+            "deadbeef",
+        );
         assert!(toml_out.contains("org = \"Acme\""));
         assert!(toml_out.contains("max_nodes = 3"));
         assert!(toml_out.contains("features = [\"b\", \"a\"]"));

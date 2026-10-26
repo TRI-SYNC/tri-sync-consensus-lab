@@ -14,17 +14,29 @@
 /// both are caller bugs, not something to paper over silently.
 pub fn trimmed_fuse(values: &[Vec<f64>], weights: &[f64], trim_frac: f64) -> Vec<f64> {
     assert!(!values.is_empty(), "trimmed_fuse: no values to fuse");
-    assert_eq!(values.len(), weights.len(), "trimmed_fuse: values/weights length mismatch");
+    assert_eq!(
+        values.len(),
+        weights.len(),
+        "trimmed_fuse: values/weights length mismatch"
+    );
 
     let dim = values[0].len();
     let mut out = vec![0.0; dim];
     for k in 0..dim {
-        let mut pairs: Vec<(f64, f64)> = values.iter().zip(weights.iter()).map(|(v, w)| (v[k], *w)).collect();
+        let mut pairs: Vec<(f64, f64)> = values
+            .iter()
+            .zip(weights.iter())
+            .map(|(v, w)| (v[k], *w))
+            .collect();
         pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
         let n = pairs.len();
         let t = ((n as f64) * trim_frac).floor() as usize;
-        let core = if n > 2 * t { &pairs[t..(n - t)] } else { &pairs[..] };
+        let core = if n > 2 * t {
+            &pairs[t..(n - t)]
+        } else {
+            &pairs[..]
+        };
 
         let wsum: f64 = core.iter().map(|(_, w)| *w).sum();
         out[k] = if wsum > 0.0 {
@@ -38,7 +50,11 @@ pub fn trimmed_fuse(values: &[Vec<f64>], weights: &[f64], trim_frac: f64) -> Vec
 
 /// Euclidean distance between two equal-length vectors.
 pub fn l2_distance(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<f64>().sqrt()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[cfg(test)]

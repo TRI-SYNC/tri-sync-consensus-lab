@@ -79,25 +79,50 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Toml(e) => write!(f, "node.toml is not valid TOML: {e}"),
             ConfigError::ZeroDimension => write!(f, "node.toml: dim must be at least 1"),
-            ConfigError::BadListenAddr(a) => write!(f, "node.toml: listen_addr '{a}' is not a valid host:port address"),
-            ConfigError::DuplicatePeerId(id) => write!(f, "node.toml: peer id {id} is listed more than once"),
+            ConfigError::BadListenAddr(a) => write!(
+                f,
+                "node.toml: listen_addr '{a}' is not a valid host:port address"
+            ),
+            ConfigError::DuplicatePeerId(id) => {
+                write!(f, "node.toml: peer id {id} is listed more than once")
+            }
             ConfigError::DuplicatePeerAddr(id) => {
-                write!(f, "node.toml: peer id {id}'s addr is already used by another configured peer")
+                write!(
+                    f,
+                    "node.toml: peer id {id}'s addr is already used by another configured peer"
+                )
             }
             ConfigError::PeerIdMatchesOwnNodeId(id) => {
-                write!(f, "node.toml: peer id {id} is the same as this node's own node_id")
+                write!(
+                    f,
+                    "node.toml: peer id {id} is the same as this node's own node_id"
+                )
             }
             ConfigError::PeerAddrMatchesOwnListenAddr(id) => {
-                write!(f, "node.toml: peer id {id}'s addr is the same as this node's own listen_addr")
+                write!(
+                    f,
+                    "node.toml: peer id {id}'s addr is the same as this node's own listen_addr"
+                )
             }
-            ConfigError::BadPeerAddr(id) => write!(f, "node.toml: peer id {id}'s addr is not a valid host:port address"),
+            ConfigError::BadPeerAddr(id) => write!(
+                f,
+                "node.toml: peer id {id}'s addr is not a valid host:port address"
+            ),
             ConfigError::BadPeerPubkey(id) => {
                 write!(f, "node.toml: peer id {id}'s pubkey_hex is not a valid 32-byte hex-encoded Ed25519 public key")
             }
-            ConfigError::ZeroRoundInterval => write!(f, "node.toml: round_interval_secs must be at least 1"),
-            ConfigError::BadMetricsAddr(a) => write!(f, "node.toml: metrics_addr '{a}' is not a valid host:port address"),
+            ConfigError::ZeroRoundInterval => {
+                write!(f, "node.toml: round_interval_secs must be at least 1")
+            }
+            ConfigError::BadMetricsAddr(a) => write!(
+                f,
+                "node.toml: metrics_addr '{a}' is not a valid host:port address"
+            ),
             ConfigError::MetricsAddrMatchesListenAddr => {
-                write!(f, "node.toml: metrics_addr must not be the same as listen_addr")
+                write!(
+                    f,
+                    "node.toml: metrics_addr must not be the same as listen_addr"
+                )
             }
             ConfigError::EmptyLicensePath => write!(f, "node.toml: license_path must not be empty"),
             ConfigError::EmptyDataDir => write!(f, "node.toml: data_dir must not be empty"),
@@ -117,8 +142,12 @@ impl std::error::Error for ConfigError {}
 /// exactly the loud-failure-at-config-load-time this module's own doc
 /// comment promises, defeated by checking the wrong thing.
 fn is_valid_ed25519_pubkey_hex(hex_str: &str) -> bool {
-    let Ok(bytes) = hex::decode(hex_str) else { return false };
-    let Ok(arr): Result<[u8; 32], _> = bytes.try_into() else { return false };
+    let Ok(bytes) = hex::decode(hex_str) else {
+        return false;
+    };
+    let Ok(arr): Result<[u8; 32], _> = bytes.try_into() else {
+        return false;
+    };
     ed25519_dalek::VerifyingKey::from_bytes(&arr).is_ok()
 }
 
@@ -129,13 +158,16 @@ fn is_valid_ed25519_pubkey_hex(hex_str: &str) -> bool {
 /// worse, a peer that silently drops out of the network because its
 /// unparseable `addr` never even reaches `consensus::run`'s peer map.
 pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
-    let config: NodeConfig = toml::from_str(toml_str).map_err(|e| ConfigError::Toml(e.to_string()))?;
+    let config: NodeConfig =
+        toml::from_str(toml_str).map_err(|e| ConfigError::Toml(e.to_string()))?;
 
     if config.dim == 0 {
         return Err(ConfigError::ZeroDimension);
     }
-    let listen_addr: std::net::SocketAddr =
-        config.listen_addr.parse().map_err(|_| ConfigError::BadListenAddr(config.listen_addr.clone()))?;
+    let listen_addr: std::net::SocketAddr = config
+        .listen_addr
+        .parse()
+        .map_err(|_| ConfigError::BadListenAddr(config.listen_addr.clone()))?;
     if config.round_interval_secs == 0 {
         return Err(ConfigError::ZeroRoundInterval);
     }
@@ -146,7 +178,9 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
         return Err(ConfigError::EmptyDataDir);
     }
     if let Some(addr) = &config.metrics_addr {
-        let metrics_addr: std::net::SocketAddr = addr.parse().map_err(|_| ConfigError::BadMetricsAddr(addr.clone()))?;
+        let metrics_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|_| ConfigError::BadMetricsAddr(addr.clone()))?;
         if metrics_addr == listen_addr {
             return Err(ConfigError::MetricsAddrMatchesListenAddr);
         }
@@ -161,7 +195,10 @@ pub fn load_from_str(toml_str: &str) -> Result<NodeConfig, ConfigError> {
         if !seen_ids.insert(peer.id) {
             return Err(ConfigError::DuplicatePeerId(peer.id));
         }
-        let peer_addr: std::net::SocketAddr = peer.addr.parse().map_err(|_| ConfigError::BadPeerAddr(peer.id))?;
+        let peer_addr: std::net::SocketAddr = peer
+            .addr
+            .parse()
+            .map_err(|_| ConfigError::BadPeerAddr(peer.id))?;
         if peer_addr == listen_addr {
             return Err(ConfigError::PeerAddrMatchesOwnListenAddr(peer.id));
         }
@@ -274,7 +311,10 @@ mod tests {
             dim = 1
             listen_addr = "   "
         "#;
-        assert_eq!(load_from_str(toml), Err(ConfigError::BadListenAddr("   ".to_string())));
+        assert_eq!(
+            load_from_str(toml),
+            Err(ConfigError::BadListenAddr("   ".to_string()))
+        );
     }
 
     #[test]
@@ -284,7 +324,10 @@ mod tests {
             dim = 1
             listen_addr = "127.0.0.1"
         "#;
-        assert_eq!(load_from_str(toml), Err(ConfigError::BadListenAddr("127.0.0.1".to_string())));
+        assert_eq!(
+            load_from_str(toml),
+            Err(ConfigError::BadListenAddr("127.0.0.1".to_string()))
+        );
     }
 
     #[test]
@@ -320,7 +363,10 @@ mod tests {
         "#,
             &DUMMY_PUBKEY[..64]
         );
-        assert_eq!(load_from_str(&toml), Err(ConfigError::PeerAddrMatchesOwnListenAddr(1)));
+        assert_eq!(
+            load_from_str(&toml),
+            Err(ConfigError::PeerAddrMatchesOwnListenAddr(1))
+        );
     }
 
     #[test]
@@ -354,7 +400,10 @@ mod tests {
             listen_addr = "127.0.0.1:9000"
             metrics_addr = "127.0.0.1:9000"
         "#;
-        assert_eq!(load_from_str(toml), Err(ConfigError::MetricsAddrMatchesListenAddr));
+        assert_eq!(
+            load_from_str(toml),
+            Err(ConfigError::MetricsAddrMatchesListenAddr)
+        );
     }
 
     #[test]
@@ -365,7 +414,10 @@ mod tests {
             listen_addr = "127.0.0.1:9000"
             metrics_addr = "not an address"
         "#;
-        assert_eq!(load_from_str(toml), Err(ConfigError::BadMetricsAddr("not an address".to_string())));
+        assert_eq!(
+            load_from_str(toml),
+            Err(ConfigError::BadMetricsAddr("not an address".to_string()))
+        );
     }
 
     #[test]
@@ -405,7 +457,10 @@ mod tests {
         "#,
             &DUMMY_PUBKEY[..64]
         );
-        assert_eq!(load_from_str(&toml), Err(ConfigError::PeerIdMatchesOwnNodeId(5)));
+        assert_eq!(
+            load_from_str(&toml),
+            Err(ConfigError::PeerIdMatchesOwnNodeId(5))
+        );
     }
 
     #[test]
@@ -497,11 +552,17 @@ mod tests {
 
     #[test]
     fn malformed_toml_is_rejected_without_panicking() {
-        assert!(matches!(load_from_str("not valid toml {{{"), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            load_from_str("not valid toml {{{"),
+            Err(ConfigError::Toml(_))
+        ));
     }
 
     #[test]
     fn missing_required_fields_are_rejected_without_panicking() {
-        assert!(matches!(load_from_str("node_id = 0"), Err(ConfigError::Toml(_))));
+        assert!(matches!(
+            load_from_str("node_id = 0"),
+            Err(ConfigError::Toml(_))
+        ));
     }
 }

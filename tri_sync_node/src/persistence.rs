@@ -103,7 +103,8 @@ impl Store {
     /// Opens (creating if necessary) an LMDB environment at `dir` with
     /// the seven databases this node needs.
     pub fn open(dir: &Path) -> Result<Store, PersistError> {
-        std::fs::create_dir_all(dir).map_err(|e| PersistError(format!("creating {}: {e}", dir.display())))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| PersistError(format!("creating {}: {e}", dir.display())))?;
         // SAFETY: heed's `open` is unsafe because opening the same LMDB
         // environment concurrently from unrelated processes with
         // mismatched configuration (map size, max_dbs) is undefined
@@ -122,7 +123,16 @@ impl Store {
         let members = env.create_database(&mut wtxn, Some("members"))?;
         wtxn.commit()?;
 
-        Ok(Store { env, blocks, trust, keys, meta, peer_keys, locks, members })
+        Ok(Store {
+            env,
+            blocks,
+            trust,
+            keys,
+            meta,
+            peer_keys,
+            locks,
+            members,
+        })
     }
 
     pub fn put_block(&self, block: &Block) -> Result<(), PersistError> {
@@ -157,7 +167,8 @@ impl Store {
 
     pub fn put_signing_key(&self, sk: &SigningKey) -> Result<(), PersistError> {
         let mut wtxn = self.env.write_txn()?;
-        self.keys.put(&mut wtxn, SIGNING_KEY_KEY, sk.to_bytes().as_slice())?;
+        self.keys
+            .put(&mut wtxn, SIGNING_KEY_KEY, sk.to_bytes().as_slice())?;
         wtxn.commit()?;
         Ok(())
     }
@@ -171,9 +182,11 @@ impl Store {
         match self.keys.get(&rtxn, SIGNING_KEY_KEY)? {
             None => Ok(None),
             Some(bytes) => {
-                let arr: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| PersistError("stored signing key is not 32 bytes - data_dir is corrupt".to_string()))?;
+                let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                    PersistError(
+                        "stored signing key is not 32 bytes - data_dir is corrupt".to_string(),
+                    )
+                })?;
                 Ok(Some(SigningKey::from_bytes(&arr)))
             }
         }
@@ -284,7 +297,11 @@ impl Store {
 
     pub fn is_membership_initialized(&self) -> Result<bool, PersistError> {
         let rtxn = self.env.read_txn()?;
-        Ok(self.meta.get(&rtxn, MEMBERSHIP_INITIALIZED_KEY)?.unwrap_or(0) == 1)
+        Ok(self
+            .meta
+            .get(&rtxn, MEMBERSHIP_INITIALIZED_KEY)?
+            .unwrap_or(0)
+            == 1)
     }
 }
 
@@ -293,8 +310,8 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use ed25519_dalek::SigningKey;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn corrupt_signing_key_bytes_are_a_hard_error_not_a_silent_regeneration() {
@@ -303,7 +320,10 @@ mod tests {
         // Bypass put_signing_key to write a malformed value directly,
         // simulating on-disk corruption or a foreign writer.
         let mut wtxn = store.env.write_txn().unwrap();
-        store.keys.put(&mut wtxn, SIGNING_KEY_KEY, b"not 32 bytes").unwrap();
+        store
+            .keys
+            .put(&mut wtxn, SIGNING_KEY_KEY, b"not 32 bytes")
+            .unwrap();
         wtxn.commit().unwrap();
 
         match store.get_signing_key() {
@@ -342,8 +362,22 @@ mod tests {
         let dir = TempDir::new("trust");
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.get_trust(7).unwrap(), None);
-        store.put_trust(7, TrustEntry { edge_weight: 1.5, reliability: 0.7 }).unwrap();
-        assert_eq!(store.get_trust(7).unwrap(), Some(TrustEntry { edge_weight: 1.5, reliability: 0.7 }));
+        store
+            .put_trust(
+                7,
+                TrustEntry {
+                    edge_weight: 1.5,
+                    reliability: 0.7,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_trust(7).unwrap(),
+            Some(TrustEntry {
+                edge_weight: 1.5,
+                reliability: 0.7
+            })
+        );
     }
 
     #[test]
@@ -372,13 +406,23 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.get_peer_key(1).unwrap(), None);
 
-        let first = PeerKeyRecord { pubkey_hex: "aa".repeat(32), rotation_seq: 1 };
+        let first = PeerKeyRecord {
+            pubkey_hex: "aa".repeat(32),
+            rotation_seq: 1,
+        };
         store.put_peer_key(1, &first).unwrap();
         assert_eq!(store.get_peer_key(1).unwrap(), Some(first));
 
-        let second = PeerKeyRecord { pubkey_hex: "bb".repeat(32), rotation_seq: 2 };
+        let second = PeerKeyRecord {
+            pubkey_hex: "bb".repeat(32),
+            rotation_seq: 2,
+        };
         store.put_peer_key(1, &second).unwrap();
-        assert_eq!(store.get_peer_key(1).unwrap(), Some(second), "a newer rotation must overwrite, not append");
+        assert_eq!(
+            store.get_peer_key(1).unwrap(),
+            Some(second),
+            "a newer rotation must overwrite, not append"
+        );
 
         // A different peer's record is independent.
         assert_eq!(store.get_peer_key(2).unwrap(), None);
@@ -390,13 +434,25 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.get_lock().unwrap(), None);
 
-        let first = LockRecord { height: 1, view: 0, block_hash: "aaa".to_string() };
+        let first = LockRecord {
+            height: 1,
+            view: 0,
+            block_hash: "aaa".to_string(),
+        };
         store.put_lock(&first).unwrap();
         assert_eq!(store.get_lock().unwrap(), Some(first));
 
-        let second = LockRecord { height: 1, view: 1, block_hash: "bbb".to_string() };
+        let second = LockRecord {
+            height: 1,
+            view: 1,
+            block_hash: "bbb".to_string(),
+        };
         store.put_lock(&second).unwrap();
-        assert_eq!(store.get_lock().unwrap(), Some(second), "only one height is ever in flight - a new lock replaces, not appends");
+        assert_eq!(
+            store.get_lock().unwrap(),
+            Some(second),
+            "only one height is ever in flight - a new lock replaces, not appends"
+        );
     }
 
     #[test]
@@ -406,8 +462,24 @@ mod tests {
         assert_eq!(store.all_members().unwrap(), vec![]);
         assert!(!store.is_membership_initialized().unwrap());
 
-        store.put_member(1, &MemberRecord { addr: "127.0.0.1:1".to_string(), pubkey_hex: "aa".repeat(32) }).unwrap();
-        store.put_member(2, &MemberRecord { addr: "127.0.0.1:2".to_string(), pubkey_hex: "bb".repeat(32) }).unwrap();
+        store
+            .put_member(
+                1,
+                &MemberRecord {
+                    addr: "127.0.0.1:1".to_string(),
+                    pubkey_hex: "aa".repeat(32),
+                },
+            )
+            .unwrap();
+        store
+            .put_member(
+                2,
+                &MemberRecord {
+                    addr: "127.0.0.1:2".to_string(),
+                    pubkey_hex: "bb".repeat(32),
+                },
+            )
+            .unwrap();
         store.mark_membership_initialized().unwrap();
 
         let mut members = store.all_members().unwrap();
@@ -419,7 +491,11 @@ mod tests {
 
         store.remove_member(1).unwrap();
         let members = store.all_members().unwrap();
-        assert_eq!(members.len(), 1, "a removed member must actually be gone, not just marked");
+        assert_eq!(
+            members.len(),
+            1,
+            "a removed member must actually be gone, not just marked"
+        );
         assert_eq!(members[0].0, 2);
 
         // Removing something already gone is a no-op, not an error.
@@ -430,7 +506,11 @@ mod tests {
     fn own_rotation_seq_round_trips() {
         let dir = TempDir::new("own_rotation_seq");
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.get_own_rotation_seq().unwrap(), None, "never rotated yet");
+        assert_eq!(
+            store.get_own_rotation_seq().unwrap(),
+            None,
+            "never rotated yet"
+        );
         store.put_own_rotation_seq(1).unwrap();
         assert_eq!(store.get_own_rotation_seq().unwrap(), Some(1));
         store.put_own_rotation_seq(2).unwrap();
@@ -446,13 +526,27 @@ mod tests {
             store.put_signing_key(&sk).unwrap();
             store.put_epoch(2).unwrap();
             store.put_block(&Block::genesis(2)).unwrap();
-            store.put_trust(1, TrustEntry { edge_weight: 2.0, reliability: 0.9 }).unwrap();
+            store
+                .put_trust(
+                    1,
+                    TrustEntry {
+                        edge_weight: 2.0,
+                        reliability: 0.9,
+                    },
+                )
+                .unwrap();
         } // store (and its Env) dropped here, simulating process exit
 
         let reopened = Store::open(dir.path()).unwrap();
         assert!(reopened.get_signing_key().unwrap().is_some());
         assert_eq!(reopened.get_epoch().unwrap(), Some(2));
         assert_eq!(reopened.all_blocks().unwrap().len(), 1);
-        assert_eq!(reopened.get_trust(1).unwrap(), Some(TrustEntry { edge_weight: 2.0, reliability: 0.9 }));
+        assert_eq!(
+            reopened.get_trust(1).unwrap(),
+            Some(TrustEntry {
+                edge_weight: 2.0,
+                reliability: 0.9
+            })
+        );
     }
 }

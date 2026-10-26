@@ -48,13 +48,19 @@ async fn main() -> ExitCode {
     };
 
     let expect_pubkey = match expect_pubkey_hex {
-        Some(hex_str) => match hex::decode(&hex_str).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|a| ed25519_dalek::VerifyingKey::from_bytes(&a).ok()) {
-            Some(pk) => Some(pk),
-            None => {
-                eprintln!("tri_sync_node_probe: --expect-pubkey value is not a valid Ed25519 public key");
-                return ExitCode::FAILURE;
+        Some(hex_str) => {
+            match hex::decode(&hex_str)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .and_then(|a| ed25519_dalek::VerifyingKey::from_bytes(&a).ok())
+            {
+                Some(pk) => Some(pk),
+                None => {
+                    eprintln!("tri_sync_node_probe: --expect-pubkey value is not a valid Ed25519 public key");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
+        }
         None => None,
     };
 

@@ -19,7 +19,10 @@ use tri_sync_node::{config, consensus, license, metrics, net, persistence, state
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let node_toml_path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("node.toml"));
+    let node_toml_path = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("node.toml"));
 
     // `--duration <secs>`: run the server for a bounded time then exit
     // cleanly, instead of forever. Meant for scripted tests; a real
@@ -94,9 +97,13 @@ async fn main() -> ExitCode {
                 let addr = args.next();
                 let pubkey_hex = args.next();
                 match (id, addr, pubkey_hex) {
-                    (Some(id), Some(addr), Some(pubkey_hex)) => propose_add_peer = Some((id, addr, pubkey_hex)),
+                    (Some(id), Some(addr), Some(pubkey_hex)) => {
+                        propose_add_peer = Some((id, addr, pubkey_hex))
+                    }
                     _ => {
-                        eprintln!("tri_sync_node: --propose-add-peer requires <id> <addr> <pubkey_hex>");
+                        eprintln!(
+                            "tri_sync_node: --propose-add-peer requires <id> <addr> <pubkey_hex>"
+                        );
                         return ExitCode::FAILURE;
                     }
                 }
@@ -115,7 +122,10 @@ async fn main() -> ExitCode {
     let node_toml_str = match std::fs::read_to_string(&node_toml_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tri_sync_node: cannot read node config {}: {e}", node_toml_path.display());
+            eprintln!(
+                "tri_sync_node: cannot read node config {}: {e}",
+                node_toml_path.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -131,7 +141,10 @@ async fn main() -> ExitCode {
     let license_str = match std::fs::read_to_string(&config.license_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tri_sync_node: cannot read license file {}: {e}", config.license_path);
+            eprintln!(
+                "tri_sync_node: cannot read license file {}: {e}",
+                config.license_path
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -164,18 +177,22 @@ async fn main() -> ExitCode {
     let store = match persistence::Store::open(std::path::Path::new(&config.data_dir)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tri_sync_node: cannot open data_dir {}: {e}", config.data_dir);
+            eprintln!(
+                "tri_sync_node: cannot open data_dir {}: {e}",
+                config.data_dir
+            );
             return ExitCode::FAILURE;
         }
     };
 
-    let (node_state, loaded_from_disk) = match state::NodeState::load_or_init(&config, &store, &mut OsRng) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("tri_sync_node: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (node_state, loaded_from_disk) =
+        match state::NodeState::load_or_init(&config, &store, &mut OsRng) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("tri_sync_node: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     println!(
         "tri_sync_node: node {} {} - dim={} listen_addr={} peers={:?} pubkey={} head_height={} head_hash={}",
@@ -198,16 +215,33 @@ async fn main() -> ExitCode {
     }
 
     if let Some((id, addr, pubkey_hex)) = propose_add_peer {
-        return propose_membership_change(&config, &node_state.signing_key, MembershipChange::Add { node_id: id, addr, pubkey_hex }).await;
+        return propose_membership_change(
+            &config,
+            &node_state.signing_key,
+            MembershipChange::Add {
+                node_id: id,
+                addr,
+                pubkey_hex,
+            },
+        )
+        .await;
     }
     if let Some(id) = propose_remove_peer {
-        return propose_membership_change(&config, &node_state.signing_key, MembershipChange::Remove { node_id: id }).await;
+        return propose_membership_change(
+            &config,
+            &node_state.signing_key,
+            MembershipChange::Remove { node_id: id },
+        )
+        .await;
     }
 
     let listen_addr: std::net::SocketAddr = match config.listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("tri_sync_node: invalid listen_addr '{}': {e}", config.listen_addr);
+            eprintln!(
+                "tri_sync_node: invalid listen_addr '{}': {e}",
+                config.listen_addr
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -233,10 +267,15 @@ async fn main() -> ExitCode {
     let peer_ids: Vec<usize> = config.peers.iter().map(|p| p.id).collect();
     let node_metrics = std::sync::Arc::new(metrics::Metrics::new(&peer_ids));
     if let Some(metrics_addr_str) = &config.metrics_addr {
-        let metrics_addr: std::net::SocketAddr = metrics_addr_str.parse().expect("validated at config load");
+        let metrics_addr: std::net::SocketAddr =
+            metrics_addr_str.parse().expect("validated at config load");
         match metrics::serve(metrics_addr, node_metrics.clone()) {
-            Ok(_handle) => println!("tri_sync_node: serving Prometheus metrics on http://{metrics_addr}/metrics"),
-            Err(e) => eprintln!("tri_sync_node: cannot start metrics server on {metrics_addr}: {e}"),
+            Ok(_handle) => println!(
+                "tri_sync_node: serving Prometheus metrics on http://{metrics_addr}/metrics"
+            ),
+            Err(e) => {
+                eprintln!("tri_sync_node: cannot start metrics server on {metrics_addr}: {e}")
+            }
         }
     }
 
@@ -244,7 +283,16 @@ async fn main() -> ExitCode {
     tokio::spawn(net::serve(server_endpoint, tx));
 
     let duration = duration_secs.map(std::time::Duration::from_secs);
-    consensus::run(config, node_state, store, client_endpoint, rx, duration, node_metrics).await;
+    consensus::run(
+        config,
+        node_state,
+        store,
+        client_endpoint,
+        rx,
+        duration,
+        node_metrics,
+    )
+    .await;
 
     ExitCode::SUCCESS
 }
@@ -273,7 +321,11 @@ async fn main() -> ExitCode {
 /// missed an announcement needs a manual nudge (e.g. restarting it
 /// after it next receives a signed message from this node's new key
 /// through some other path) outside this mechanism's scope.
-async fn rotate_key(config: &config::NodeConfig, store: &persistence::Store, old_signing_key: &SigningKey) -> ExitCode {
+async fn rotate_key(
+    config: &config::NodeConfig,
+    store: &persistence::Store,
+    old_signing_key: &SigningKey,
+) -> ExitCode {
     let new_signing_key = SigningKey::generate(&mut OsRng);
     let new_pubkey_hex = hex::encode(new_signing_key.verifying_key().to_bytes());
 
@@ -318,17 +370,25 @@ async fn rotate_key(config: &config::NodeConfig, store: &persistence::Store, old
         // config::load_from_str already validated pubkey_hex at config
         // load time, so this can only fail if that validation and this
         // decode somehow disagree - never expected in practice.
-        let peer_pubkey = hex::decode(&peer.pubkey_hex).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|a| VerifyingKey::from_bytes(&a).ok());
+        let peer_pubkey = hex::decode(&peer.pubkey_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .and_then(|a| VerifyingKey::from_bytes(&a).ok());
         match net::send_message(&endpoint, addr, peer_pubkey, &msg).await {
             Ok(()) => println!("tri_sync_node: notified peer {} at {addr}", peer.id),
             Err(e) => {
-                eprintln!("tri_sync_node: failed to notify peer {} at {addr}: {e}", peer.id);
+                eprintln!(
+                    "tri_sync_node: failed to notify peer {} at {addr}: {e}",
+                    peer.id
+                );
                 any_failed = true;
             }
         }
     }
 
-    println!("tri_sync_node: key rotation complete - restart this node normally to use the new identity");
+    println!(
+        "tri_sync_node: key rotation complete - restart this node normally to use the new identity"
+    );
     if any_failed {
         eprintln!("tri_sync_node: at least one peer was not notified - see the disclosed limitation in this binary's --rotate-key handling");
         ExitCode::FAILURE
@@ -346,10 +406,18 @@ async fn rotate_key(config: &config::NodeConfig, store: &persistence::Store, old
 /// to its own next block (`consensus::handle_membership_proposal`),
 /// which still has to earn a real precommit quorum under the actual
 /// current membership before anything takes effect.
-async fn propose_membership_change(config: &config::NodeConfig, signing_key: &SigningKey, change: MembershipChange) -> ExitCode {
+async fn propose_membership_change(
+    config: &config::NodeConfig,
+    signing_key: &SigningKey,
+    change: MembershipChange,
+) -> ExitCode {
     let canon = protocol::membership_proposal_canon(config.node_id, &change);
     let sig = crypto::sign_canon(signing_key, &canon);
-    let msg = Message::MembershipProposal(MembershipProposalMsg { sender: config.node_id, change: change.clone(), sig_hex: hex::encode(sig.to_bytes()) });
+    let msg = Message::MembershipProposal(MembershipProposalMsg {
+        sender: config.node_id,
+        change: change.clone(),
+        sig_hex: hex::encode(sig.to_bytes()),
+    });
     println!("tri_sync_node: proposing membership change {change:?}");
 
     let endpoint = match net::make_client_endpoint() {
@@ -363,11 +431,17 @@ async fn propose_membership_change(config: &config::NodeConfig, signing_key: &Si
     let mut any_failed = false;
     for peer in &config.peers {
         let addr: std::net::SocketAddr = peer.addr.parse().expect("validated at config load");
-        let peer_pubkey = hex::decode(&peer.pubkey_hex).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|a| VerifyingKey::from_bytes(&a).ok());
+        let peer_pubkey = hex::decode(&peer.pubkey_hex)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .and_then(|a| VerifyingKey::from_bytes(&a).ok());
         match net::send_message(&endpoint, addr, peer_pubkey, &msg).await {
             Ok(()) => println!("tri_sync_node: sent proposal to peer {} at {addr}", peer.id),
             Err(e) => {
-                eprintln!("tri_sync_node: failed to send proposal to peer {} at {addr}: {e}", peer.id);
+                eprintln!(
+                    "tri_sync_node: failed to send proposal to peer {} at {addr}: {e}",
+                    peer.id
+                );
                 any_failed = true;
             }
         }

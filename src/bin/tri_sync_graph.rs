@@ -4,8 +4,8 @@
 // with neighboring loops in the same function that touch several.
 #![allow(clippy::needless_range_loop)]
 
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 /// Default seed; override with `--seed <u64>` for a different (still
 /// reproducible) run.
@@ -40,27 +40,41 @@ const DEVIATION_BIAS: f64 = 3.0;
 const ADVERSARIAL_SIGMA: f64 = 0.12;
 use rand_distr::StandardNormal;
 
-use tri_sync::{invariants, telemetry};
 use tri_sync::types::TelemetryRow;
+use tri_sync::{invariants, telemetry};
 
-fn clamp(x: f64, lo: f64, hi: f64) -> f64 { x.max(lo).min(hi) }
-fn l2(v: &[f64]) -> f64 { v.iter().map(|x| x*x).sum::<f64>().sqrt() }
-fn v_sub(a: &[f64], b: &[f64]) -> Vec<f64> { a.iter().zip(b.iter()).map(|(x,y)| x-y).collect() }
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    x.max(lo).min(hi)
+}
+fn l2(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+fn v_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
+    a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()
+}
 
 fn fuse_vec(values: &[Vec<f64>], weights: &[f64], trim_frac: f64) -> Vec<f64> {
     let d = values[0].len();
     let mut out = vec![0.0; d];
     for k in 0..d {
-        let mut pairs: Vec<(f64,f64)> = values.iter().zip(weights.iter()).map(|(v,w)| (v[k], *w)).collect();
-        pairs.sort_by(|a,b| a.0.partial_cmp(&b.0).unwrap());
+        let mut pairs: Vec<(f64, f64)> = values
+            .iter()
+            .zip(weights.iter())
+            .map(|(v, w)| (v[k], *w))
+            .collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let n = pairs.len();
-        let t = ((n as f64)*trim_frac).floor() as usize;
-        let core = if n > 2*t { &pairs[t..(n-t)] } else { &pairs[..] };
-        let wsum: f64 = core.iter().map(|(_,w)| *w).sum();
-        out[k] = if wsum > 0.0 {
-            core.iter().map(|(v,w)| v*w).sum::<f64>() / wsum
+        let t = ((n as f64) * trim_frac).floor() as usize;
+        let core = if n > 2 * t {
+            &pairs[t..(n - t)]
         } else {
-            core.iter().map(|(v,_)| *v).sum::<f64>() / (core.len().max(1) as f64)
+            &pairs[..]
+        };
+        let wsum: f64 = core.iter().map(|(_, w)| *w).sum();
+        out[k] = if wsum > 0.0 {
+            core.iter().map(|(v, w)| v * w).sum::<f64>() / wsum
+        } else {
+            core.iter().map(|(v, _)| *v).sum::<f64>() / (core.len().max(1) as f64)
         };
     }
     out
@@ -97,7 +111,7 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
             w_out[j].insert(i, w0 * rng.gen_range(0.8..1.2));
         }
     }
-    for _ in 0..(n*2) {
+    for _ in 0..(n * 2) {
         let a = rng.gen_range(0..n);
         let b = rng.gen_range(0..n);
         if a != b {
@@ -112,7 +126,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
     let mut clarified: Vec<bool> = vec![false; n];
 
     // potentials Φ
-    let mut phi: Vec<f64> = (0..n).map(|i| (i as f64)/(n as f64 - 1.0) * 10.0).collect();
+    let mut phi: Vec<f64> = (0..n)
+        .map(|i| (i as f64) / (n as f64 - 1.0) * 10.0)
+        .collect();
 
     // truth
     let mut truth: Vec<f64> = vec![0.0; d];
@@ -140,16 +156,24 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
     let mut fast_sync_remaining: u64 = 0;
     let mut complete_streak: u64 = 0;
 
-    if verbose { telemetry::print_header(); }
+    if verbose {
+        telemetry::print_header();
+    }
 
     loop {
         t += 1;
 
         // env
-        for k in 0..d { truth[k] += drift; }
+        for k in 0..d {
+            truth[k] += drift;
+        }
         if rng.gen::<f64>() < shock_prob {
             let k = rng.gen_range(0..d);
-            truth[k] += if rng.gen::<bool>() { shock_mag } else { -shock_mag };
+            truth[k] += if rng.gen::<bool>() {
+                shock_mag
+            } else {
+                -shock_mag
+            };
         }
 
         // observe
@@ -158,7 +182,14 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
             let noise = if is_adversarial {
                 ADVERSARIAL_SIGMA
             } else {
-                match i % 6 { 0=>0.12, 1=>0.18, 2=>0.28, 3=>0.40, 4=>0.65, _=>0.95 }
+                match i % 6 {
+                    0 => 0.12,
+                    1 => 0.18,
+                    2 => 0.28,
+                    3 => 0.40,
+                    4 => 0.65,
+                    _ => 0.95,
+                }
             };
             sigma[i] = noise;
             let bias = if i % 11 == 0 { 0.05 } else { 0.0 };
@@ -168,24 +199,30 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
                 // Always draw, whether or not it's used, so the RNG
                 // stream doesn't depend on which nodes are adversarial.
                 let eps: f64 = rng.sample::<f64, _>(StandardNormal) * noise;
-                ov[k] = if is_adversarial { truth[k] + DEVIATION_BIAS } else { truth[k] + bias + eps };
+                ov[k] = if is_adversarial {
+                    truth[k] + DEVIATION_BIAS
+                } else {
+                    truth[k] + bias + eps
+                };
             }
             obs_vec[i] = ov;
         }
 
         // local refs + shares
         let mut refs: Vec<Vec<f64>> = vec![vec![0.0; d]; n];
-        let mut shares: Vec<Vec<(usize,f64)>> = vec![vec![]; n];
+        let mut shares: Vec<Vec<(usize, f64)>> = vec![vec![]; n];
 
         for i in 0..n {
             let mut vals: Vec<Vec<f64>> = vec![obs_vec[i].clone()];
             let mut ws: Vec<f64> = vec![1.0];
 
-            let mut neigh: Vec<(usize,f64)> = vec![];
+            let mut neigh: Vec<(usize, f64)> = vec![];
             let mut sumw = 0.0;
 
             for (&j, &wij) in w_out[i].iter() {
-                if wij <= 0.0 { continue; }
+                if wij <= 0.0 {
+                    continue;
+                }
                 let wcl = clamp(wij, 0.0, 5.0);
                 vals.push(x_vec[j].clone());
                 ws.push(wcl);
@@ -195,12 +232,16 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
 
             refs[i] = fuse_vec(&vals, &ws, 0.15);
             if sumw > 0.0 {
-                shares[i] = neigh.into_iter().map(|(j,wc)| (j, wc/sumw)).collect();
+                shares[i] = neigh.into_iter().map(|(j, wc)| (j, wc / sumw)).collect();
             }
         }
 
         // lock
-        let tau = if fast_sync_remaining > 0 { tau_fast } else { tau_normal };
+        let tau = if fast_sync_remaining > 0 {
+            tau_fast
+        } else {
+            tau_normal
+        };
         let mut clarified_count = 0usize;
 
         for i in 0..n {
@@ -222,7 +263,7 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
                 let keys: Vec<usize> = w_out[i].keys().cloned().collect();
                 for j in keys {
                     let wij = w_out[i].get(&j).cloned().unwrap_or(0.0);
-                    w_out[i].insert(j, clamp(wij*0.995, w_floor, w_ceil));
+                    w_out[i].insert(j, clamp(wij * 0.995, w_floor, w_ceil));
                 }
                 continue;
             }
@@ -242,7 +283,9 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         let snapshot = w_out.clone();
         for i in 0..n {
             for (j, wij) in snapshot[i].iter() {
-                if *wij <= 0.0 { continue; }
+                if *wij <= 0.0 {
+                    continue;
+                }
                 let grad = phi[i] - phi[*j];
                 let flow = flow_rate * (*wij) * grad;
                 phi[i] -= flow;
@@ -253,10 +296,16 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         // disagreement
         let mut ds: Vec<f64> = vec![];
         for i in 0..n {
-            if clarified[i] { continue; }
+            if clarified[i] {
+                continue;
+            }
             ds.push(l2(&v_sub(&x_vec[i], &refs[i])));
         }
-        let dval = if ds.is_empty() { f64::INFINITY } else { ds.iter().sum::<f64>() / (ds.len() as f64) };
+        let dval = if ds.is_empty() {
+            f64::INFINITY
+        } else {
+            ds.iter().sum::<f64>() / (ds.len() as f64)
+        };
 
         // phase
         if fast_sync_remaining == 0 && dval < delta_explode {
@@ -265,15 +314,23 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         fast_sync_remaining = fast_sync_remaining.saturating_sub(1);
 
         // completion
-        let all_ok = (0..n).all(|i| !clarified[i] && l2(&v_sub(&x_vec[i], &refs[i])) <= epsilon_align);
-        if all_ok { complete_streak += 1; } else { complete_streak = 0; }
+        let all_ok =
+            (0..n).all(|i| !clarified[i] && l2(&v_sub(&x_vec[i], &refs[i])) <= epsilon_align);
+        if all_ok {
+            complete_streak += 1;
+        } else {
+            complete_streak = 0;
+        }
         let done = complete_streak >= complete_cycles;
 
         // mean edge weight for telemetry
         let mut sumw = 0.0;
         let mut cnt = 0usize;
         for i in 0..n {
-            for wij in w_out[i].values() { sumw += *wij; cnt += 1; }
+            for wij in w_out[i].values() {
+                sumw += *wij;
+                cnt += 1;
+            }
         }
         let mean_w = if cnt == 0 { 0.0 } else { sumw / (cnt as f64) };
 
@@ -294,19 +351,33 @@ fn simulate(seed: u64, verbose: bool) -> Outcome {
         }
 
         if done {
-            if verbose { println!("\n✅ COMPLETE: directed trust alignment achieved (sustained)."); }
+            if verbose {
+                println!("\n✅ COMPLETE: directed trust alignment achieved (sustained).");
+            }
             break;
         }
         if t >= 400 {
-            if verbose { println!("\nℹ️  Not completed within step budget (normal under shocks/noise)."); }
+            if verbose {
+                println!("\nℹ️  Not completed within step budget (normal under shocks/noise).");
+            }
             break;
         }
     }
 
-    Outcome { truth, x_vec, w_out }
+    Outcome {
+        truth,
+        x_vec,
+        w_out,
+    }
 }
 
-fn mean(v: &[f64]) -> f64 { if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 } }
+fn mean(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+}
 
 /// Every OTHER node's edge weight toward node `m`, across the whole
 /// directed graph. If the network learned to distrust an adversarial
@@ -323,19 +394,25 @@ fn print_adversarial_summary(outcome: &Outcome) {
         .filter(|i| !ADVERSARIAL_NODES.contains(i))
         .map(|i| l2(&v_sub(&outcome.x_vec[i], &outcome.truth)))
         .collect();
-    println!("mean |x - truth| for baseline nodes: {:.4}", mean(&baseline_err));
+    println!(
+        "mean |x - truth| for baseline nodes: {:.4}",
+        mean(&baseline_err)
+    );
 
     let baseline_incoming: Vec<f64> = (0..n)
         .filter(|i| !ADVERSARIAL_NODES.contains(i))
         .flat_map(|i| incoming(&outcome.w_out, i))
         .collect();
-    let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES.iter()
+    let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES
+        .iter()
         .flat_map(|&i| incoming(&outcome.w_out, i))
         .collect();
     println!(
         "mean incoming trust weight: baseline={:.4} (n={})  adversarial={:.4} (n={})",
-        mean(&baseline_incoming), baseline_incoming.len(),
-        mean(&adversarial_incoming), adversarial_incoming.len()
+        mean(&baseline_incoming),
+        baseline_incoming.len(),
+        mean(&adversarial_incoming),
+        adversarial_incoming.len()
     );
 }
 
@@ -368,13 +445,15 @@ mod sim_tests {
             .filter(|i| !ADVERSARIAL_NODES.contains(i))
             .flat_map(|i| incoming(&outcome.w_out, i))
             .collect();
-        let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES.iter()
+        let adversarial_incoming: Vec<f64> = ADVERSARIAL_NODES
+            .iter()
             .flat_map(|&i| incoming(&outcome.w_out, i))
             .collect();
         assert!(
             mean(&adversarial_incoming) < mean(&baseline_incoming) - 0.1,
             "adversarial={} baseline={}",
-            mean(&adversarial_incoming), mean(&baseline_incoming)
+            mean(&adversarial_incoming),
+            mean(&baseline_incoming)
         );
     }
 }

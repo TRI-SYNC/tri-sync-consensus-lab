@@ -54,11 +54,18 @@ impl Metrics {
     /// `record_peer_seen` below are no-ops for an unconfigured id
     /// rather than silently losing data for a configured one.
     pub fn new(peer_ids: &[usize]) -> Metrics {
-        Metrics { peer_health: peer_ids.iter().map(|&id| (id, PeerHealth::default())).collect(), ..Default::default() }
+        Metrics {
+            peer_health: peer_ids
+                .iter()
+                .map(|&id| (id, PeerHealth::default()))
+                .collect(),
+            ..Default::default()
+        }
     }
 
     pub fn set_mean_trust_weight(&self, value: f64) {
-        self.mean_trust_weight_bits.store(value.to_bits(), Ordering::Relaxed);
+        self.mean_trust_weight_bits
+            .store(value.to_bits(), Ordering::Relaxed);
     }
 
     pub fn mean_trust_weight(&self) -> f64 {
@@ -74,7 +81,9 @@ impl Metrics {
     /// see that method for why the transition must come from there,
     /// not from a separate before/after comparison here.
     pub fn record_send_result(&self, peer_id: usize, ok: bool) -> Option<HealthTransition> {
-        self.peer_health.get(&peer_id).map(|h| h.record_send_result(ok))
+        self.peer_health
+            .get(&peer_id)
+            .map(|h| h.record_send_result(ok))
     }
 
     pub fn record_peer_seen(&self, peer_id: usize) {
@@ -120,14 +129,20 @@ impl Metrics {
             ids.sort_unstable();
             for &id in &ids {
                 let h = &self.peer_health[id];
-                out.push_str(&format!("tri_sync_peer_healthy{{peer=\"{id}\"}} {}\n", if h.is_healthy() { 1 } else { 0 }));
+                out.push_str(&format!(
+                    "tri_sync_peer_healthy{{peer=\"{id}\"}} {}\n",
+                    if h.is_healthy() { 1 } else { 0 }
+                ));
             }
             out.push_str(
                 "# HELP tri_sync_peer_consecutive_send_failures Consecutive failed sends to a peer since its last successful send.\n\
                  # TYPE tri_sync_peer_consecutive_send_failures gauge\n",
             );
             for &id in &ids {
-                out.push_str(&format!("tri_sync_peer_consecutive_send_failures{{peer=\"{id}\"}} {}\n", self.peer_health[id].consecutive_send_failures()));
+                out.push_str(&format!(
+                    "tri_sync_peer_consecutive_send_failures{{peer=\"{id}\"}} {}\n",
+                    self.peer_health[id].consecutive_send_failures()
+                ));
             }
             out.push_str(
                 "# HELP tri_sync_peer_seconds_since_last_seen Seconds since the last authenticated message received from a peer. Absent if none has ever arrived.\n\
@@ -135,7 +150,9 @@ impl Metrics {
             );
             for &id in &ids {
                 if let Some(secs) = self.peer_health[id].seconds_since_last_seen() {
-                    out.push_str(&format!("tri_sync_peer_seconds_since_last_seen{{peer=\"{id}\"}} {secs}\n"));
+                    out.push_str(&format!(
+                        "tri_sync_peer_seconds_since_last_seen{{peer=\"{id}\"}} {secs}\n"
+                    ));
                 }
             }
         }
@@ -158,13 +175,21 @@ impl std::error::Error for MetricsError {}
 /// Serves `GET /metrics` (Prometheus text exposition format) on `addr`
 /// until the process exits. `tiny_http` is synchronous, so this runs on
 /// its own OS thread rather than as a tokio task.
-pub fn serve(addr: SocketAddr, metrics: std::sync::Arc<Metrics>) -> Result<std::thread::JoinHandle<()>, MetricsError> {
+pub fn serve(
+    addr: SocketAddr,
+    metrics: std::sync::Arc<Metrics>,
+) -> Result<std::thread::JoinHandle<()>, MetricsError> {
     let server = tiny_http::Server::http(addr).map_err(|e| MetricsError(e.to_string()))?;
     Ok(std::thread::spawn(move || {
         for request in server.incoming_requests() {
             let body = metrics.render();
-            let response = tiny_http::Response::from_string(body)
-                .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/plain; version=0.0.4"[..]).unwrap());
+            let response = tiny_http::Response::from_string(body).with_header(
+                tiny_http::Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"text/plain; version=0.0.4"[..],
+                )
+                .unwrap(),
+            );
             let _ = request.respond(response);
         }
     }))
@@ -206,7 +231,10 @@ mod tests {
     fn a_metrics_with_no_configured_peers_renders_no_peer_health_lines() {
         let metrics = Metrics::default();
         let text = metrics.render();
-        assert!(!text.contains("tri_sync_peer_healthy"), "no peers configured, nothing to report");
+        assert!(
+            !text.contains("tri_sync_peer_healthy"),
+            "no peers configured, nothing to report"
+        );
     }
 
     #[test]
@@ -219,11 +247,23 @@ mod tests {
         metrics.record_peer_seen(1);
 
         let text = metrics.render();
-        assert!(text.contains("tri_sync_peer_healthy{peer=\"1\"} 1"), "peer 1 just had a successful send: {text}");
-        assert!(text.contains("tri_sync_peer_healthy{peer=\"2\"} 0"), "peer 2 hit the failure threshold: {text}");
+        assert!(
+            text.contains("tri_sync_peer_healthy{peer=\"1\"} 1"),
+            "peer 1 just had a successful send: {text}"
+        );
+        assert!(
+            text.contains("tri_sync_peer_healthy{peer=\"2\"} 0"),
+            "peer 2 hit the failure threshold: {text}"
+        );
         assert!(text.contains("tri_sync_peer_consecutive_send_failures{peer=\"2\"} 3"));
-        assert!(text.contains("tri_sync_peer_seconds_since_last_seen{peer=\"1\"}"), "peer 1 was marked seen: {text}");
-        assert!(!text.contains("tri_sync_peer_seconds_since_last_seen{peer=\"2\"}"), "peer 2 was never seen, only sent to: {text}");
+        assert!(
+            text.contains("tri_sync_peer_seconds_since_last_seen{peer=\"1\"}"),
+            "peer 1 was marked seen: {text}"
+        );
+        assert!(
+            !text.contains("tri_sync_peer_seconds_since_last_seen{peer=\"2\"}"),
+            "peer 2 was never seen, only sent to: {text}"
+        );
     }
 
     #[test]
@@ -256,7 +296,10 @@ mod tests {
         });
 
         let body = ureq_get(bound_addr);
-        assert!(body.contains("tri_sync_head_height 3"), "unexpected body: {body}");
+        assert!(
+            body.contains("tri_sync_head_height 3"),
+            "unexpected body: {body}"
+        );
         handle.join().unwrap();
     }
 
@@ -266,9 +309,15 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpStream;
         let mut stream = TcpStream::connect(addr).unwrap();
-        stream.write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        response.split("\r\n\r\n").nth(1).unwrap_or_default().to_string()
+        response
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string()
     }
 }

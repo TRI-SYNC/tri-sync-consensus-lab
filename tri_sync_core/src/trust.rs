@@ -9,7 +9,14 @@
 ///
 /// Same formula as the existing (already-tested) `tri_sync::trust_graph::
 /// update_reliability`: `target = 1 / (1 + error)`.
-pub fn update_reliability(reliability: f64, estimate: f64, reference: f64, alpha: f64, floor: f64, ceil: f64) -> f64 {
+pub fn update_reliability(
+    reliability: f64,
+    estimate: f64,
+    reference: f64,
+    alpha: f64,
+    floor: f64,
+    ceil: f64,
+) -> f64 {
     let error = (estimate - reference).abs();
     let target = 1.0 / (1.0 + error);
     (reliability + alpha * (target - reliability)).clamp(floor, ceil)
@@ -26,8 +33,17 @@ pub fn update_reliability(reliability: f64, estimate: f64, reference: f64, alpha
 /// positive when fusing helped, negative when it hurt. Multiplicative
 /// (`wij * exp(alpha_edge * share * delta_e)`) so weights can only
 /// change sign-consistently and never cross zero in one step.
-pub fn update_edge_weight(wij: f64, share: f64, delta_e: f64, alpha_edge: f64, floor: f64, ceil: f64) -> f64 {
-    (wij * (alpha_edge * share * delta_e).exp()).max(floor).min(ceil)
+pub fn update_edge_weight(
+    wij: f64,
+    share: f64,
+    delta_e: f64,
+    alpha_edge: f64,
+    floor: f64,
+    ceil: f64,
+) -> f64 {
+    (wij * (alpha_edge * share * delta_e).exp())
+        .max(floor)
+        .min(ceil)
 }
 
 /// Decays an edge weight toward the floor when the node it belongs to

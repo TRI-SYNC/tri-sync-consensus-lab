@@ -72,7 +72,10 @@ fn err(e: impl std::fmt::Display) -> NetError {
 /// here except the seed itself is fixed by the RFC - there is nothing
 /// to compute, only to concatenate.
 fn ed25519_pkcs8_der(signing_key: &SigningKey) -> Vec<u8> {
-    const PREFIX: [u8; 16] = [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+    const PREFIX: [u8; 16] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
     let mut out = Vec::with_capacity(PREFIX.len() + 32);
     out.extend_from_slice(&PREFIX);
     out.extend_from_slice(&signing_key.to_bytes());
@@ -97,7 +100,9 @@ const ED25519_SPKI_PREFIX: [u8; 10] = [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
 /// malformed or wrong-algorithm peer certificate, not a real one this
 /// code produced).
 fn extract_ed25519_spki_pubkey(cert_der: &[u8]) -> Option<[u8; 32]> {
-    let pos = cert_der.windows(ED25519_SPKI_PREFIX.len()).position(|w| w == ED25519_SPKI_PREFIX)?;
+    let pos = cert_der
+        .windows(ED25519_SPKI_PREFIX.len())
+        .position(|w| w == ED25519_SPKI_PREFIX)?;
     let start = pos + ED25519_SPKI_PREFIX.len();
     cert_der.get(start..start + 32)?.try_into().ok()
 }
@@ -111,12 +116,23 @@ fn extract_ed25519_spki_pubkey(cert_der: &[u8]) -> Option<[u8; 32]> {
 /// certificate that happens to also be valid TLS.
 fn self_signed_cert_from_identity(
     signing_key: &SigningKey,
-) -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>), NetError> {
+) -> Result<
+    (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    NetError,
+> {
     let pkcs8_der = ed25519_pkcs8_der(signing_key);
-    let key_pair =
-        rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der.clone()), &rcgen::PKCS_ED25519)
-            .map_err(err)?;
-    let cert = rcgen::CertificateParams::new(vec!["tri-sync-node".to_string()]).map_err(err)?.self_signed(&key_pair).map_err(err)?;
+    let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &rustls::pki_types::PrivatePkcs8KeyDer::from(pkcs8_der.clone()),
+        &rcgen::PKCS_ED25519,
+    )
+    .map_err(err)?;
+    let cert = rcgen::CertificateParams::new(vec!["tri-sync-node".to_string()])
+        .map_err(err)?
+        .self_signed(&key_pair)
+        .map_err(err)?;
     let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(pkcs8_der.into());
     Ok((cert_der, key_der))
@@ -148,7 +164,9 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerVerification {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let Some(presented) = extract_ed25519_spki_pubkey(end_entity.as_ref()) else {
-            return Err(rustls::Error::General("server certificate does not carry a parseable Ed25519 public key".to_string()));
+            return Err(rustls::Error::General(
+                "server certificate does not carry a parseable Ed25519 public key".to_string(),
+            ));
         };
         if presented != self.expected_pubkey.to_bytes() {
             return Err(rustls::Error::General(format!(
@@ -166,7 +184,12 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -175,11 +198,18 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -209,7 +239,12 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -218,7 +253,12 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -229,7 +269,10 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 /// Builds a QUIC server endpoint bound to `listen_addr`, with a real
 /// self-signed certificate tied to this node's own Ed25519 identity -
 /// see `self_signed_cert_from_identity` below.
-pub fn make_server_endpoint(listen_addr: SocketAddr, signing_key: &SigningKey) -> Result<quinn::Endpoint, NetError> {
+pub fn make_server_endpoint(
+    listen_addr: SocketAddr,
+    signing_key: &SigningKey,
+) -> Result<quinn::Endpoint, NetError> {
     let (cert, key) = self_signed_cert_from_identity(signing_key)?;
     // Explicit provider: this binary links both `ring` and `aws-lc-rs`
     // transitively (via quinn's and rustls' default features), so
@@ -252,12 +295,24 @@ pub fn make_server_endpoint(listen_addr: SocketAddr, signing_key: &SigningKey) -
 /// [`PinnedServerVerification`] - or, if `expected_pubkey` is `None`,
 /// one that accepts any server certificate at all (the narrow,
 /// explicit opt-out this module's doc comment describes).
-fn client_config_for(expected_pubkey: Option<VerifyingKey>) -> Result<quinn::ClientConfig, NetError> {
+fn client_config_for(
+    expected_pubkey: Option<VerifyingKey>,
+) -> Result<quinn::ClientConfig, NetError> {
     let provider = rustls::crypto::ring::default_provider();
-    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone())).with_safe_default_protocol_versions().map_err(err)?.dangerous();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+        .with_safe_default_protocol_versions()
+        .map_err(err)?
+        .dangerous();
     let mut client_crypto = match expected_pubkey {
-        Some(expected_pubkey) => builder.with_custom_certificate_verifier(Arc::new(PinnedServerVerification { provider, expected_pubkey })),
-        None => builder.with_custom_certificate_verifier(Arc::new(SkipServerVerification(provider))),
+        Some(expected_pubkey) => {
+            builder.with_custom_certificate_verifier(Arc::new(PinnedServerVerification {
+                provider,
+                expected_pubkey,
+            }))
+        }
+        None => {
+            builder.with_custom_certificate_verifier(Arc::new(SkipServerVerification(provider)))
+        }
     }
     .with_no_client_auth();
     client_crypto.alpn_protocols = vec![ALPN.to_vec()];
@@ -301,10 +356,16 @@ pub async fn send_message(
     msg: &Message,
 ) -> Result<(), NetError> {
     let client_config = client_config_for(expected_server_pubkey)?;
-    let connecting = endpoint.connect_with(client_config, addr, "tri-sync-node").map_err(err)?;
+    let connecting = endpoint
+        .connect_with(client_config, addr, "tri-sync-node")
+        .map_err(err)?;
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
         .await
-        .map_err(|_| NetError(format!("connecting to {addr} timed out after {CONNECT_TIMEOUT:?}")))?
+        .map_err(|_| {
+            NetError(format!(
+                "connecting to {addr} timed out after {CONNECT_TIMEOUT:?}"
+            ))
+        })?
         .map_err(err)?;
     let mut send = connection.open_uni().await.map_err(err)?;
     let bytes = serde_json::to_vec(msg).map_err(err)?;
@@ -319,7 +380,10 @@ pub async fn send_message(
 /// remote address) to `tx`. Malformed frames and connection errors are
 /// logged to stderr and otherwise ignored - one bad peer must not take
 /// down the server.
-pub async fn serve(endpoint: quinn::Endpoint, tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, Message)>) {
+pub async fn serve(
+    endpoint: quinn::Endpoint,
+    tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, Message)>,
+) {
     while let Some(incoming) = endpoint.accept().await {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -366,15 +430,30 @@ mod tests {
     #[tokio::test]
     async fn a_message_sent_to_a_real_server_endpoint_is_received_intact() {
         let server_identity = SigningKey::generate(&mut rand::rngs::OsRng);
-        let server_endpoint = make_server_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), &server_identity).unwrap();
+        let server_endpoint = make_server_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server_identity,
+        )
+        .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(serve(server_endpoint, tx));
 
         let client_endpoint = make_client_endpoint().unwrap();
-        let msg = Message::Observation(ObservationMsg { sender: 7, values: vec![1.0, 2.0, 3.0], sig_hex: "aa".to_string() });
-        send_message(&client_endpoint, server_addr, Some(server_identity.verifying_key()), &msg).await.unwrap();
+        let msg = Message::Observation(ObservationMsg {
+            sender: 7,
+            values: vec![1.0, 2.0, 3.0],
+            sig_hex: "aa".to_string(),
+        });
+        send_message(
+            &client_endpoint,
+            server_addr,
+            Some(server_identity.verifying_key()),
+            &msg,
+        )
+        .await
+        .unwrap();
 
         let (_, received) = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
@@ -391,19 +470,40 @@ mod tests {
     #[tokio::test]
     async fn a_server_certificate_for_the_wrong_identity_is_rejected() {
         let server_identity = SigningKey::generate(&mut rand::rngs::OsRng);
-        let server_endpoint = make_server_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), &server_identity).unwrap();
+        let server_endpoint = make_server_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server_identity,
+        )
+        .unwrap();
         let server_addr = server_endpoint.local_addr().unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(serve(server_endpoint, tx));
 
         let wrong_identity = SigningKey::generate(&mut rand::rngs::OsRng);
-        assert_ne!(server_identity.verifying_key(), wrong_identity.verifying_key(), "sanity: must be genuinely different identities");
+        assert_ne!(
+            server_identity.verifying_key(),
+            wrong_identity.verifying_key(),
+            "sanity: must be genuinely different identities"
+        );
 
         let client_endpoint = make_client_endpoint().unwrap();
-        let msg = Message::Observation(ObservationMsg { sender: 7, values: vec![1.0], sig_hex: "aa".to_string() });
-        let result = send_message(&client_endpoint, server_addr, Some(wrong_identity.verifying_key()), &msg).await;
+        let msg = Message::Observation(ObservationMsg {
+            sender: 7,
+            values: vec![1.0],
+            sig_hex: "aa".to_string(),
+        });
+        let result = send_message(
+            &client_endpoint,
+            server_addr,
+            Some(wrong_identity.verifying_key()),
+            &msg,
+        )
+        .await;
 
-        assert!(result.is_err(), "a real, validly self-signed certificate for the WRONG identity must still be rejected");
+        assert!(
+            result.is_err(),
+            "a real, validly self-signed certificate for the WRONG identity must still be rejected"
+        );
     }
 
     #[tokio::test]
@@ -411,14 +511,21 @@ mod tests {
         let client_endpoint = make_client_endpoint().unwrap();
         // Nothing listens on this loopback port.
         let dead_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
-        let msg = Message::Observation(ObservationMsg { sender: 1, values: vec![0.0], sig_hex: "aa".to_string() });
+        let msg = Message::Observation(ObservationMsg {
+            sender: 1,
+            values: vec![0.0],
+            sig_hex: "aa".to_string(),
+        });
 
         let started = tokio::time::Instant::now();
         let result = send_message(&client_endpoint, dead_addr, None, &msg).await;
         let elapsed = started.elapsed();
 
         assert!(result.is_err());
-        assert!(elapsed < CONNECT_TIMEOUT + std::time::Duration::from_secs(2), "took {elapsed:?}, should be bounded");
+        assert!(
+            elapsed < CONNECT_TIMEOUT + std::time::Duration::from_secs(2),
+            "took {elapsed:?}, should be bounded"
+        );
     }
 
     /// `extract_ed25519_spki_pubkey` against a real generated
@@ -430,12 +537,16 @@ mod tests {
     fn extract_ed25519_spki_pubkey_recovers_the_real_identity_from_a_generated_cert() {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let (cert_der, _key_der) = self_signed_cert_from_identity(&signing_key).unwrap();
-        let extracted = extract_ed25519_spki_pubkey(cert_der.as_ref()).expect("a cert this module generated must always parse");
+        let extracted = extract_ed25519_spki_pubkey(cert_der.as_ref())
+            .expect("a cert this module generated must always parse");
         assert_eq!(extracted, signing_key.verifying_key().to_bytes());
     }
 
     #[test]
     fn extract_ed25519_spki_pubkey_returns_none_for_non_certificate_bytes() {
-        assert_eq!(extract_ed25519_spki_pubkey(b"not a certificate at all"), None);
+        assert_eq!(
+            extract_ed25519_spki_pubkey(b"not a certificate at all"),
+            None
+        );
     }
 }

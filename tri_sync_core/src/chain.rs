@@ -53,8 +53,14 @@ pub fn canon_string(
 /// membership_change`'s doc comment for how one takes effect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MembershipChange {
-    Add { node_id: usize, addr: String, pubkey_hex: String },
-    Remove { node_id: usize },
+    Add {
+        node_id: usize,
+        addr: String,
+        pubkey_hex: String,
+    },
+    Remove {
+        node_id: usize,
+    },
 }
 
 /// A fixed-size digest of `mc`, folded into `canon_string` the same
@@ -66,7 +72,11 @@ pub enum MembershipChange {
 pub fn hash_membership_change(mc: &Option<MembershipChange>) -> String {
     let encoded = match mc {
         None => "none".to_string(),
-        Some(MembershipChange::Add { node_id, addr, pubkey_hex }) => format!("add|{node_id}|{addr}|{pubkey_hex}"),
+        Some(MembershipChange::Add {
+            node_id,
+            addr,
+            pubkey_hex,
+        }) => format!("add|{node_id}|{addr}|{pubkey_hex}"),
         Some(MembershipChange::Remove { node_id }) => format!("remove|{node_id}"),
     };
     let mut hasher = Sha256::new();
@@ -160,9 +170,15 @@ impl Block {
 /// actually got) get to break the tie before confidence (how tight the
 /// contributing estimates were) does.
 pub fn prefer(a: &Block, b: &Block) -> bool {
-    if b.height != a.height { return b.height > a.height; }
-    if (b.sig_weight - a.sig_weight).abs() > f64::EPSILON { return b.sig_weight > a.sig_weight; }
-    if (b.confidence - a.confidence).abs() > f64::EPSILON { return b.confidence > a.confidence; }
+    if b.height != a.height {
+        return b.height > a.height;
+    }
+    if (b.sig_weight - a.sig_weight).abs() > f64::EPSILON {
+        return b.sig_weight > a.sig_weight;
+    }
+    if (b.confidence - a.confidence).abs() > f64::EPSILON {
+        return b.confidence > a.confidence;
+    }
     false
 }
 
@@ -209,30 +225,66 @@ mod tests {
         let mut prev = epoch_for_height(0);
         for h in 1..(5 * BLOCKS_PER_EPOCH) {
             let e = epoch_for_height(h);
-            assert!(e == prev || e == prev + 1, "epoch must never jump by more than one or ever decrease");
+            assert!(
+                e == prev || e == prev + 1,
+                "epoch must never jump by more than one or ever decrease"
+            );
             prev = e;
         }
     }
 
     #[test]
     fn taller_chain_always_wins_regardless_of_weight_or_confidence() {
-        let a = Block { height: 5, sig_weight: 100.0, confidence: 1.0, ..Block::genesis(1) };
-        let b = Block { height: 6, sig_weight: 0.0, confidence: 0.0, ..Block::genesis(1) };
+        let a = Block {
+            height: 5,
+            sig_weight: 100.0,
+            confidence: 1.0,
+            ..Block::genesis(1)
+        };
+        let b = Block {
+            height: 6,
+            sig_weight: 0.0,
+            confidence: 0.0,
+            ..Block::genesis(1)
+        };
         assert!(prefer(&a, &b));
         assert!(!prefer(&b, &a));
     }
 
     #[test]
     fn equal_height_breaks_tie_on_sig_weight_before_confidence() {
-        let a = Block { height: 5, sig_weight: 1.0, confidence: 0.99, ..Block::genesis(1) };
-        let b = Block { height: 5, sig_weight: 2.0, confidence: 0.01, ..Block::genesis(1) };
-        assert!(prefer(&a, &b), "higher sig_weight should win despite lower confidence");
+        let a = Block {
+            height: 5,
+            sig_weight: 1.0,
+            confidence: 0.99,
+            ..Block::genesis(1)
+        };
+        let b = Block {
+            height: 5,
+            sig_weight: 2.0,
+            confidence: 0.01,
+            ..Block::genesis(1)
+        };
+        assert!(
+            prefer(&a, &b),
+            "higher sig_weight should win despite lower confidence"
+        );
     }
 
     #[test]
     fn equal_height_and_weight_breaks_tie_on_confidence() {
-        let a = Block { height: 5, sig_weight: 1.0, confidence: 0.5, ..Block::genesis(1) };
-        let b = Block { height: 5, sig_weight: 1.0, confidence: 0.9, ..Block::genesis(1) };
+        let a = Block {
+            height: 5,
+            sig_weight: 1.0,
+            confidence: 0.5,
+            ..Block::genesis(1)
+        };
+        let b = Block {
+            height: 5,
+            sig_weight: 1.0,
+            confidence: 0.9,
+            ..Block::genesis(1)
+        };
         assert!(prefer(&a, &b));
     }
 

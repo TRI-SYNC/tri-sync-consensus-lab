@@ -16,7 +16,9 @@ pub fn regen_keys(
     signing.clear();
     verify.clear();
     // consume RNG proportional to epoch (sim-only determinism hint)
-    for _ in 0..(epoch as usize * 3).min(30) { let _: u64 = rng.gen(); }
+    for _ in 0..(epoch as usize * 3).min(30) {
+        let _: u64 = rng.gen();
+    }
     for _i in 0..n {
         let sk = SigningKey::generate(rng);
         let vk = sk.verifying_key();
@@ -41,8 +43,8 @@ pub fn verify_canon(vk: &VerifyingKey, canon: &str, sig: &Signature) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn regen_keys_is_deterministic_given_the_same_seed_and_epoch() {
@@ -96,7 +98,13 @@ mod tests {
         let sig = sign_canon(&signing[0], canon);
 
         regen_keys(&mut rng, 1, 1, &mut signing, &mut verify);
-        assert!(!verify_canon(&verify[0], canon, &sig), "epoch 1 key shouldn't verify an epoch 0 signature");
-        assert!(verify_canon(&epoch0_verify, canon, &sig), "the original epoch 0 key still should");
+        assert!(
+            !verify_canon(&verify[0], canon, &sig),
+            "epoch 1 key shouldn't verify an epoch 0 signature"
+        );
+        assert!(
+            verify_canon(&epoch0_verify, canon, &sig),
+            "the original epoch 0 key still should"
+        );
     }
 }
